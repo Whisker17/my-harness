@@ -245,14 +245,16 @@ Large phases (5+ issues):
     ...
 ```
 
-Print the Decomposition Plan to the user and add:
+Print the Decomposition Plan to the user, then ask for explicit confirmation before proceeding:
 
 ```
-Review the plan above. Press ESC to abort before any Linear changes are made.
-Proceeding to issue generation in a moment...
+AskUserQuestion("Proceed with creating these N issues in Linear?")
 ```
 
-Then continue to Step 6. (There is no explicit confirmation prompt — the user can abort by pressing ESC at any time before Step 7 begins. Note this in the output above.)
+Replace `N` with the actual count of issues in the plan.
+
+- If the user answers **Yes** (or equivalent): continue to Step 6.
+- If the user answers **No** (or equivalent): print `Aborted — no changes made to Linear.` and exit cleanly. Do NOT create any milestones, issues, or other Linear objects.
 
 ---
 
@@ -494,7 +496,7 @@ The "first unblocked issue" is the lowest-numbered issue with no `blockedBy` dep
 | Step 7 — milestone creation fails | Print error, STOP — issues cannot reference a milestone that doesn't exist |
 | Step 7 — individual issue creation fails | Print warning, continue with remaining issues; report in summary |
 | Step 7 — partial creation (some issues created, some not) | Report what succeeded and what failed in the summary; do NOT roll back created issues silently |
-| User presses ESC before Step 7 | No Linear changes made; exit cleanly |
+| User answers "No" at Step 5 confirmation gate | No Linear changes made; exit cleanly |
 | Any step — unexpected error | Print the error and current state; do NOT silently swallow failures |
 
 **On partial failure:** always report exactly which issues were created (with their IDs) and which failed. The user needs this information to decide whether to re-run or fix manually. Never leave the user guessing about the state of Linear.
@@ -524,11 +526,16 @@ The "first unblocked issue" is the lowest-numbered issue with no `blockedBy` dep
                              generate issues
                                     │
                                     ▼
-                              [Step 7] Create
-                              in Linear (Backlog)
-                                    │
-                                    ▼
-                              [Step 8] Summary
+                        AskUserQuestion: Proceed?
+                          │               │
+                        Yes │           No │
+                            ▼             ▼
+                      [Step 7] Create   Aborted —
+                      in Linear         no Linear
+                      (Backlog)         changes made
+                            │
+                            ▼
+                      [Step 8] Summary
 ```
 
 **Linear states managed by this skill:**
