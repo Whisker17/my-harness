@@ -413,7 +413,8 @@ Phase overview: <1-2 sentences>. This parent tracks the following sub-issues:
 See sub-issues for individual technical details. Phase depends on: <preceding phase name>.
 
 ## Dependencies
-<blocking milestone or "None">
+<!-- Fill in: list the @@DEP:<Issue title>@@ placeholder tags for blocking issues, or write "None — no blocking dependencies." -->
+None — no blocking dependencies.
 
 ## Scope Boundary
 This issue is an index only. All implementation is in the sub-issues below.
