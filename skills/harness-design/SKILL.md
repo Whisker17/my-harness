@@ -45,6 +45,16 @@ echo "Branch:     $CURRENT_BRANCH"
 echo "Repo root:  $REPO_ROOT"
 echo "CLAUDE.md:  $CLAUDE_MD_EXISTS"
 echo "Slug:       $SLUG"
+
+# Schema sanity check — must pass before Step 2
+SCHEMA="$HOME/.claude/skills/harness-dev/schema.md"
+if [ ! -s "$SCHEMA" ]; then
+  echo "🛑  STOP: harness-dev schema not found or empty: $SCHEMA"
+  echo "   Install or repair the harness-dev skill before running harness-design."
+  echo "   (The schema is required to generate schema-compliant issue descriptions in Step 6.)"
+  exit 1
+fi
+echo "Schema:     $SCHEMA (ok)"
 ```
 
 **harness-design tolerates a missing CLAUDE.md** — unlike harness-dev, it operates at the project-planning layer, before a repo may exist. If CLAUDE.md is absent, print:
