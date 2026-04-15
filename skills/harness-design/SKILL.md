@@ -68,6 +68,41 @@ Do NOT stop. Continue to Step 1.
 
 ---
 
+## Re-entry Detection
+
+Before running Step 1, check whether a prior run already produced artifacts. This lets you skip the long interactive sessions when the user re-invokes after a Step 7 failure.
+
+```bash
+SLUG="<slug-from-preamble>"
+DESIGN_DOC=$(ls -t ~/.gstack/projects/"$SLUG"/*-design-*.md 2>/dev/null | head -1)
+echo "Re-entry check — design doc: ${DESIGN_DOC:-not found}"
+```
+
+Also check whether milestones already exist in Linear for the resolved project (requires the project ID from Step 1 — do this check immediately after Step 1 resolves the project, before Step 2):
+
+```
+mcp__linear-server__list_milestones(project: "<project-id>")
+```
+
+**Decision table:**
+
+| Design doc exists? | Milestones in Linear? | Entry point |
+|---|---|---|
+| No | No | Full run — Steps 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 |
+| Yes | No | Skip /office-hours and /plan-eng-review — jump to Step 5 (reuse existing doc); Step 7 creates milestones normally |
+| Yes | Yes | Skip /office-hours, /plan-eng-review, and milestone creation — jump to Step 5; Step 7c creates only missing issues (dedup check already handles this) |
+| No | Yes | Full run — design doc is the authoritative source; milestones without a doc are stale |
+
+When skipping sessions, print:
+
+```
+⏩  Re-entry detected: design doc found at <path>.
+    Skipping /office-hours and /plan-eng-review — resuming from Step 5.
+    (Re-run /office-hours manually if you want to revise the design.)
+```
+
+---
+
 ## Step 1 — Input Resolution
 
 Extract the argument the user passed to `/harness-design`. Three cases:
@@ -519,34 +554,40 @@ The "first unblocked issue" is the lowest-numbered issue with no `blockedBy` dep
 ```
 (no Linear state)  ──[Step 1]──►  Project resolved/created
                                           │
-                                          ▼
-                                  [Step 2] /office-hours
-                                  (interactive — user participates)
+                                    Re-entry check
+                                    (design doc? milestones?)
                                           │
-                                          ▼
-                                  [Step 3] /plan-eng-review
-                                  (interactive — user participates)
-                                          │
-                                          ▼
-                                  [Step 4] Design doc check
-                                    │             │
-                               found │        not found │
-                                    ▼             ▼
-                             [Steps 5-6]        🛑 STOP
-                             Decompose +
-                             generate issues
-                                    │
-                                    ▼
-                        AskUserQuestion: Proceed?
-                          │               │
-                        Yes │           No │
-                            ▼             ▼
-                      [Step 7] Create   Aborted —
-                      in Linear         no Linear
-                      (Backlog)         changes made
-                            │
-                            ▼
-                      [Step 8] Summary
+                     ┌────────────────────┼────────────────────────┐
+                     │ neither            │ doc only               │ both
+                     ▼                   │                        │
+             [Step 2] /office-hours      │ ⏩ skip Steps 2-4       │ ⏩ skip Steps 2-4
+             (interactive)               │   resume at Step 5     │   resume at Step 5
+                     │                   │                        │   (Step 7 skips
+                     ▼                   │                        │    milestone create)
+             [Step 3] /plan-eng-review   ▼                        ▼
+             (interactive)        [Steps 5-6]               [Steps 5-6]
+                     │            Decompose +               Decompose +
+                     ▼            generate issues           generate issues
+             [Step 4] Design                │                        │
+             doc check                      └──────────┬─────────────┘
+               │             │                         │
+          found │    not found│                        ▼
+               ▼             ▼              AskUserQuestion: Proceed?
+         [Steps 5-6]       🛑 STOP            │               │
+         Decompose +                        Yes │           No │
+         generate issues                       ▼             ▼
+               │                       [Step 7] Create   Aborted —
+               ▼                       in Linear         no Linear
+    AskUserQuestion: Proceed?          (Backlog)         changes made
+      │               │                       │
+    Yes │           No │                      ▼
+        ▼             ▼                 [Step 8] Summary
+  [Step 7] Create   Aborted —
+  in Linear         no Linear
+  (Backlog)         changes made
+        │
+        ▼
+  [Step 8] Summary
 ```
 
 **Linear states managed by this skill:**
