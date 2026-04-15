@@ -1,0 +1,533 @@
+---
+name: harness-design
+version: 1.0.0
+description: "Transforms a raw idea into a fully scoped Linear project with milestones, phases, and schema-compliant issues. Invokes /office-hours and /plan-eng-review interactively, then decomposes the resulting design doc into a complete Linear issue hierarchy. Invoke with /harness-design <project-id-or-idea>."
+allowed-tools:
+  - Read
+  - Write
+  - Edit
+  - Bash
+  - Grep
+  - Glob
+  - Agent
+  - Skill
+  - AskUserQuestion
+  - mcp__linear-server__get_project
+  - mcp__linear-server__save_project
+  - mcp__linear-server__list_milestones
+  - mcp__linear-server__save_milestone
+  - mcp__linear-server__save_issue
+  - mcp__linear-server__list_teams
+---
+
+# harness-design
+
+You are transforming a raw idea into a fully scoped Linear project. The user invoked this skill as `/harness-design <project-id-or-idea>` (or similar). Extract the argument from the invocation.
+
+This skill runs interactively. It orchestrates two sessions with the user (/office-hours and /plan-eng-review) before doing any autonomous work. Do NOT skip or pre-answer those sessions — the user's participation is required.
+
+## Preamble
+
+Before any steps, run these checks in a single bash block:
+
+```bash
+# Detect repo context and gstack slug
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "not-a-git-repo")
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+CLAUDE_MD_EXISTS=$([ -f "$REPO_ROOT/CLAUDE.md" ] && echo "yes" || echo "no")
+
+# Derive gstack slug
+eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+SLUG="${SLUG:-unknown}"
+
+echo "Branch:     $CURRENT_BRANCH"
+echo "Repo root:  $REPO_ROOT"
+echo "CLAUDE.md:  $CLAUDE_MD_EXISTS"
+echo "Slug:       $SLUG"
+```
+
+**harness-design tolerates a missing CLAUDE.md** — unlike harness-dev, it operates at the project-planning layer, before a repo may exist. If CLAUDE.md is absent, print:
+
+```
+⚠️  No CLAUDE.md found. Proceeding without repo context.
+    (Run /harness-bootstrap after /harness-design to set up the project repo.)
+```
+
+Do NOT stop. Continue to Step 1.
+
+---
+
+## Step 1 — Input Resolution
+
+Extract the argument the user passed to `/harness-design`. Three cases:
+
+### Case A: Argument looks like a Linear project identifier
+
+A Linear project identifier is a UUID, a URL slug, or a short name that matches an existing project. Try to resolve it:
+
+```
+mcp__linear-server__get_project(query: "<argument>")
+```
+
+If it resolves successfully:
+- Use the project's `name` as the working project name
+- Use the project's `description` as the seed idea
+- Record the project `id` — this is the target project for all issue creation in Step 7
+- Print: `✅  Resolved Linear project: <name> (<id>). Using project description as seed.`
+
+If `get_project` fails (project not found), fall through to Case B.
+
+### Case B: Argument is a free-form idea string
+
+The argument doesn't match a Linear project. Use `AskUserQuestion` to ask:
+
+```
+No Linear project found matching "<argument>".
+
+Options:
+  1. Create a new Linear project for this idea and continue
+  2. Proceed without a Linear project (issues will be attached to an existing project you specify)
+  3. Cancel
+
+Which would you prefer?
+```
+
+- If the user picks **1**: use `mcp__linear-server__list_teams` to find the team, then `mcp__linear-server__save_project` to create the project. Record the new project `id`.
+- If the user picks **2**: use `AskUserQuestion` to ask which existing project to attach issues to. Call `mcp__linear-server__get_project` with the provided name/ID. Record the project `id`.
+- If the user picks **3**: STOP gracefully.
+
+In either continuing case, treat the argument string as the seed idea.
+
+### Case C: No argument provided
+
+Use `AskUserQuestion`:
+
+```
+What would you like to design?
+
+Provide either:
+  • A Linear project ID or name (e.g., "WHI-payments", "forkcast-cli")
+  • A free-form idea description (e.g., "a CLI tool that syncs GitHub issues to Notion")
+```
+
+Then re-enter Case A or Case B based on the answer.
+
+---
+
+## Step 2 — Design Session via /office-hours
+
+**This is an interactive session. Do NOT pre-answer the questions /office-hours asks. The user must participate.**
+
+Invoke /office-hours using the `Skill` tool:
+
+```
+Skill("office-hours", args: "<seed idea>")
+```
+
+Pass the seed idea from Step 1 as the argument. If the seed came from a Linear project description, summarize it in 1-2 sentences before passing.
+
+While /office-hours runs:
+- Do NOT interrupt
+- Do NOT attempt to answer on behalf of the user
+- Wait for it to complete before continuing
+
+After /office-hours completes, print:
+```
+✅  /office-hours session complete. Proceeding to architecture review.
+```
+
+---
+
+## Step 3 — Architecture Review via /plan-eng-review
+
+**This is also an interactive session. Do NOT pre-answer anything.**
+
+Invoke /plan-eng-review using the `Skill` tool:
+
+```
+Skill("plan-eng-review")
+```
+
+/plan-eng-review reads the design doc produced by /office-hours and walks through architecture decisions interactively with the user.
+
+While /plan-eng-review runs:
+- Do NOT interrupt
+- Do NOT attempt to answer on behalf of the user
+- Wait for it to complete before continuing
+
+After /plan-eng-review completes, print:
+```
+✅  /plan-eng-review session complete. Checking for design artifacts.
+```
+
+---
+
+## Step 4 — Design Doc Presence Check
+
+Before doing any decomposition, verify that /office-hours actually produced a design doc. If the user abandoned the session mid-way, no doc was written — proceeding without it would produce hallucinated issue descriptions.
+
+Derive the slug from the preamble's `SLUG` variable. If `SLUG` is `unknown`, try to derive from the project name (lowercase, hyphens, max 30 chars).
+
+```bash
+SLUG="<slug>"
+DESIGN_DOC=$(ls -t ~/.gstack/projects/"$SLUG"/*-design-*.md 2>/dev/null | head -1)
+echo "Design doc: ${DESIGN_DOC:-NOT FOUND}"
+```
+
+**If no design doc is found — STOP with this error:**
+
+```
+🛑  STOP: No design doc found in ~/.gstack/projects/<slug>/
+
+This means /office-hours did not complete successfully (the user may have
+abandoned the session before the doc was written).
+
+Resolution:
+  1. Re-invoke /office-hours and complete the full session
+  2. Then re-invoke /harness-design <project-id-or-idea>
+
+Do NOT proceed without the design doc — issue descriptions would be fabricated.
+```
+
+**If the design doc is found:**
+
+```bash
+# Also look for eng review artifacts
+ENG_REVIEW=$(ls -t ~/.gstack/projects/"$SLUG"/*-eng-review-*.md 2>/dev/null | head -1)
+PLAN_REVIEW=$(ls -t ~/.gstack/projects/"$SLUG"/*-plan-eng-review-*.md 2>/dev/null | head -1)
+ENG_ARTIFACT="${ENG_REVIEW:-$PLAN_REVIEW}"
+echo "Eng review: ${ENG_ARTIFACT:-not found (will fall back to design doc)}"
+```
+
+Record both paths. If no eng review artifact is found, fall back to the design doc only in Step 5 — do NOT stop.
+
+---
+
+## Step 5 — Decomposition
+
+Read the design doc in full. Read the eng review artifact if found.
+
+```bash
+cat "<DESIGN_DOC_PATH>"
+# If eng review exists:
+cat "<ENG_ARTIFACT_PATH>"
+```
+
+Internally extract the following structured information:
+
+1. **Project name and one-paragraph summary** — from the design doc header or Problem Statement section
+2. **Major phases** — sections like "Phase 0", "Phase 1", "Skill 1", numbered milestones, or other top-level groupings. Each major phase becomes a Linear milestone.
+3. **Features / deliverables within each phase** — sub-sections, bullet lists, or named components. Each becomes a Linear issue (or a parent issue with sub-issues for large phases).
+4. **Dependencies between deliverables** — explicit "depends on", "after X", ordering language, or logical data-flow dependencies.
+5. **Technical decisions** — from Architecture Notes, Eng Review, or "Recommended Approach" sections. Note the source heading so you can cite it in issue descriptions.
+
+Then produce a **Decomposition Plan** as a markdown nested list:
+
+```
+## Decomposition Plan
+
+Project: <project name>
+
+Milestone 1: <Phase name>
+  Issue: <title> [priority: Urgent/High/Normal/Low] [no blockers]
+  Issue: <title> [priority: Normal] [blocks: issue above]
+  ...
+
+Milestone 2: <Phase name>
+  Issue: <title> [priority: Normal] [blocked by: last issue of Milestone 1]
+  ...
+
+Large phases (5+ issues):
+  Parent Issue: <phase name overview>
+    Sub-issue: <title>
+    Sub-issue: <title>
+    ...
+```
+
+Print the Decomposition Plan to the user and add:
+
+```
+Review the plan above. Press ESC to abort before any Linear changes are made.
+Proceeding to issue generation in a moment...
+```
+
+Then continue to Step 6. (There is no explicit confirmation prompt — the user can abort by pressing ESC at any time before Step 7 begins. Note this in the output above.)
+
+---
+
+## Step 6 — Issue Generation
+
+For each issue in the Decomposition Plan, construct a complete description using all five schema sections. The schema is at `~/.claude/skills/harness-dev/schema.md`.
+
+The five required headings (verbatim, as level-2 markdown headings):
+- `## Context`
+- `## Acceptance Criteria`
+- `## Architecture Notes`
+- `## Dependencies`
+- `## Scope Boundary`
+
+### Writing each section
+
+**`## Context`**
+- What this issue is about, why it matters, where it fits in the project
+- Cite the specific design doc section by heading name: e.g., "See design doc §Target User & Narrowest Wedge"
+- Minimum: 2-3 sentences with concrete, project-specific content
+
+**`## Acceptance Criteria`**
+- Use checklist format: `- [ ] Concrete, testable criterion`
+- Each criterion must be independently verifiable — no vague phrasing like "works correctly"
+- Prefer: "returns X for input Y", "file Z exists at path P", "command C outputs D"
+- Minimum: 3 criteria
+
+**`## Architecture Notes`**
+- Key files to create or modify (with paths relative to repo root)
+- Function signatures or interface shapes where known
+- Error handling expectations
+- Patterns to follow (reference existing files where applicable)
+- Cite specific eng review decisions: e.g., "See eng review §Model Routing Constraint"
+- If no eng review exists, derive from design doc architecture sections
+
+**`## Dependencies`**
+- List blocking issues by their intended title (IDs will be resolved in Step 7)
+- Format: `- <Issue title> (to be resolved in Step 7)`
+- Write `None` if no dependencies
+
+**`## Scope Boundary`**
+- What is explicitly NOT in scope for this issue
+- Minimum: 2 explicit exclusions
+- Prevents scope creep and over-engineering
+
+### Self-validation (REQUIRED before creating any issue in Linear)
+
+Apply this validation to every issue description BEFORE calling any Linear API:
+
+```
+VALIDATION RULES:
+1. All five headings present:
+   regex: ^## (Context|Acceptance Criteria|Architecture Notes|Dependencies|Scope Boundary)
+   → check each of the five exists
+
+2. Minimum content per section:
+   → strip lines matching ^\[.*\]$ (bracket placeholders)
+   → remaining non-whitespace chars must be ≥ 20 per section
+
+3. No bare placeholders:
+   → no line that is exactly [placeholder text] (bracket-wrapped, alone on the line)
+```
+
+**If validation fails for an issue:**
+- Regenerate that issue's description — do NOT skip, do NOT create a partial description in Linear
+- Re-validate the regenerated description before proceeding
+- If regeneration fails twice, print a warning and skip that specific issue (log the title for the summary)
+
+**If validation passes:**
+- Record the validated description
+- Continue to next issue
+
+For large projects (10+ issues), group issues into sub-issues under a parent issue per phase. The parent issue's description is a brief index still in schema format:
+
+```markdown
+## Context
+Phase overview: <1-2 sentences>. This parent tracks the following sub-issues:
+- <sub-issue title 1>
+- <sub-issue title 2>
+
+## Acceptance Criteria
+- [ ] All sub-issues in this phase are in Done state
+
+## Architecture Notes
+See sub-issues for individual technical details. Phase depends on: <preceding phase name>.
+
+## Dependencies
+<blocking milestone or "None">
+
+## Scope Boundary
+This issue is an index only. All implementation is in the sub-issues below.
+```
+
+---
+
+## Step 7 — Linear Creation
+
+Create all Linear objects in this order: milestones first, then issues in dependency order (blockers before blocked), then sub-issues.
+
+### 7a. Ensure milestones exist
+
+```
+mcp__linear-server__list_milestones(project: "<project-id>")
+```
+
+For each milestone in the Decomposition Plan, check if one with that name already exists. If not, create it:
+
+```
+mcp__linear-server__save_milestone(
+  project: "<project-id>",
+  name: "<milestone name>",
+  description: "<1-sentence summary of the phase>"
+)
+```
+
+Record the returned milestone ID for each. Map milestone name → milestone ID.
+
+### 7b. Determine team
+
+If the project was resolved in Step 1, the team is known from the project. Otherwise:
+
+```
+mcp__linear-server__list_teams()
+```
+
+Ask the user (via AskUserQuestion) which team to assign issues to, if not determinable from context.
+
+### 7c. Create issues in dependency order
+
+Process issues in this order:
+1. Issues with no blockers (within their milestone, sorted by priority)
+2. Issues whose blockers have been created (and their IDs recorded)
+3. Continue until all issues are created
+
+For each issue, call:
+
+```
+mcp__linear-server__save_issue(
+  team: "<team-id>",
+  project: "<project-id>",
+  title: "<issue title>",
+  description: "<validated description from Step 6>",
+  milestone: "<milestone-id for this phase>",
+  priority: <0=None|1=Urgent|2=High|3=Normal|4=Low>,
+  blockedBy: ["<id-of-blocking-issue>", ...]   // only if blockers have been created
+)
+```
+
+**As each issue is created:**
+- Record the returned Linear issue ID
+- Map: intended title → Linear issue ID
+- Update the `blockedBy` field of any subsequent issues that depend on this one
+
+**For sub-issues:**
+- Create the parent issue first (no `blockedBy` within the phase yet)
+- Create each sub-issue with `parentId: "<parent-issue-id>"`
+- Sub-issues inherit the parent's milestone
+
+**If a Linear API call fails:**
+- Print: `⚠️  Failed to create issue "<title>": <error>`
+- Continue creating remaining issues — do NOT abort the entire run
+- Record failed issues for the summary
+- Do NOT silently retry more than once (one retry on network error is acceptable)
+
+### 7d. Issues created in Backlog state
+
+**harness-design creates all issues in `Backlog` state.** Do NOT transition issues to In Progress — that is `/harness-dev`'s job when implementation begins.
+
+---
+
+## Step 8 — Summary Output
+
+After all creation is complete, print the structured summary:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅  harness-design complete for <project-name>
+
+Milestones created:   N
+Issues created:       M
+Sub-issues created:   K
+Issues failed:        F  ← (0 if all succeeded)
+
+Dependency chain:
+  <Milestone 1 name>
+    WHI-<a>: <title>
+    WHI-<b>: <title> (blocked by WHI-<a>)
+  <Milestone 2 name>
+    WHI-<c>: <title> (blocked by WHI-<b>)
+    WHI-<d>: <title> (blocked by WHI-<c>)
+    ...
+
+Failed issues (if any):
+  ❌ <title> — <error or validation failure reason>
+
+Next step:  /harness-dev WHI-<first-unblocked-issue-id>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+The "first unblocked issue" is the lowest-numbered issue with no `blockedBy` dependencies (i.e., the natural starting point for implementation).
+
+---
+
+## Error Recovery Reference
+
+| Failure point | Recovery action |
+|---------------|-----------------|
+| Step 1 — Linear project not found | Fall through to free-form idea path (Case B); ask user for target project |
+| Step 1 — user cancels project creation | STOP gracefully |
+| Step 4 — design doc missing | 🛑 STOP with explicit instructions to re-run /office-hours; do NOT proceed |
+| Step 5 — eng review artifact not found | Fall back to design doc only; warn but continue |
+| Step 6 — issue description fails validation | Regenerate description; if second attempt also fails, skip and log |
+| Step 7 — milestone creation fails | Print error, STOP — issues cannot reference a milestone that doesn't exist |
+| Step 7 — individual issue creation fails | Print warning, continue with remaining issues; report in summary |
+| Step 7 — partial creation (some issues created, some not) | Report what succeeded and what failed in the summary; do NOT roll back created issues silently |
+| User presses ESC before Step 7 | No Linear changes made; exit cleanly |
+| Any step — unexpected error | Print the error and current state; do NOT silently swallow failures |
+
+**On partial failure:** always report exactly which issues were created (with their IDs) and which failed. The user needs this information to decide whether to re-run or fix manually. Never leave the user guessing about the state of Linear.
+
+---
+
+## State Machine
+
+```
+(no Linear state)  ──[Step 1]──►  Project resolved/created
+                                          │
+                                          ▼
+                                  [Step 2] /office-hours
+                                  (interactive — user participates)
+                                          │
+                                          ▼
+                                  [Step 3] /plan-eng-review
+                                  (interactive — user participates)
+                                          │
+                                          ▼
+                                  [Step 4] Design doc check
+                                    │             │
+                               found │        not found │
+                                    ▼             ▼
+                             [Steps 5-6]        🛑 STOP
+                             Decompose +
+                             generate issues
+                                    │
+                                    ▼
+                              [Step 7] Create
+                              in Linear (Backlog)
+                                    │
+                                    ▼
+                              [Step 8] Summary
+```
+
+**Linear states managed by this skill:**
+- All issues are created in `Backlog` state
+- No state transitions happen after creation
+
+**Linear states NOT managed by this skill:**
+- `Backlog → In Progress` — managed by `/harness-dev` when implementation begins
+- All subsequent transitions (`In Progress → In Review → Done`) — managed by `/harness-dev` and `/harness-review`
+
+---
+
+## Scope Boundary
+
+This skill **only**:
+- Reads a Linear project or accepts a free-form idea
+- Invokes /office-hours and /plan-eng-review interactively (user participates)
+- Reads the resulting design doc and eng review artifacts
+- Decomposes the design into milestones, phases, and issues
+- Generates schema-compliant issue descriptions (self-validated)
+- Creates milestones and issues in Linear in `Backlog` state
+
+This skill **does NOT**:
+- Automate or pre-answer /office-hours or /plan-eng-review — they are interactive sessions
+- Generate code or implementation artifacts — only Linear project structure and issue descriptions
+- Modify existing Linear issues — only creates new ones
+- Handle multi-project scenarios — one project per invocation
+- Transition issues to `In Progress` — that is `/harness-dev`'s job
+- Run adversarial review, implement features, or manage worktrees
