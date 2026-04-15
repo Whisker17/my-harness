@@ -492,9 +492,9 @@ When the user says "继续下一个任务" or similar, follow this sequence befo
 3. Merge the PR: `gh pr merge --merge --delete-branch`
 4. Switch to `dev` and sync: `cd <project-root> && git checkout dev && git pull origin dev`
 5. Remove the worktree: `git worktree remove .worktrees/<name>`
-6. **Update Linear**: move the completed issue to `Done` state (see Linear Workflow below)
+6. **Update Linear**: move the completed issue to `<STATE_COMPLETED>` state (see Linear Workflow below)
 7. Create a new worktree for the next task (per Worktree Lifecycle above)
-8. **Update Linear**: move the next issue to `In Progress` state
+8. **Update Linear**: move the next issue to `<STATE_STARTED>` state
 
 ## PR Workflow
 
