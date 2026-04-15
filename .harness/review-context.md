@@ -40,7 +40,7 @@ To be populated after adversarial review runs.
 
 ## PR
 
-(to be added after PR creation)
+https://github.com/Whisker17/my-harness/pull/5
 
 ## Acceptance Criteria Status
 
