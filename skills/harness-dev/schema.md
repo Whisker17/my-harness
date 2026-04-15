@@ -68,7 +68,7 @@ This section is the LLM's primary technical guide. The more specific, the better
 What must be done before this issue can start:
 - Other Linear issues (by ID) that must be in `Done` state
 - External resources or services that must exist
-- Write `None` if there are no dependencies
+- Write `None — no blocking dependencies.` if there are no dependencies (the sentinel must be long enough to clear the ≥20 non-whitespace-char minimum)
 
 ### `## Scope Boundary`
 

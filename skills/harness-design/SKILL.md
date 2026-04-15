@@ -17,6 +17,7 @@ allowed-tools:
   - mcp__linear-server__list_milestones
   - mcp__linear-server__save_milestone
   - mcp__linear-server__save_issue
+  - mcp__linear-server__list_issues
   - mcp__linear-server__list_teams
 ---
 
@@ -288,9 +289,10 @@ The five required headings (verbatim, as level-2 markdown headings):
 - If no eng review exists, derive from design doc architecture sections
 
 **`## Dependencies`**
-- List blocking issues by their intended title (IDs will be resolved in Step 7)
-- Format: `- <Issue title> (to be resolved in Step 7)`
-- Write `None` if no dependencies
+- List blocking issues by their intended title using the placeholder tag `@@DEP:<Issue title>@@`
+- Format: `- @@DEP:<Issue title>@@`
+- These placeholder tags are rewritten to actual `WHI-<N>` references in Step 7d after all issues are created. Do NOT leave `(to be resolved in Step 7)` or similar prose in the live description.
+- Write `None — no blocking dependencies.` if no dependencies (the sentinel must be long enough to clear the ≥20 non-whitespace-char minimum)
 
 **`## Scope Boundary`**
 - What is explicitly NOT in scope for this issue
@@ -316,6 +318,7 @@ VALIDATION RULES:
 ```
 
 **If validation fails for an issue:**
+- **Before regenerating, re-read the relevant design doc section** using `Read(file_path=<design-doc-path>, offset=<start-line>, limit=<line-count>)` so the regeneration is grounded in the actual source text. Do NOT regenerate from memory — on long projects the design doc content may have fallen out of context.
 - Regenerate that issue's description — do NOT skip, do NOT create a partial description in Linear
 - Re-validate the regenerated description before proceeding
 - If regeneration fails twice, print a warning and skip that specific issue (log the title for the summary)
@@ -386,6 +389,17 @@ Process issues in this order:
 2. Issues whose blockers have been created (and their IDs recorded)
 3. Continue until all issues are created
 
+**Dedup check before each create.** On re-invocation (or if a prior run partially succeeded), avoid double-creating an issue that already exists:
+
+```
+mcp__linear-server__list_issues(
+  project: "<project-id>",
+  query: "<issue title>"
+)
+```
+
+If the returned list contains an issue whose `title` is an exact match, skip `save_issue` — record the existing issue ID in the title → ID map and proceed. Report it in the summary as `existing` (not `created`). If no exact match, continue with `save_issue` below.
+
 For each issue, call:
 
 ```
@@ -395,6 +409,7 @@ mcp__linear-server__save_issue(
   title: "<issue title>",
   description: "<validated description from Step 6>",
   milestone: "<milestone-id for this phase>",
+  state: "Backlog",
   priority: <0=None|1=Urgent|2=High|3=Normal|4=Low>,
   blockedBy: ["<id-of-blocking-issue>", ...]   // only if blockers have been created
 )
@@ -407,8 +422,8 @@ mcp__linear-server__save_issue(
 
 **For sub-issues:**
 - Create the parent issue first (no `blockedBy` within the phase yet)
-- Create each sub-issue with `parentId: "<parent-issue-id>"`
-- Sub-issues inherit the parent's milestone
+- Create each sub-issue with BOTH `parentId: "<parent-issue-id>"` AND `milestone: "<milestone-id for this phase>"` — sub-issues do NOT auto-inherit the parent's milestone; it must be set explicitly
+- All other fields (`team`, `project`, `state: "Backlog"`, `description`, `priority`) follow the standard `save_issue` call template above
 
 **If a Linear API call fails:**
 - Print: `⚠️  Failed to create issue "<title>": <error>`
@@ -416,7 +431,19 @@ mcp__linear-server__save_issue(
 - Record failed issues for the summary
 - Do NOT silently retry more than once (one retry on network error is acceptable)
 
-### 7d. Issues created in Backlog state
+### 7d. Resolve dependency placeholders (second pass)
+
+After ALL issues are created and the title → Linear ID map is complete, rewrite each description to replace `@@DEP:<title>@@` placeholder tags with actual `WHI-<N>` references:
+
+1. For every issue in the title → ID map whose description contains `@@DEP:...@@` tags:
+   - Build the final Dependencies section text: replace each `@@DEP:<title>@@` tag with the resolved `WHI-<N>` reference from the map (or drop the line if the referenced title failed to create — noting this in the summary).
+   - Call `mcp__linear-server__save_issue(id: "<issue-id>", description: "<rewritten description>")` to update the issue in place.
+2. Do not leave any `@@DEP:...@@` tags in the live Linear descriptions — validate with a final grep of the rewritten descriptions before proceeding.
+3. If a referenced title was skipped or failed to create, replace the tag with `(dependency <title> — not created; see summary)` so the description stays valid and informative.
+
+This two-pass approach keeps the description self-contained once Step 7 completes — no meta-comments about unresolved IDs remain.
+
+### 7e. Issues created in Backlog state
 
 **harness-design creates all issues in `Backlog` state.** Do NOT transition issues to In Progress — that is `/harness-dev`'s job when implementation begins.
 
