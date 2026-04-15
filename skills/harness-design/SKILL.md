@@ -287,7 +287,7 @@ The five required headings (verbatim, as level-2 markdown headings):
 - Function signatures or interface shapes where known
 - Error handling expectations
 - Patterns to follow (reference existing files where applicable)
-- Cite specific eng review decisions: e.g., "See eng review §Model Routing Constraint"
+- Cite specific eng review decisions using a heading that appears in the `/plan-eng-review` output — e.g., `"See eng review §Key Interactions to Verify"` or `"See eng review §Critical Paths"`. If no relevant test-plan heading applies, cite a heading from the design doc instead.
 - If no eng review exists, derive from design doc architecture sections
 
 **`## Dependencies`**
