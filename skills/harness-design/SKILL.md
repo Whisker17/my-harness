@@ -139,7 +139,30 @@ Which would you prefer?
 ```
 
 - If the user picks **1**: use `mcp__linear-server__list_teams` to find the team, then `mcp__linear-server__save_project` to create the project. Record the new project `id`.
-- If the user picks **2**: use `AskUserQuestion` to ask which existing project to attach issues to. Call `mcp__linear-server__get_project` with the provided name/ID. Record the project `id`.
+- If the user picks **2**: use a retry loop (up to 3 attempts total) to resolve the existing project:
+
+  ```
+  for attempt in 1..3:
+    answer = AskUserQuestion("Which existing project? Provide its ID, URL slug, or exact name.")
+    result = mcp__linear-server__get_project(query: answer)
+    if result resolves successfully:
+      record project id
+      break
+    else:
+      print "⚠️  Project not found: \"<answer>\" (attempt <attempt>/3). Check the name and try again."
+  
+  if all 3 attempts fail:
+    AskUserQuestion(
+      "Could not resolve a project after 3 attempts.\n\nOptions:\n" +
+      "  1. Cancel the skill cleanly\n" +
+      "  2. Create a new project instead (fall through to Case B option 1)\n\n" +
+      "Which would you prefer?"
+    )
+    → If user picks 1: STOP gracefully.
+    → If user picks 2: proceed as Case B option 1 (create new project).
+  ```
+
+  Surface the Linear error on each failure so the user can correct the typo.
 - If the user picks **3**: STOP gracefully.
 
 In either continuing case, treat the argument string as the seed idea.
@@ -535,6 +558,7 @@ The "first unblocked issue" is the lowest-numbered issue with no `blockedBy` dep
 | Failure point | Recovery action |
 |---------------|-----------------|
 | Step 1 — Linear project not found | Fall through to free-form idea path (Case B); ask user for target project |
+| Step 1 — user-supplied project name doesn't resolve (Case B opt 2) | Retry up to 3 attempts surfacing the Linear error; on 3rd failure offer cancel or fall through to create-new-project |
 | Step 1 — user cancels project creation | STOP gracefully |
 | Step 4 — design doc missing | 🛑 STOP with explicit instructions to re-run /office-hours; do NOT proceed |
 | Step 5 — eng review artifact not found | Fall back to design doc only; warn but continue |
