@@ -339,7 +339,7 @@ VALIDATION RULES:
 - Record the validated description
 - Continue to next issue
 
-For large projects (10+ issues), group issues into sub-issues under a parent issue per phase. The parent issue's description is a brief index still in schema format:
+For phases with 5 or more issues, group those issues under a parent index issue with sub-issues. (The threshold is per-phase, not total-project. A project with two 4-issue phases does not trigger grouping; a single 5-issue phase does.) The parent issue's description is a brief index still in schema format:
 
 ```markdown
 ## Context
