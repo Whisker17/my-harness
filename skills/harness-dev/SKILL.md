@@ -33,10 +33,13 @@ CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "not-a-git-
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
 CLAUDE_MD_EXISTS=$([ -f "$REPO_ROOT/CLAUDE.md" ] && echo "yes" || echo "no")
 WORKTREE_LIST=$(git worktree list 2>/dev/null || echo "")
+REVIEW_MODE=$(cat ~/.gstack/config.json 2>/dev/null | jq -r '.review_mode // empty' 2>/dev/null || echo "")
+REVIEW_MODE=${REVIEW_MODE:-adversarial-review}
 
 echo "Branch: $CURRENT_BRANCH"
 echo "Repo root: $REPO_ROOT"
 echo "CLAUDE.md: $CLAUDE_MD_EXISTS"
+echo "Review mode: $REVIEW_MODE"
 echo "Worktrees:"
 echo "$WORKTREE_LIST"
 ```
@@ -47,11 +50,15 @@ If the repo root is empty or CLAUDE.md is missing, warn the user and stop — ha
 
 ## Step 1 — Quality Gate
 
+**Note:** This step always runs, even on re-invocation. This is intentional — it confirms the issue description hasn't been degraded since the last run and that blocked-by dependencies are still satisfied.
+
 **Read the Linear issue:**
 
 Use `mcp__linear-server__get_issue` with `id: "<issue-id>"` and `includeRelations: true`.
 
 **Validate the issue description against the schema:**
+
+The canonical schema is at `~/.claude/skills/harness-dev/schema.md`. The rules below are derived from it. If validation rules change, update schema.md first and align this section.
 
 The issue description must contain all five required sections as level-2 headings. For each section, check:
 
@@ -97,7 +104,7 @@ Do NOT proceed to Step 2 if the quality gate fails.
 Before creating a new worktree, check if one already exists for this issue:
 
 ```bash
-git worktree list | grep "WHI-<N>"
+git worktree list | grep "WHI-<N>[^0-9]"
 ```
 
 If a worktree is found:
@@ -185,6 +192,8 @@ git -C .worktrees/<slug> add -A
 git -C .worktrees/<slug> commit -m "<type>(WHI-<N>): <description>"
 ```
 
+**Staging safety:** Prefer staging specific files when possible. If using `git add -A`, ensure `.gitignore` covers sensitive files. Never stage `.env`, credentials, API keys, or large binaries.
+
 The description should be a concise summary of what was implemented (not "implement acceptance criteria").
 
 ---
@@ -231,9 +240,11 @@ Add relevant labels if applicable: `security`, `breaking-change`, `migration`.
 
 ## Step 4 — Adversarial Review
 
-### Primary path: `/adversarial-review:run`
+Use the `REVIEW_MODE` detected in the preamble to decide the review strategy. Default is `adversarial-review`.
 
-If `/adversarial-review:run` is available and a PR exists, invoke it:
+### Primary path: `/adversarial-review:run` (when REVIEW_MODE is `adversarial-review`)
+
+If `/adversarial-review:run` is available, a PR exists, and `REVIEW_MODE` is `adversarial-review`, invoke it:
 
 ```
 /adversarial-review:run
@@ -265,28 +276,27 @@ Parse the adversarial review output into a structured list:
 
 ## Step 5 — Fix Loop
 
-**Maximum 2 iterations.**
+**Maximum 2 iterations.** Step 4 already produced the initial findings (`ROUND_1_FINDINGS`). This loop consumes those findings first, fixes them, then re-reviews.
 
 ### Loop logic
 
 ```
-ROUND = 1
-PRIOR_FINDINGS = []
+CURRENT_FINDINGS = ROUND_1_FINDINGS (from Step 4)
+FIX_ROUND = 0
 
-WHILE ROUND <= 2:
-  RUN adversarial review → NEW_FINDINGS
-  DEDUPLICATE new_findings against PRIOR_FINDINGS
-  
-  CRITICALS = findings where severity == CRITICAL
-  HIGHS = findings where severity == HIGH
-  MEDIUMS_AND_LOWS = findings where severity in [MEDIUM, LOW]
-  
+LOOP:
+  CRITICALS = CURRENT_FINDINGS where severity == CRITICAL
+  HIGHS = CURRENT_FINDINGS where severity == HIGH
+  MEDIUMS_AND_LOWS = CURRENT_FINDINGS where severity in [MEDIUM, LOW]
+
   Log MEDIUMS_AND_LOWS — do NOT auto-fix these
-  
+
   IF CRITICALS + HIGHS is empty:
     BREAK — no more fixes needed
-  
-  IF ROUND == 2 AND (CRITICALS + HIGHS) is not empty:
+
+  FIX_ROUND += 1
+
+  IF FIX_ROUND > 2:
     Print: "⚠️  Fix loop cap reached (2 iterations). Unresolved findings:"
     List each unresolved CRITICAL and HIGH
     IF any CRITICALS remain:
@@ -296,14 +306,18 @@ WHILE ROUND <= 2:
     ELSE:
       Print: "Proceeding to handoff with unresolved HIGH findings (documented in review context)."
     BREAK
-  
+
   Fix CRITICALS and HIGHS:
     - Edit the relevant files
-    - Commit: `git -C .worktrees/<slug> commit -am "fix(WHI-<N>): address adversarial review findings (round <ROUND>)"`
+    - Stage changes: `git -C .worktrees/<slug> add -A`
+    - Commit: `git -C .worktrees/<slug> commit -m "fix(WHI-<N>): address adversarial review findings (round <FIX_ROUND>)"`
     - Push: `git -C .worktrees/<slug> push`
-  
-  PRIOR_FINDINGS = NEW_FINDINGS
-  ROUND += 1
+
+  Re-run adversarial review (same approach as Step 4) → NEW_FINDINGS
+  DEDUPLICATE NEW_FINDINGS against CURRENT_FINDINGS
+  CURRENT_FINDINGS = NEW_FINDINGS
+
+  GOTO LOOP
 ```
 
 **Important:** Only fix Critical and High findings. Log Medium/Low items in `.harness/review-context.md` for the human reviewer to assess.
@@ -410,7 +424,7 @@ Run:  /harness-review WHI-<N>
 | Failure point | Recovery action |
 |---------------|-----------------|
 | Step 2 — worktree creation fails | Roll back Linear to "Todo", print error, STOP |
-| Step 2 — push fails | Warn, continue with local-only adversarial review |
+| Step 3.5 — push fails | Warn, continue with local-only adversarial review |
 | Step 3.5 — PR creation fails | Warn, continue with Agent subagent for review |
 | Step 5 — cap reached with Criticals | STOP with explicit message, do NOT proceed to handoff |
 | Step 5 — cap reached with Highs only | Proceed to handoff, document in review context |
