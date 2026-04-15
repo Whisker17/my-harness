@@ -321,12 +321,13 @@ VALIDATION RULES:
    regex: ^## (Context|Acceptance Criteria|Architecture Notes|Dependencies|Scope Boundary)
    → check each of the five exists
 
-2. Minimum content per section:
-   → strip lines matching ^\[.*\]$ (bracket placeholders)
+2. Strip placeholder lines and enforce minimum content:
+   → strip lines matching `^[\[<].*[\]>]$` (square- or angle-bracket placeholders)
    → remaining non-whitespace chars must be ≥ 20 per section
-
-3. No bare placeholders:
-   → no line that is exactly [placeholder text] (bracket-wrapped, alone on the line)
+   → this catches both "[fill in later]" and "<TBD>" patterns; 20 chars matches
+     harness-dev's quality gate and rejects one-liner placeholder sections
+   Example: `[details TBD]` and `<blocking milestone or "None">` are both stripped
+            before the char count is evaluated
 ```
 
 **If validation fails for an issue:**
