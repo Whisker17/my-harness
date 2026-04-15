@@ -45,6 +45,16 @@ echo "Branch:     $CURRENT_BRANCH"
 echo "Repo root:  $REPO_ROOT"
 echo "CLAUDE.md:  $CLAUDE_MD_EXISTS"
 echo "Slug:       $SLUG"
+
+# Schema sanity check — must pass before Step 2
+SCHEMA="$HOME/.claude/skills/harness-dev/schema.md"
+if [ ! -s "$SCHEMA" ]; then
+  echo "🛑  STOP: harness-dev schema not found or empty: $SCHEMA"
+  echo "   Install or repair the harness-dev skill before running harness-design."
+  echo "   (The schema is required to generate schema-compliant issue descriptions in Step 6.)"
+  exit 1
+fi
+echo "Schema:     $SCHEMA (ok)"
 ```
 
 **harness-design tolerates a missing CLAUDE.md** — unlike harness-dev, it operates at the project-planning layer, before a repo may exist. If CLAUDE.md is absent, print:
@@ -55,6 +65,41 @@ echo "Slug:       $SLUG"
 ```
 
 Do NOT stop. Continue to Step 1.
+
+---
+
+## Re-entry Detection
+
+Before running Step 1, check whether a prior run already produced artifacts. This lets you skip the long interactive sessions when the user re-invokes after a Step 7 failure.
+
+```bash
+SLUG="<slug-from-preamble>"
+DESIGN_DOC=$(ls -t ~/.gstack/projects/"$SLUG"/*-design-*.md 2>/dev/null | head -1)
+echo "Re-entry check — design doc: ${DESIGN_DOC:-not found}"
+```
+
+Also check whether milestones already exist in Linear for the resolved project (requires the project ID from Step 1 — do this check immediately after Step 1 resolves the project, before Step 2):
+
+```
+mcp__linear-server__list_milestones(project: "<project-id>")
+```
+
+**Decision table:**
+
+| Design doc exists? | Milestones in Linear? | Entry point |
+|---|---|---|
+| No | No | Full run — Steps 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 |
+| Yes | No | Skip /office-hours and /plan-eng-review — jump to Step 5 (reuse existing doc); Step 7 creates milestones normally |
+| Yes | Yes | Skip /office-hours, /plan-eng-review, and milestone creation — jump to Step 5; Step 7c creates only missing issues (dedup check already handles this) |
+| No | Yes | Full run — design doc is the authoritative source; milestones without a doc are stale |
+
+When skipping sessions, print:
+
+```
+⏩  Re-entry detected: design doc found at <path>.
+    Skipping /office-hours and /plan-eng-review — resuming from Step 5.
+    (Re-run /office-hours manually if you want to revise the design.)
+```
 
 ---
 
@@ -94,7 +139,30 @@ Which would you prefer?
 ```
 
 - If the user picks **1**: use `mcp__linear-server__list_teams` to find the team, then `mcp__linear-server__save_project` to create the project. Record the new project `id`.
-- If the user picks **2**: use `AskUserQuestion` to ask which existing project to attach issues to. Call `mcp__linear-server__get_project` with the provided name/ID. Record the project `id`.
+- If the user picks **2**: use a retry loop (up to 3 attempts total) to resolve the existing project:
+
+  ```
+  for attempt in 1..3:
+    answer = AskUserQuestion("Which existing project? Provide its ID, URL slug, or exact name.")
+    result = mcp__linear-server__get_project(query: answer)
+    if result resolves successfully:
+      record project id
+      break
+    else:
+      print "⚠️  Project not found: \"<answer>\" (attempt <attempt>/3). Check the name and try again."
+  
+  if all 3 attempts fail:
+    AskUserQuestion(
+      "Could not resolve a project after 3 attempts.\n\nOptions:\n" +
+      "  1. Cancel the skill cleanly\n" +
+      "  2. Create a new project instead (fall through to Case B option 1)\n\n" +
+      "Which would you prefer?"
+    )
+    → If user picks 1: STOP gracefully.
+    → If user picks 2: proceed as Case B option 1 (create new project).
+  ```
+
+  Surface the Linear error on each failure so the user can correct the typo.
 - If the user picks **3**: STOP gracefully.
 
 In either continuing case, treat the argument string as the seed idea.
@@ -245,14 +313,16 @@ Large phases (5+ issues):
     ...
 ```
 
-Print the Decomposition Plan to the user and add:
+Print the Decomposition Plan to the user, then ask for explicit confirmation before proceeding:
 
 ```
-Review the plan above. Press ESC to abort before any Linear changes are made.
-Proceeding to issue generation in a moment...
+AskUserQuestion("Proceed with creating these N issues in Linear?")
 ```
 
-Then continue to Step 6. (There is no explicit confirmation prompt — the user can abort by pressing ESC at any time before Step 7 begins. Note this in the output above.)
+Replace `N` with the actual count of issues in the plan.
+
+- If the user answers **Yes** (or equivalent): continue to Step 6.
+- If the user answers **No** (or equivalent): print `Aborted — no changes made to Linear.` and exit cleanly. Do NOT create any milestones, issues, or other Linear objects.
 
 ---
 
@@ -285,7 +355,7 @@ The five required headings (verbatim, as level-2 markdown headings):
 - Function signatures or interface shapes where known
 - Error handling expectations
 - Patterns to follow (reference existing files where applicable)
-- Cite specific eng review decisions: e.g., "See eng review §Model Routing Constraint"
+- Cite specific eng review decisions using a heading that appears in the `/plan-eng-review` output — e.g., `"See eng review §Key Interactions to Verify"` or `"See eng review §Critical Paths"`. If no relevant test-plan heading applies, cite a heading from the design doc instead.
 - If no eng review exists, derive from design doc architecture sections
 
 **`## Dependencies`**
@@ -309,12 +379,13 @@ VALIDATION RULES:
    regex: ^## (Context|Acceptance Criteria|Architecture Notes|Dependencies|Scope Boundary)
    → check each of the five exists
 
-2. Minimum content per section:
-   → strip lines matching ^\[.*\]$ (bracket placeholders)
+2. Strip placeholder lines and enforce minimum content:
+   → strip lines matching `^[\[<].*[\]>]$` (square- or angle-bracket placeholders)
    → remaining non-whitespace chars must be ≥ 20 per section
-
-3. No bare placeholders:
-   → no line that is exactly [placeholder text] (bracket-wrapped, alone on the line)
+   → this catches both "[fill in later]" and "<TBD>" patterns; 20 chars matches
+     harness-dev's quality gate and rejects one-liner placeholder sections
+   Example: `[details TBD]` and `<blocking milestone or "None">` are both stripped
+            before the char count is evaluated
 ```
 
 **If validation fails for an issue:**
@@ -327,7 +398,7 @@ VALIDATION RULES:
 - Record the validated description
 - Continue to next issue
 
-For large projects (10+ issues), group issues into sub-issues under a parent issue per phase. The parent issue's description is a brief index still in schema format:
+For phases with 5 or more issues, group those issues under a parent index issue with sub-issues. (The threshold is per-phase, not total-project. A project with two 4-issue phases does not trigger grouping; a single 5-issue phase does.) The parent issue's description is a brief index still in schema format:
 
 ```markdown
 ## Context
@@ -342,7 +413,8 @@ Phase overview: <1-2 sentences>. This parent tracks the following sub-issues:
 See sub-issues for individual technical details. Phase depends on: <preceding phase name>.
 
 ## Dependencies
-<blocking milestone or "None">
+<!-- Fill in: list the @@DEP:<Issue title>@@ placeholder tags for blocking issues, or write "None — no blocking dependencies." -->
+None — no blocking dependencies.
 
 ## Scope Boundary
 This issue is an index only. All implementation is in the sub-issues below.
@@ -487,6 +559,7 @@ The "first unblocked issue" is the lowest-numbered issue with no `blockedBy` dep
 | Failure point | Recovery action |
 |---------------|-----------------|
 | Step 1 — Linear project not found | Fall through to free-form idea path (Case B); ask user for target project |
+| Step 1 — user-supplied project name doesn't resolve (Case B opt 2) | Retry up to 3 attempts surfacing the Linear error; on 3rd failure offer cancel or fall through to create-new-project |
 | Step 1 — user cancels project creation | STOP gracefully |
 | Step 4 — design doc missing | 🛑 STOP with explicit instructions to re-run /office-hours; do NOT proceed |
 | Step 5 — eng review artifact not found | Fall back to design doc only; warn but continue |
@@ -494,7 +567,7 @@ The "first unblocked issue" is the lowest-numbered issue with no `blockedBy` dep
 | Step 7 — milestone creation fails | Print error, STOP — issues cannot reference a milestone that doesn't exist |
 | Step 7 — individual issue creation fails | Print warning, continue with remaining issues; report in summary |
 | Step 7 — partial creation (some issues created, some not) | Report what succeeded and what failed in the summary; do NOT roll back created issues silently |
-| User presses ESC before Step 7 | No Linear changes made; exit cleanly |
+| User answers "No" at Step 5 confirmation gate | No Linear changes made; exit cleanly |
 | Any step — unexpected error | Print the error and current state; do NOT silently swallow failures |
 
 **On partial failure:** always report exactly which issues were created (with their IDs) and which failed. The user needs this information to decide whether to re-run or fix manually. Never leave the user guessing about the state of Linear.
@@ -506,29 +579,40 @@ The "first unblocked issue" is the lowest-numbered issue with no `blockedBy` dep
 ```
 (no Linear state)  ──[Step 1]──►  Project resolved/created
                                           │
-                                          ▼
-                                  [Step 2] /office-hours
-                                  (interactive — user participates)
+                                    Re-entry check
+                                    (design doc? milestones?)
                                           │
-                                          ▼
-                                  [Step 3] /plan-eng-review
-                                  (interactive — user participates)
-                                          │
-                                          ▼
-                                  [Step 4] Design doc check
-                                    │             │
-                               found │        not found │
-                                    ▼             ▼
-                             [Steps 5-6]        🛑 STOP
-                             Decompose +
-                             generate issues
-                                    │
-                                    ▼
-                              [Step 7] Create
-                              in Linear (Backlog)
-                                    │
-                                    ▼
-                              [Step 8] Summary
+                     ┌────────────────────┼────────────────────────┐
+                     │ neither            │ doc only               │ both
+                     ▼                   │                        │
+             [Step 2] /office-hours      │ ⏩ skip Steps 2-4       │ ⏩ skip Steps 2-4
+             (interactive)               │   resume at Step 5     │   resume at Step 5
+                     │                   │                        │   (Step 7 skips
+                     ▼                   │                        │    milestone create)
+             [Step 3] /plan-eng-review   ▼                        ▼
+             (interactive)        [Steps 5-6]               [Steps 5-6]
+                     │            Decompose +               Decompose +
+                     ▼            generate issues           generate issues
+             [Step 4] Design                │                        │
+             doc check                      └──────────┬─────────────┘
+               │             │                         │
+          found │    not found│                        ▼
+               ▼             ▼              AskUserQuestion: Proceed?
+         [Steps 5-6]       🛑 STOP            │               │
+         Decompose +                        Yes │           No │
+         generate issues                       ▼             ▼
+               │                       [Step 7] Create   Aborted —
+               ▼                       in Linear         no Linear
+    AskUserQuestion: Proceed?          (Backlog)         changes made
+      │               │                       │
+    Yes │           No │                      ▼
+        ▼             ▼                 [Step 8] Summary
+  [Step 7] Create   Aborted —
+  in Linear         no Linear
+  (Backlog)         changes made
+        │
+        ▼
+  [Step 8] Summary
 ```
 
 **Linear states managed by this skill:**
