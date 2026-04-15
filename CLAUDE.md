@@ -8,10 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **`dev`** — primary development branch, all feature work branches from here
 - Every development task MUST use a git worktree branched from `dev`
 - Branch naming: `<type>/WHI-<N>-<short-desc>` where type is `feat`, `fix`, or `chore` (e.g., `feat/WHI-58-data-fetcher`, `fix/WHI-60-eip-lookup`)
-- Development happens in the feature worktree first, then the user performs peer review
-- Do NOT merge a phase back to `dev` until the user explicitly says the review is finished and there are no remaining issues
-- When task is complete and review is approved, commit the feature branch, then merge back to `dev` using **merge commit** (no squash, no rebase)
-- After merge, clean up the worktree and its branch
+- Development happens in the feature worktree first, then reviewed via GitHub PR
+- Every feature branch MUST be merged to `dev` through a GitHub PR (no direct `git merge`)
+- Do NOT merge a PR until the user explicitly says the review is finished and there are no remaining issues
+- PR merge strategy: **merge commit** (no squash, no rebase) — use `gh pr merge --merge`
+- After PR merge, clean up the local worktree
 
 ### Worktree Lifecycle
 
@@ -19,27 +20,66 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 1. git worktree add .worktrees/<name> -b <type>/WHI-<N>-<name> dev
 2. Work in .worktrees/<name>/
 3. Implement and verify in the feature worktree
-4. Wait for user peer review and address review feedback there
-5. After user approval, commit with message: "feat(WHI-<N>): description"
-6. Verify build passes: npm run build
-7. git checkout dev && git merge --no-ff <type>/WHI-<N>-<name>
-8. git worktree remove .worktrees/<name>
-9. git branch -d <type>/WHI-<N>-<name>
+4. Commit with message: "feat(WHI-<N>): description"
+5. Verify build passes (if applicable)
+6. Push feature branch: git push -u origin <type>/WHI-<N>-<name>
+7. Create PR: gh pr create --base dev --title "feat(WHI-<N>): description" --body "..."
+8. Run reviews on the PR (adversarial review, human review, Opus review)
+9. Address review feedback, push fixes to the same branch
+10. After approval: gh pr merge --merge --delete-branch
+11. git checkout dev && git pull origin dev
+12. git worktree remove .worktrees/<name>
 ```
 
 ### Task Transition
 
 When the user says "继续下一个任务" or similar, follow this sequence before starting the next task:
 
-1. Ensure the current task has passed peer review and the user has explicitly approved merge/cleanup
-2. Ensure all changes are committed on the current feature branch
-3. Switch to `dev`: `cd <project-root> && git checkout dev`
-4. Merge the feature branch: `git merge --no-ff <current-branch>`
+1. Ensure the current task has passed review and the user has explicitly approved merge
+2. Ensure all changes are committed and pushed on the current feature branch
+3. Merge the PR: `gh pr merge --merge --delete-branch`
+4. Switch to `dev` and sync: `cd <project-root> && git checkout dev && git pull origin dev`
 5. Remove the worktree: `git worktree remove .worktrees/<name>`
-6. Delete the feature branch: `git branch -d <type>/WHI-<N>-<name>`
-7. **Update Linear**: move the completed issue to `Done` state (see Linear Workflow below)
-8. Create a new worktree for the next task (per Worktree Lifecycle above)
-9. **Update Linear**: move the next issue to `In Progress` state
+6. **Update Linear**: move the completed issue to `Done` state (see Linear Workflow below)
+7. Create a new worktree for the next task (per Worktree Lifecycle above)
+8. **Update Linear**: move the next issue to `In Progress` state
+
+## PR Workflow
+
+### PR Creation
+
+- Every feature branch MUST have a PR before review begins
+- Create PR after implementation is committed and pushed:
+  ```
+  gh pr create --base dev --title "<type>(WHI-<N>): description" --body "..."
+  ```
+- PR body format:
+  ```markdown
+  ## Summary
+  <1-3 bullet points describing what changed>
+
+  ## Linear Issue
+  [WHI-<N>](https://linear.app/whisker-personal/issue/WHI-<N>)
+
+  ## Test Plan
+  - [ ] Build passes
+  - [ ] <specific verification steps>
+  ```
+- Add labels for risk signals when applicable: `security`, `breaking-change`, `migration`
+
+### PR Review Flow
+
+1. After PR creation, run `/adversarial-review:run` (uses PR as review surface)
+2. Fix Critical/Major findings, push to the same branch
+3. Human review or Opus `/harness-review` on the PR
+4. All reviews pass → user approves merge
+
+### PR Merge
+
+- Merge strategy: merge commit (`gh pr merge --merge`), NOT squash or rebase
+- Use `--delete-branch` to auto-clean the remote branch
+- After merge, sync local: `git checkout dev && git pull origin dev`
+- Clean up worktree locally: `git worktree remove .worktrees/<name>`
 
 ## Linear Workflow
 
