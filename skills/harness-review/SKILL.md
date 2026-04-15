@@ -13,6 +13,7 @@ allowed-tools:
   - mcp__linear-server__save_comment
   - mcp__linear-server__list_comments
   - mcp__linear-server__list_issue_statuses
+  - mcp__linear-server__list_issues
 ---
 
 # harness-review
@@ -94,22 +95,39 @@ If `.harness/review-context.md` is found, extract from it:
 - **Acceptance criteria status** — from `## Acceptance Criteria Status`
 - **Adversarial review findings** — from `## Adversarial Review Findings`
 
-### 2b. Fallback — Linear comments
+### 2b. Fallback — `gh pr view` on feature branch
 
-If the review context file is missing or the PR URL is not found within it, read Linear comments:
+If the review context file is missing or the PR URL is not found within it, try `gh pr view` on the feature branch:
+
+```bash
+# Detect branch from worktree list
+FEATURE_BRANCH=$(git worktree list | grep "WHI-<N>[^0-9]" | awk '{print $3}' | tr -d '[]')
+echo "Feature branch: $FEATURE_BRANCH"
+
+if [ -n "$FEATURE_BRANCH" ]; then
+  gh pr view "$FEATURE_BRANCH" --json number,url,state,headRefName 2>/dev/null || echo "no PR found"
+fi
+```
+
+If a PR is found, extract the PR URL and number from the JSON output.
+
+### 2c. Fallback — Linear comments
+
+If `gh pr view` also failed, read Linear comments:
 
 Use `mcp__linear-server__list_comments` with `issueId: "<issue-id>"`.
 
 Scan the comments for the handoff comment written by `harness-dev`. It will contain a line like `**PR:** https://github.com/...`. Extract the PR URL from there.
 
-If no PR URL is found in either source, output:
+If no PR URL is found in any source, output:
 
 ```
 ❌  Cannot proceed: no PR URL found.
 
 Checked:
-  - .harness/review-context.md in the worktree (missing or no PR section)
-  - Linear comments on WHI-<N> (no PR link found)
+  1. .harness/review-context.md in the worktree (missing or no PR section)
+  2. gh pr view <feature-branch> (no open PR found)
+  3. Linear comments on WHI-<N> (no PR link found)
 
 Resolution: ensure the implementation was pushed and a PR was created, then re-invoke /harness-review WHI-<N>.
 ```
@@ -130,27 +148,15 @@ PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
 echo "PR number: $PR_NUMBER"
 ```
 
-If the URL wasn't available, try `gh pr view` on the feature branch:
-
-```bash
-# Fall back: detect branch from worktree list
-FEATURE_BRANCH=$(git worktree list | grep "WHI-<N>[^0-9]" | awk '{print $3}' | tr -d '[]')
-echo "Feature branch: $FEATURE_BRANCH"
-
-if [ -n "$FEATURE_BRANCH" ]; then
-  gh pr view "$FEATURE_BRANCH" --json number,url,state,headRefName 2>/dev/null || echo "no PR found"
-fi
-```
-
-If no PR can be found after all fallbacks, output:
+If no PR can be found after all fallbacks in Step 2, output:
 
 ```
 ❌  Cannot proceed: no open PR found for WHI-<N>.
 
 Tried:
   1. PR URL from .harness/review-context.md
-  2. PR URL from Linear comments
-  3. gh pr view <feature-branch>
+  2. gh pr view <feature-branch>
+  3. PR URL from Linear comments
 
 Resolution: push the feature branch and create a PR, then re-invoke /harness-review WHI-<N>.
 ```
@@ -283,7 +289,7 @@ If checks are **pending**, wait briefly (the check may still be running):
 
 ```bash
 # Check once more after a short wait
-sleep 10
+sleep 30
 gh pr checks <number> 2>/dev/null
 ```
 
@@ -306,13 +312,14 @@ Verify the merge succeeded by checking the output for "Merged pull request".
 ### 8b. Sync dev branch
 
 ```bash
+cd "$REPO_ROOT"
 git checkout dev && git pull origin dev
 ```
 
 ### 8c. Remove the worktree
 
 ```bash
-git worktree remove .worktrees/<slug>
+git worktree remove "$WORKTREE_PATH"
 ```
 
 If the worktree removal fails (uncommitted changes, etc.), warn but do NOT block — the merge already happened. Tell the user to clean it up manually.
@@ -348,13 +355,10 @@ Do NOT merge. Do NOT move the issue out of "In Review".
 
 ### 9a. Post GitHub PR review comment
 
-Use `gh api` to post a review comment on the PR:
+Use `gh pr review` to post a review requesting changes:
 
 ```bash
-gh api repos/:owner/:repo/pulls/<number>/reviews \
-  --method POST \
-  --field event=REQUEST_CHANGES \
-  --field body="$(cat <<'REVIEW_EOF'
+gh pr review <number> --request-changes --body "$(cat <<'REVIEW_EOF'
 ## harness-review — Changes Requested
 
 **Verdict:** REJECT — acceptance criteria not fully met
