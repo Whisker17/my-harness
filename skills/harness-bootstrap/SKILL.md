@@ -112,7 +112,11 @@ mcp__linear-server__list_teams()
 Match the team using the project's `teamId`. Record the **team key** (e.g., `WHI`), **team name**,
 and **team ID** — these are used in branch naming and Linear issue links in the generated CLAUDE.md.
 
-Also derive the **workspace slug** from the team's URL or default to `whisker-personal`.
+Also derive the **workspace slug** from the team's URL. If the workspace slug cannot be derived
+from the API response, use `AskUserQuestion` to ask the user:
+```
+What is your Linear workspace slug? (e.g., "my-company" from linear.app/my-company/...)
+```
 
 ### 1c. Fetch issue state names
 
@@ -129,7 +133,33 @@ Build the ordered state flow by sorting the returned states by their workflow ty
 | `started` (first by name sort) | In Progress |
 | `started` (second, if exists) | In Review |
 | `completed` | Done |
-| `canceled` | Canceled |
+| `canceled` | _(excluded from flow diagram)_ |
+
+**Multiple states of the same type:** If the API returns more than one state for a given type
+(e.g., two `canceled` states: "Canceled" and "Duplicate"), include only the first by name sort
+in the flow diagram. Extra `canceled` and `completed` states are excluded from the forward flow.
+
+**Ordering caveat:** Sorting `started` states alphabetically works for default English names
+("In Progress" < "In Review") but may produce incorrect order for custom names. The Linear MCP
+API does not expose a `position` field. After building the flow, **always confirm with the user**:
+
+Use `AskUserQuestion`:
+```
+The detected state flow for your team is:
+
+  <constructed-flow-string>
+
+States used in workflow references:
+  - Starting work → "<first-started-state>"
+  - Submitting for review → "<second-started-state>"
+  - Completed → "<completed-state>"
+
+Is this order correct?
+  1. Yes — looks correct
+  2. No — let me reorder
+```
+
+If the user picks **2**, ask them to provide the correct order of `started` states and use that.
 
 Produce a flow string like:
 ```
@@ -201,10 +231,10 @@ If `GIT_EXISTS` is `no`:
 Extract the second argument (if provided): `REMOTE_URL`.
 
 If `REMOTE_URL` is provided:
-- Validate the URL format: must start with `https://` or `git@`
-- Add the remote:
+- Validate the URL format: must match `^(https://[a-zA-Z0-9._/-]+|git@[a-zA-Z0-9._:/-]+)$`
+- Add the remote (use single quotes to prevent shell expansion):
   ```bash
-  git remote add origin "<REMOTE_URL>"
+  git remote add origin '<REMOTE_URL>'
   ```
 - If `git remote add` fails (remote already exists), print:
   `⚠️  Remote 'origin' already exists: <current-remote>. Skipping remote add.`
@@ -300,6 +330,10 @@ Store as `ISSUE_PREFIX` (e.g., `WHI`).
 
 ### 4c. Compose build commands section
 
+**Note:** The code examples below use `\`` to escape backticks inside markdown code blocks for
+SKILL.md rendering purposes only. When writing the actual CLAUDE.md to disk, use real triple
+backticks (` ``` `). Do NOT include backslashes in the generated output.
+
 For `other` stack, use this placeholder block:
 
 ```markdown
@@ -388,12 +422,15 @@ Assemble the complete CLAUDE.md and write it to `CLAUDE.md` in the current worki
 | Placeholder | Value source |
 |-------------|--------------|
 | `<project-name>` | Linear project `name` |
-| `<workspace>` | Workspace slug (e.g., `whisker-personal`) |
-| `<project-slug>` | Derived from project name: lowercase, hyphens |
+| `<project-url>` | Linear project `url` field from `get_project` response (use verbatim — do NOT derive from name) |
+| `<workspace>` | Workspace slug (from team URL or `AskUserQuestion` if not derivable) |
 | `<team-name>` | Team `name` from Step 1b |
 | `<ISSUE_PREFIX>` | Team key from Step 1b (e.g., `WHI`) |
 | `<project-description>` | Project `description` from Linear (first 300 chars, truncated with "..." if longer) |
 | `<STATE_FLOW_STRING>` | State flow from Step 1c |
+| `<STATE_STARTED>` | Name of the first `started`-type state (e.g., "In Progress") from Step 1c |
+| `<STATE_REVIEW>` | Name of the second `started`-type state (e.g., "In Review") from Step 1c |
+| `<STATE_COMPLETED>` | Name of the `completed`-type state (e.g., "Done") from Step 1c |
 
 If the project description in Linear is empty or a one-liner, add this note in the Project
 Overview section:
@@ -412,7 +449,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 **Project:** <project-name>
-**Linear Project:** [<project-name>](https://linear.app/<workspace>/project/<project-slug>)
+**Linear Project:** [<project-name>](<project-url>)
 **Team:** <team-name> (issue prefix: `<ISSUE_PREFIX>-<N>`)
 
 <project-description>
@@ -504,17 +541,17 @@ When the user says "继续下一个任务" or similar, follow this sequence befo
 <STATE_FLOW_STRING>
 ```
 
-- **Starting a task**: move issue + its sub-issues to `In Progress`
-- **Submitting for review**: move issue to `In Review`
-- **Review approved + merged**: move issue to `Done`
-- **Review has feedback**: keep in `In Review`, address feedback, re-submit
+- **Starting a task**: move issue + its sub-issues to `<STATE_STARTED>`
+- **Submitting for review**: move issue to `<STATE_REVIEW>`
+- **Review approved + merged**: move issue to `<STATE_COMPLETED>`
+- **Review has feedback**: keep in `<STATE_REVIEW>`, address feedback, re-submit
 
 ### Mandatory Linear Updates
 
-1. **Before starting implementation**: move the parent issue and all its sub-issues to `In Progress`
-2. **As each sub-issue is completed**: move that sub-issue to `Done`
-3. **When implementation is done, before requesting review**: move the parent issue to `In Review`
-4. **After review is approved and code is merged to dev**: move the parent issue to `Done`
+1. **Before starting implementation**: move the parent issue and all its sub-issues to `<STATE_STARTED>`
+2. **As each sub-issue is completed**: move that sub-issue to `<STATE_COMPLETED>`
+3. **When implementation is done, before requesting review**: move the parent issue to `<STATE_REVIEW>`
+4. **After review is approved and code is merged to dev**: move the parent issue to `<STATE_COMPLETED>`
 5. **If blocked**: add a comment on the Linear issue explaining what's blocking
 
 ## Schema Reference
@@ -586,15 +623,27 @@ If no remote URL was provided AND this is an existing repo (from Step 2a):
 
 ### 6a. Create private GitHub repo (if no remote yet)
 
+First, verify `gh` is installed and authenticated:
+
 ```bash
-# Derive repo name from project name (lowercase, hyphens, max 100 chars)
-REPO_NAME=$(echo "<project-name>" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | tr -s '-' | sed 's/^-//;s/-$//')
-gh repo create "$REPO_NAME" --private --source=. --push
+which gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
 ```
 
 If the `gh` CLI is not found:
 - Print: `` ⚠️  `gh` CLI not found. Install it from https://cli.github.com/ to enable GitHub repo creation. ``
 - Skip the rest of Step 6. Continue to Step 7.
+
+If `gh auth status` fails (not authenticated):
+- Print: `⚠️  GitHub CLI is not authenticated. Run 'gh auth login' first to enable repo creation.`
+- Skip the rest of Step 6. Continue to Step 7.
+
+If both checks pass, create the repo:
+
+```bash
+# Derive repo name from project name (lowercase, hyphens, max 100 chars)
+REPO_NAME=$(echo "<project-name>" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '-' | tr -s '-' | sed 's/^-//;s/-$//')
+gh repo create "$REPO_NAME" --private --source=. --push
+```
 
 If `gh repo create` fails:
 - Print: `⚠️  GitHub repo creation failed: <error>. Skipping remote push.`
@@ -640,16 +689,26 @@ CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
 echo "Current branch: $CURRENT_BRANCH"
 ```
 
-If the current branch is `main`:
-- Print: `⚠️  Currently on main branch. Switching to dev before committing.`
+If the current branch is NOT `dev`:
+- Print: `⚠️  Currently on $CURRENT_BRANCH branch. Switching to dev before committing.`
 - ```bash
   git checkout dev 2>/dev/null || git checkout -b dev
   ```
 
 ### 7b. Stage and commit
 
+Before staging, ensure `.gitignore` includes harness transient directories:
+
 ```bash
-git add CLAUDE.md AGENTS.md
+# Append to .gitignore if entries are missing (create file if absent)
+touch .gitignore
+grep -qxF '.harness/' .gitignore || echo '.harness/' >> .gitignore
+grep -qxF '.reviews/' .gitignore || echo '.reviews/' >> .gitignore
+grep -qxF '.worktrees/' .gitignore || echo '.worktrees/' >> .gitignore
+```
+
+```bash
+git add CLAUDE.md AGENTS.md .gitignore
 git status --short
 git commit -m "chore: bootstrap project with CLAUDE.md and AGENTS.md"
 ```
@@ -734,7 +793,7 @@ harness-bootstrap is designed to be safe to re-run:
 - **`git init`**: only runs if `.git` is absent (Step 2b guard)
 - **`git remote add`**: skips if `origin` already exists (Step 2c guard)
 - **Commit**: gracefully handles "nothing to commit" (Step 7b)
-- **`gh repo create`**: `--source=.` and `--push` fail gracefully if the repo already exists
+- **`gh repo create`**: If the repo already exists, creation errors — but the error is caught and a warning is printed. The bootstrap continues without GitHub setup. This is error recovery, not true idempotency.
 
 ---
 
@@ -745,10 +804,14 @@ Before writing CLAUDE.md to disk, verify:
 - [ ] Issue prefix is correct: `<ISSUE_PREFIX>-<N>` appears in the Worktree Lifecycle and PR
       Creation sections (not the my-harness `WHI-` prefix if the project uses a different prefix)
 - [ ] State flow uses **actual state names** from `list_issue_statuses`, not hardcoded placeholders
+- [ ] State references in the Linear Workflow bullets (`<STATE_STARTED>`, `<STATE_REVIEW>`,
+      `<STATE_COMPLETED>`) are resolved to actual state names, matching the flow diagram
+- [ ] Linear project URL (`<project-url>`) is the verbatim URL from `get_project`, not a derived slug
 - [ ] Build commands are concrete (not `<your build command>`) for known stacks (`node`, `python`, `go`, `rust`)
 - [ ] Project description in the Project Overview section is non-empty and informative
 - [ ] Schema reference at the bottom points to `~/.claude/skills/harness-dev/schema.md`
 - [ ] No `<placeholder>` tokens remain in the final output (except intentional TODO comments)
+- [ ] Code blocks in Build & Development Commands use real triple backticks (no backslash escapes)
 
 If any item fails, fix it before writing. For the "Other" stack, placeholder build commands are
 acceptable — add a clear TODO comment so the user knows to fill them in.
