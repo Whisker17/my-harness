@@ -61,3 +61,7 @@ Backlog ──► Todo ──► In Progress ──► In Review ──► Done
 3. **When implementation is done, before requesting review**: move the parent issue to `In Review`
 4. **After review is approved and code is merged to dev**: move the parent issue to `Done`
 5. **If blocked**: add a comment on the Linear issue explaining what's blocking
+
+## Schema Reference
+
+The shared issue schema is at `~/.claude/skills/harness-dev/schema.md`.
