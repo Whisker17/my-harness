@@ -33,23 +33,42 @@ PR    ──►  /harness-review WHI-N  ──►  Approve + merge (or reject)
 
 ### Installation
 
-The skills are installed as user-level Claude Code skills:
-
 ```bash
 # Clone the repo
 git clone https://github.com/Whisker17/my-harness.git
+cd my-harness
 
-# Copy skills to Claude Code's skill directory
-cp -r my-harness/skills/harness-dev ~/.claude/skills/
-cp -r my-harness/skills/harness-review ~/.claude/skills/
-cp -r my-harness/skills/harness-design ~/.claude/skills/
-cp -r my-harness/skills/harness-bootstrap ~/.claude/skills/
-
-# Also copy the shared schema (required by harness-dev)
-cp my-harness/skills/harness-dev/schema.md ~/.claude/skills/harness-dev/schema.md
+# Run the setup script
+./setup.sh
 ```
 
-After copying, the skills are available as slash commands in any Claude Code session.
+The setup script will:
+1. Check prerequisites (Claude Code, GitHub CLI, Linear MCP)
+2. Install all four harness skills to `~/.claude/skills/`
+3. Check external skill dependencies and report what's missing
+4. Initialize `~/.gstack/` directory and config
+
+After setup, the skills are available as slash commands in any Claude Code session.
+
+<details>
+<summary>Manual installation (alternative)</summary>
+
+```bash
+# Copy skills to Claude Code's skill directory
+cp -r skills/harness-dev ~/.claude/skills/
+cp -r skills/harness-review ~/.claude/skills/
+cp -r skills/harness-design ~/.claude/skills/
+cp -r skills/harness-bootstrap ~/.claude/skills/
+
+# Copy the shared schema (required by harness-dev)
+cp skills/harness-dev/schema.md ~/.claude/skills/harness-dev/schema.md
+
+# Create gstack directories
+mkdir -p ~/.gstack/projects
+echo '{"review_mode": "adversarial-review"}' > ~/.gstack/config.json
+```
+
+</details>
 
 ### Usage
 
@@ -142,12 +161,37 @@ Backlog ──► Todo ──► In Progress ──► In Review ──► Done
                      (harness-dev)   (harness-dev)  (harness-review)
 ```
 
+## External Dependencies
+
+The harness skills depend on a few external tools and skills. The `setup.sh` script checks all of these automatically.
+
+### Required (core workflow)
+
+| Dependency | Used By | Purpose |
+|------------|---------|---------|
+| [Claude Code](https://claude.ai/code) | All skills | Runtime environment |
+| [GitHub CLI](https://cli.github.com/) (`gh`) | harness-dev, harness-review | PR creation, merge, CI checks |
+| [Linear MCP server](https://github.com/linear/linear-mcp) | All skills | Issue management, state transitions |
+| [adversarial-review](https://github.com/anthropics/claude-code-plugins) plugin | harness-dev | Adversarial code review (falls back to Agent-based review if missing) |
+
+### Optional (design workflow only)
+
+These are only needed if you use `/harness-design` to create new projects from scratch. The core dev/review loop (`/harness-dev` + `/harness-review`) works without them.
+
+| Dependency | Used By | Purpose |
+|------------|---------|---------|
+| `office-hours` skill | harness-design | Interactive requirements gathering |
+| `plan-eng-review` skill | harness-design | Engineering review of design docs |
+| `gstack-slug` binary | harness-design | Project slug generation |
+| `~/.gstack/` directory | harness-design, harness-bootstrap | Design doc storage and project config |
+
 ## Repository Structure
 
 ```
 my-harness/
 ├── CLAUDE.md                              # Project conventions for Claude Code
 ├── README.md                              # This file
+├── setup.sh                               # Interactive setup script
 ├── skills/
 │   ├── harness-dev/
 │   │   └── SKILL.md                       # Dev loop skill (449 lines)
