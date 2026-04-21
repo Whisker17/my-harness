@@ -332,6 +332,16 @@ git branch -d "$FEATURE_BRANCH"
 
 If the branch deletion fails (e.g., branch not fully merged — unlikely after a successful PR merge), warn but do NOT block.
 
+### 8c-3. Verify and delete remote feature branch
+
+`--delete-branch` on `gh pr merge` is unreliable when run inside a worktree (git cannot checkout the base branch since `dev` is occupied by the main worktree, causing the remote delete to silently fail). Always verify:
+
+```bash
+git ls-remote --heads origin "$FEATURE_BRANCH" | grep -q . && git push origin --delete "$FEATURE_BRANCH"
+```
+
+If the remote branch was already deleted by `--delete-branch`, `git ls-remote` returns nothing and the explicit delete is skipped. If it still exists, the explicit delete cleans it up.
+
 ### 8d. Move Linear issue to Done
 
 Use `mcp__linear-server__save_issue` with `id: "<issue-id>", state: "Done"`.

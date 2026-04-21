@@ -466,7 +466,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - PR merge strategy: **merge commit** (no squash, no rebase) — use `gh pr merge --merge`
 - After PR merge, clean up the local worktree
 - After worktree removal, delete the local feature branch: `git branch -d <branch-name>`
-  - `--delete-branch` on `gh pr merge` only deletes the **remote** branch; the local branch must be cleaned up separately
+- **Remote branch cleanup:** `--delete-branch` on `gh pr merge` is unreliable when run inside a worktree (git cannot checkout the base branch since `dev` is occupied by the main worktree, causing the remote delete to silently fail). Always verify and fallback:
+  ```
+  git ls-remote --heads origin <branch-name> | grep -q <branch-name> && git push origin --delete <branch-name>
+  ```
 
 ```
 1. git worktree add .worktrees/<name> -b <type>/<ISSUE_PREFIX>-<N>-<name> dev
@@ -482,7 +485,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 11. git checkout dev && git pull origin dev
 12. git worktree remove .worktrees/<name>
 13. git branch -d <type>/<ISSUE_PREFIX>-<N>-<name>   # clean up local branch
+14. git ls-remote --heads origin <type>/<ISSUE_PREFIX>-<N>-<name> | grep -q . && git push origin --delete <type>/<ISSUE_PREFIX>-<N>-<name>  # verify remote branch deleted
 ```
+
+> **Why step 14?** `gh pr merge --delete-branch` silently fails to delete the remote branch
+> when run inside a worktree, because git cannot checkout the base branch (`dev` is occupied
+> by the main worktree). Always verify with `git ls-remote` and fallback to explicit delete.
 
 ### Task Transition
 
@@ -494,9 +502,10 @@ When the user says "继续下一个任务" or similar, follow this sequence befo
 4. Switch to `dev` and sync: `cd <project-root> && git checkout dev && git pull origin dev`
 5. Remove the worktree: `git worktree remove .worktrees/<name>`
 6. Delete the local feature branch: `git branch -d <type>/<ISSUE_PREFIX>-<N>-<name>`
-7. **Update Linear**: move the completed issue to `<STATE_COMPLETED>` state (see Linear Workflow below)
-8. Create a new worktree for the next task (per Worktree Lifecycle above)
-9. **Update Linear**: move the next issue to `<STATE_STARTED>` state
+7. Verify remote branch deleted, fallback if not: `git ls-remote --heads origin <branch> | grep -q . && git push origin --delete <branch>`
+8. **Update Linear**: move the completed issue to `<STATE_COMPLETED>` state (see Linear Workflow below)
+9. Create a new worktree for the next task (per Worktree Lifecycle above)
+10. **Update Linear**: move the next issue to `<STATE_STARTED>` state
 
 ## PR Workflow
 
@@ -531,7 +540,10 @@ When the user says "继续下一个任务" or similar, follow this sequence befo
 ### PR Merge
 
 - Merge strategy: merge commit (`gh pr merge --merge`), NOT squash or rebase
-- Use `--delete-branch` to auto-clean the remote branch
+- `--delete-branch` is unreliable in worktree contexts — always verify after merge:
+  ```
+  git ls-remote --heads origin <branch> | grep -q . && git push origin --delete <branch>
+  ```
 - After merge, sync local: `git checkout dev && git pull origin dev`
 - Clean up worktree locally: `git worktree remove .worktrees/<name>`
 - Delete the local feature branch: `git branch -d <type>/<ISSUE_PREFIX>-<N>-<name>`
