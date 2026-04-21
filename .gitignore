@@ -1,0 +1,11 @@
+# Harness review context (generated per-worktree by harness-dev)
+.harness/
+
+# Adversarial review artifacts
+.reviews/
+
+# OS files
+.DS_Store
+
+# Worktrees
+.worktrees/
