@@ -324,6 +324,14 @@ git worktree remove "$WORKTREE_PATH"
 
 If the worktree removal fails (uncommitted changes, etc.), warn but do NOT block — the merge already happened. Tell the user to clean it up manually.
 
+### 8c-2. Delete the local feature branch
+
+```bash
+git branch -d "$FEATURE_BRANCH"
+```
+
+If the branch deletion fails (e.g., branch not fully merged — unlikely after a successful PR merge), warn but do NOT block.
+
 ### 8d. Move Linear issue to Done
 
 Use `mcp__linear-server__save_issue` with `id: "<issue-id>", state: "Done"`.

@@ -465,8 +465,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Do NOT merge a PR until the user explicitly says the review is finished and there are no remaining issues
 - PR merge strategy: **merge commit** (no squash, no rebase) — use `gh pr merge --merge`
 - After PR merge, clean up the local worktree
-
-### Worktree Lifecycle
+- After worktree removal, delete the local feature branch: `git branch -d <branch-name>`
+  - `--delete-branch` on `gh pr merge` only deletes the **remote** branch; the local branch must be cleaned up separately
 
 ```
 1. git worktree add .worktrees/<name> -b <type>/<ISSUE_PREFIX>-<N>-<name> dev
@@ -481,6 +481,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 10. After approval: gh pr merge --merge --delete-branch
 11. git checkout dev && git pull origin dev
 12. git worktree remove .worktrees/<name>
+13. git branch -d <type>/<ISSUE_PREFIX>-<N>-<name>   # clean up local branch
 ```
 
 ### Task Transition
@@ -492,9 +493,10 @@ When the user says "继续下一个任务" or similar, follow this sequence befo
 3. Merge the PR: `gh pr merge --merge --delete-branch`
 4. Switch to `dev` and sync: `cd <project-root> && git checkout dev && git pull origin dev`
 5. Remove the worktree: `git worktree remove .worktrees/<name>`
-6. **Update Linear**: move the completed issue to `<STATE_COMPLETED>` state (see Linear Workflow below)
-7. Create a new worktree for the next task (per Worktree Lifecycle above)
-8. **Update Linear**: move the next issue to `<STATE_STARTED>` state
+6. Delete the local feature branch: `git branch -d <type>/<ISSUE_PREFIX>-<N>-<name>`
+7. **Update Linear**: move the completed issue to `<STATE_COMPLETED>` state (see Linear Workflow below)
+8. Create a new worktree for the next task (per Worktree Lifecycle above)
+9. **Update Linear**: move the next issue to `<STATE_STARTED>` state
 
 ## PR Workflow
 
@@ -532,6 +534,7 @@ When the user says "继续下一个任务" or similar, follow this sequence befo
 - Use `--delete-branch` to auto-clean the remote branch
 - After merge, sync local: `git checkout dev && git pull origin dev`
 - Clean up worktree locally: `git worktree remove .worktrees/<name>`
+- Delete the local feature branch: `git branch -d <type>/<ISSUE_PREFIX>-<N>-<name>`
 
 ## Linear Workflow
 
