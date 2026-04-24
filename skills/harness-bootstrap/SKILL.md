@@ -431,6 +431,8 @@ Assemble the complete CLAUDE.md and write it to `CLAUDE.md` in the current worki
 | `<STATE_STARTED>` | Name of the first `started`-type state (e.g., "In Progress") from Step 1c |
 | `<STATE_REVIEW>` | Name of the second `started`-type state (e.g., "In Review") from Step 1c |
 | `<STATE_COMPLETED>` | Name of the `completed`-type state (e.g., "Done") from Step 1c |
+| `<STATE_BACKLOG>` | Name of the `backlog`-type state (e.g., "Backlog") from Step 1c |
+| `<STATE_TODO>` | Name of the `unstarted`-type state (e.g., "Todo") from Step 1c |
 
 If the project description in Linear is empty or a one-liner, add this note in the Project
 Overview section:
@@ -568,6 +570,90 @@ When the user says "继续下一个任务" or similar, follow this sequence befo
 3. **When implementation is done, before requesting review**: move the parent issue to `<STATE_REVIEW>`
 4. **After review is approved and code is merged to dev**: move the parent issue to `<STATE_COMPLETED>`
 5. **If blocked**: add a comment on the Linear issue explaining what's blocking
+
+## Issue-Driven Development
+
+**Core principle: every code change — new feature, bug fix, or course correction — MUST start with a Linear issue.** No cowboy coding. Linear is the single source of truth for what work is planned, in progress, and done.
+
+### Why This Matters
+
+- Issues capture intent before implementation — the "why" doesn't get lost
+- Conflict detection is impossible without a written record of planned work
+- The backlog stays alive: new discoveries update it rather than bypassing it
+- Review is meaningful because reviewers can compare implementation against spec
+
+### Principles
+
+1. **Issues before code.** When the user describes a problem, a feature idea, or a course correction, Claude's first action is to check Linear — not start coding. Search for existing issues that might already cover the request.
+2. **No cowboy coding.** If there is no Linear issue for the work, always confirm with the user before creating a new issue or modifying an existing one. Never create or mutate Linear issues without explicit user approval.
+3. **Living backlog.** Issue descriptions are not write-once documents. When implementation reveals new information, propose updates to the issue description and apply them after user confirmation.
+
+### Course Correction Workflow
+
+When the user explicitly requests a change to the plan — describing a bug, a design flaw, a missing requirement, or a new insight that requires modifying existing issues or creating new ones:
+
+**Important:** This workflow activates when the user clearly indicates the current plan needs to change (e.g., "我发现这个设计有问题", "we need to change the approach", "this requirement is wrong"). It does NOT activate for casual observations or minor comments during implementation.
+
+#### Step 1 — User requests a change
+
+The user describes something that changes the plan. Claude acknowledges and begins the conflict check — no code changes yet.
+
+#### Step 2 — Claude checks for conflicts and proposes changes
+
+Before making any code or Linear changes, Claude:
+
+1. **Search existing issues** for potential conflicts (query the current project across all active states):
+   ```
+   list_issues(project: "<project-name>", state: "<STATE_STARTED>")
+   list_issues(project: "<project-name>", state: "<STATE_TODO>")
+   list_issues(project: "<project-name>", state: "<STATE_BACKLOG>")
+   list_issues(project: "<project-name>", state: "<STATE_REVIEW>")
+   ```
+   Use the project name from the current Linear issue context. If the Linear API call fails, warn the user ("Linear API unavailable — cannot check for conflicts. Please verify manually or retry.") and wait for the user to decide how to proceed. Do not silently skip conflict detection.
+
+2. **Check for conflicts** against the returned issues. Look for:
+
+   | Conflict Type | Detection | Proposed Action (requires user approval) |
+   |---------------|-----------|------------------------------------------|
+   | **Scope overlap** | New work touches the same area described in an existing issue's Architecture Notes or Acceptance Criteria | Report the overlap to the user; recommend adding a comment on the existing issue or splitting scope |
+   | **Invalidation** | New finding makes an existing issue's approach wrong or unnecessary | Report to the user; recommend updating or replacing the affected sections of the existing issue description, or cancelling the issue |
+   | **Dependency change** | New work must be done before an existing issue can proceed | Report to the user; recommend adding a `blockedBy` relation and updating the Dependencies section |
+   | **Description staleness** | Current implementation reveals that an issue's description no longer matches reality | Report to the user; recommend updating the issue description |
+
+3. **Propose the issue change** (do NOT execute yet):
+   - If the finding maps to an existing issue → propose the description update
+   - If it's genuinely new work → propose creating a new issue following the schema (`~/.claude/skills/harness-dev/schema.md`)
+   - If it affects the current in-progress issue → propose updating its Acceptance Criteria or Architecture Notes
+
+#### Step 3 — Claude reports back and waits for approval
+
+Claude presents a summary to the user:
+
+- What conflicts were found (if any), or explicitly state "no conflicts detected"
+- What Linear changes are proposed (new issue creation, description updates, relation changes)
+- What the recommended next step is (continue current work, switch to the new issue, re-prioritize)
+
+**Claude does not create, update, or delete any Linear issues until the user approves.** The user decides what changes to make and in what order.
+
+#### Step 4 — Execute approved changes
+
+After the user approves specific changes:
+
+1. Apply the approved Linear mutations (create issues, update descriptions, add relations)
+2. If the user chose to continue current work → resume the current task's implementation
+3. If the user chose to switch tasks → follow the normal Task Transition workflow (commit current work, switch worktrees)
+4. If the user chose to re-prioritize → update issue priorities as approved, then resume current work
+
+### When to Update an Issue Description
+
+Update a Linear issue description (with user approval) when any of these are true:
+
+- Implementation reveals that the Architecture Notes are wrong or incomplete
+- A new acceptance criterion is discovered during development
+- A scope boundary needs to be added or adjusted
+- Dependencies have changed (new blocker discovered, or blocker resolved)
+
+Always read the full current issue description before updating. Preserve the five required sections (`## Context`, `## Acceptance Criteria`, `## Architecture Notes`, `## Dependencies`, `## Scope Boundary`). When updating, add new information alongside existing content. Outdated content that has been superseded by the current change should be replaced with the corrected version — mark what changed and why in the update.
 
 ## Schema Reference
 
@@ -825,6 +911,10 @@ Before writing CLAUDE.md to disk, verify:
 - [ ] Build commands are concrete (not `<your build command>`) for known stacks (`node`, `python`, `go`, `rust`)
 - [ ] Project description in the Project Overview section is non-empty and informative
 - [ ] Schema reference at the bottom points to `~/.claude/skills/harness-dev/schema.md`
+- [ ] Issue-Driven Development section is present with Course Correction Workflow (4 steps),
+      conflict detection table, and "When to Update an Issue Description" subsection
+- [ ] State placeholders in Course Correction Workflow `list_issues()` calls (`<STATE_STARTED>`,
+      `<STATE_TODO>`, `<STATE_BACKLOG>`, `<STATE_REVIEW>`) are resolved to actual state names
 - [ ] No `<placeholder>` tokens remain in the final output (except intentional TODO comments)
 - [ ] Code blocks in Build & Development Commands use real triple backticks (no backslash escapes)
 
