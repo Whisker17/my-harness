@@ -1,65 +1,58 @@
-# Review Context — WHI-196: Add issue-driven development workflow to CLAUDE.md
+# Review Context — WHI-197: Build harness-triage SKILL.md
 
 ## Implementation Summary
 
-Added a new "Issue-Driven Development" section to CLAUDE.md that establishes Linear as the single source of truth for all code changes. The section includes three core principles (issues before code, no cowboy coding, living backlog), a 4-step Course Correction Workflow with conflict detection, and guidance for when/how to update issue descriptions. The section is placed after "Linear Workflow" and before "Schema Reference" as specified.
-
-Key design decisions:
-- All Linear mutations require explicit user approval (no auto-creation or auto-updates)
-- Conflict detection queries 4 states: In Progress, Todo, Backlog, In Review
-- API failure is handled by warning the user and waiting (not silently skipping)
-- Course correction trigger is narrowed to explicit user requests (not casual observations)
+Built the `skills/harness-triage/SKILL.md` skill definition — the reactive course correction counterpart to harness-design. The skill formalizes mid-development findings into Linear issues with 4-category conflict detection (scope overlap, invalidation, dependency change, description staleness). Key design decisions: lightweight (no /office-hours or /plan-eng-review), hard confirmation gate before any Linear mutations, schema-compliant issue generation with self-validation, and idempotency guards on triage comments.
 
 ## Files Changed
 
-- `CLAUDE.md` — Added ~75 lines: "Issue-Driven Development" section with principles, course correction workflow (Steps 1-4), conflict detection table, and description update guidance
+- `skills/harness-triage/SKILL.md` — New file. Full skill definition with frontmatter, 7-step workflow (input resolution, fetch existing issues, conflict detection, draft changes, confirmation gate, execute changes, summary), error recovery table, state machine diagram, and scope boundary.
 
 ## Adversarial Review Findings
 
-### Addressed (Critical/High) — Round 1
+### Addressed (Critical/High)
 
-| Finding | Severity | Fix |
-|---------|----------|-----|
-| Invalid Linear state values (`started`/`unstarted`) | CRITICAL | Changed to `In Progress`, `Todo`, `In Review` |
-| Unguarded mass issue mutation without user confirmation | CRITICAL | All mutations now require explicit user approval; "propose" language throughout |
-| No API failure handling | CRITICAL | Added fallback: warn user and wait for decision |
-| Scope overlap detection based on files (impossible) | HIGH | Changed to text-based detection against Architecture Notes/Acceptance Criteria |
-| Confirmation contradiction (Principle 2 vs Step 2.3) | HIGH | Both now consistently require user confirmation |
-| No-conflict report path undefined | HIGH | Step 3 explicitly states "no conflicts detected" when none found |
-| Invalidation action contradicts no-unilateral-action principle | HIGH | All conflict actions are now proposals requiring approval |
-| Over-broad trigger phrases | HIGH | Narrowed to explicit user requests with concrete examples |
+**Round 1:**
+- CRITICAL: Confirmation gate bypass via "Modify" loop — Fixed: explicit re-ask with same 3-option AskUserQuestion after every adjustment
+- CRITICAL: Step 6b modifies issues without validating fetched description — Fixed: validates all 5 sections present before any modification
+- CRITICAL: No team resolution — Fixed: added TEAM_ID to required variables with explicit resolution procedure in Step 1
+- HIGH: Conflict detection keyword heuristic vague — Fixed: defined "substantive" as >5 chars, skip placeholder lines
+- HIGH: Schema validation placeholder-stripping diverged from schema.md — Fixed: uses `^\[.*\]$` only (matching canonical schema)
+- HIGH: No idempotency guard on triage comments — Fixed: checks list_comments before posting
+- HIGH: AskUserQuestion / unused Grep/Glob in allowed-tools — Fixed: removed unused tools, added list_comments/list_teams/list_issue_statuses
+- HIGH: Partial execution no re-entry detection — Fixed: idempotency markers in comments serve as re-entry guards
 
-### Addressed (High/Medium) — Round 2
-
-| Finding | Severity | Fix |
-|---------|----------|-----|
-| API fallback violates core principle (silently proceeds) | HIGH | Changed to warn+wait instead of skip |
-| Backlog state excluded from conflict detection | HIGH | Added `Backlog` to query list |
-| No post-approval guidance (workflow ends at Step 3) | MEDIUM | Added Step 4 with execution and re-entry guidance |
-| Heading levels wrong for Steps 1-3 | MEDIUM | Changed from `###` to `####` sub-headings |
-| Deletion rule vs invalidation conflict | MEDIUM | Reconciled: superseded content is replaced, not just deleted |
+**Round 2:**
+- CRITICAL: list_issues doesn't return full descriptions — Fixed: added per-issue get_issue calls (capped at 50) for conflict detection
+- HIGH: list_projects unused in allowed-tools — Fixed: removed
+- HIGH: TEAM_ID fallback only in error table — Fixed: added full resolution procedure in Step 1 body
+- HIGH: 6b blockedBy instruction after code block — Fixed: integrated into save_issue code block
+- HIGH: Step 2 retry has no bound — Fixed: max 2 retries (3 total attempts)
+- HIGH: Case B "2 attempts" counter not mechanically defined — Fixed: explicit loop with ATTEMPT counter
 
 ### Remaining (Medium/Low — not auto-fixed)
 
-| Finding | Severity | Recommendation |
-|---------|----------|----------------|
-| "Casual observation" exemption is subjective | MEDIUM | Inherently requires judgment; consider adding more trigger examples in a future iteration |
-| Race condition: two concurrent sessions | MEDIUM | Architectural limitation of Claude Code; not fixable at CLAUDE.md level |
-| PR body format lacks course correction audit trail | MEDIUM | Consider adding a "Course Corrections" section to PR template in a future issue |
-| Living backlog principle overlaps with Course Correction Workflow | MEDIUM | Principle 3 is the general rule; Course Correction is the specific process — cross-reference could help but risks over-documentation |
-| `<project-name>` origin unclear | LOW | Context-dependent; Claude infers from current Linear issue |
-| Principle 2 confirmation is optional with no decision rule | LOW | Now moot — Principle 2 rewritten to always require confirmation |
-| "Factually wrong" is undefined | LOW | Intentionally flexible; overly prescriptive rules would cause more harm |
-| Hardcoded project name removed | LOW | Changed to `<project-name>` placeholder — resolved |
+- MEDIUM: Comment idempotency matching uses "same finding text" without exact match spec — Recommend exact first-line substring match in implementation
+- MEDIUM: No "nothing to do" exit path when finding is purely informational — Low risk; Step 5 plan would show "No conflicts, no new issues" and user would cancel
+- MEDIUM: 6c save_issue(state: canceled) no idempotency on re-invocation — Harmless: setting same state is a no-op
+- MEDIUM: 3-round modification trigger boundary slightly ambiguous — Recommend clarifying: trigger STOP when 4th "Modify" would start
+- LOW: State machine diagram "No" label fixed to "Cancel"
+- LOW: "same as harness-design Step 6" coupling replaced with canonical schema reference
 
 ## PR
 
-https://github.com/Whisker17/my-harness/pull/7
+https://github.com/Whisker17/my-harness/pull/8
 
 ## Acceptance Criteria Status
 
-- [x] CLAUDE.md contains a new "Issue-Driven Development" section establishing Linear as the single source of truth
-- [x] A "Course Correction Workflow" subsection documents the process (expanded to 4 steps: user requests change, Claude checks conflicts and proposes, Claude reports and waits for approval, execute approved changes)
-- [x] Conflict detection rules are documented: scope overlap, invalidation, dependency change, description staleness — with concrete proposed actions for each
-- [x] The principles are clear: no cowboy coding, issues before code, living backlog
-- [x] The section integrates naturally with the existing "Linear Workflow" section (placed after it, before "Schema Reference")
+- [x] `skills/harness-triage/SKILL.md` exists with full skill frontmatter (name, version, description, allowed-tools)
+- [x] Skill accepts a finding as natural language input (with optional project ID prefix) — Case A/B/C in Step 1
+- [x] Skill resolves the target project from CLAUDE.md context or explicit argument — Step 1 Cases A-C with branch detection
+- [x] Skill fetches all non-Done issues in the project and analyzes conflicts — Step 2 with per-issue get_issue for full descriptions
+- [x] Conflict detection covers 4 categories: scope overlap, invalidation, dependency change, description staleness — Step 3 sections 3a-3d
+- [x] New issues are generated with all 5 schema sections and self-validated — Step 4a with validation rules matching schema.md
+- [x] A confirmation gate (AskUserQuestion) is presented BEFORE any Linear writes — Step 5 with hard gate, explicit re-ask on Modify
+- [x] Conflicting issues are updated with comments explaining what changed and why — Step 6b with idempotency-guarded triage comments
+- [x] Summary output lists all created/modified/canceled issues with IDs and reasons — Step 7 structured output
+- [x] Error recovery table covers: project not found, issue creation failure, conflict detection ambiguity — 11-row error recovery table
+- [x] Skill does NOT auto-implement — only creates/modifies issues — Explicit in frontmatter, preamble, and scope boundary
