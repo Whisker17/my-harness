@@ -12,7 +12,6 @@ allowed-tools:
   - mcp__linear-server__list_issues
   - mcp__linear-server__list_comments
   - mcp__linear-server__get_project
-  - mcp__linear-server__list_projects
   - mcp__linear-server__list_teams
   - mcp__linear-server__list_issue_statuses
 ---
@@ -104,19 +103,25 @@ mcp__linear-server__get_issue(id: "<issue-id>")
 
 Use the issue's `project` and `projectId` fields.
 
-3. **If no project can be resolved**, ask the user:
+3. **If no project can be resolved**, ask the user (retry loop, max 2 asks):
 
 ```
-AskUserQuestion(
-  "Which project does this finding belong to?
-   Provide the project name, ID, or URL slug."
-)
-```
-
-Try to resolve the user's answer with `mcp__linear-server__get_project`. If resolution fails after 2 attempts, STOP with:
-
-```
-🛑  Could not resolve a project after 2 attempts. Check the project name and re-invoke.
+ATTEMPT = 0
+LOOP:
+  ATTEMPT += 1
+  AskUserQuestion(
+    "Which project does this finding belong to?
+     Provide the project name, ID, or URL slug."
+  )
+  result = mcp__linear-server__get_project(query: "<user-answer>")
+  IF result resolves:
+    Record PROJECT_ID and PROJECT_NAME
+    BREAK
+  ELSE:
+    Print: "⚠️  Project not found: \"<user-answer>\" (attempt <ATTEMPT>/2)."
+    IF ATTEMPT >= 2:
+      STOP with: "🛑  Could not resolve a project after 2 attempts. Check the project name and re-invoke."
+    GOTO LOOP
 ```
 
 ### Case C: No arguments provided
@@ -137,8 +142,14 @@ Then resolve the project using Case B logic.
 **After input resolution, you must have:**
 - `PROJECT_ID` — the Linear project ID
 - `PROJECT_NAME` — the Linear project name
-- `TEAM_ID` — the Linear team ID (extracted from the project's `team`/`teamId` fields, or resolved via `mcp__linear-server__list_teams` and user selection)
+- `TEAM_ID` — the Linear team ID
 - `FINDING` — the natural language finding text
+
+**Team resolution:** Extract `TEAM_ID` from the project metadata. If `get_project` returned `team`/`teamId` fields, use them. If the project was resolved from a `get_issue` call (Case B step 2), use the issue's `teamId` field. If neither is available, call `mcp__linear-server__list_teams()` and ask the user to select a team via `AskUserQuestion`. If team resolution fails entirely, STOP with:
+
+```
+🛑  Could not resolve a team for project <PROJECT_NAME>. Verify the project configuration in Linear.
+```
 
 Print:
 
@@ -165,20 +176,32 @@ mcp__linear-server__list_issues(project: "<PROJECT_ID>", state: "In Review", lim
 
 **If any Linear API call fails:**
 - Print: `⚠️  Linear API unavailable — cannot check for conflicts. Please verify manually or retry.`
-- Use `AskUserQuestion` to ask whether the user wants to retry or abort
+- Use `AskUserQuestion` to ask whether the user wants to retry or abort (maximum 2 retries — STOP after 3 total failures)
 - Do NOT silently skip conflict detection
 
 Collect all returned issues into `EXISTING_ISSUES`. For each issue, record:
 - `id` (e.g., `WHI-123`)
 - `title`
-- `description` (full text)
 - `status` (current state)
 - `priority`
+
+**Important:** `list_issues` does not return full description text. For conflict detection to work, you must fetch full descriptions. For each issue in `EXISTING_ISSUES`, call:
+
+```
+mcp__linear-server__get_issue(id: "<issue-id>")
+```
+
+Record the full `description` from each `get_issue` response. Cap at 50 full fetches — if `EXISTING_ISSUES` has more than 50 issues, fetch descriptions for the 50 highest-priority issues (sort by priority ascending: 1=Urgent first) and warn:
+
+```
+⚠️  Large project: fetched full descriptions for 50/<total> issues (highest priority).
+    Conflict detection for remaining issues is based on title matching only.
+```
 
 Print:
 
 ```
-Fetched <N> active issues in <PROJECT_NAME>.
+Fetched <N> active issues in <PROJECT_NAME> (<M> with full descriptions).
 ```
 
 ---
@@ -193,7 +216,7 @@ The finding describes work that touches the same area as an existing issue.
 
 **Detection heuristics:**
 - Extract key terms from the finding: file paths, component names, feature names, function names, API endpoints — terms longer than 5 characters that are not common stop words (e.g., ignore "should", "update", "create", "implement", "handle")
-- For each existing issue, scan its `## Architecture Notes` and `## Acceptance Criteria` sections for the same key terms. Skip `@@DEP:...@@` placeholder lines during scanning.
+- For each existing issue, scan its `## Architecture Notes` and `## Acceptance Criteria` sections for the same key terms. Skip `^\[.*\]$` placeholder lines during scanning.
 - Overlap threshold: 2+ matching key terms in the same issue signals potential scope overlap
 
 **If detected:** Record as `SCOPE_OVERLAP` with the conflicting issue ID and the overlapping terms.
@@ -233,7 +256,7 @@ The finding reveals that an existing issue's description no longer matches reali
 
 ### Ambiguity handling
 
-If a conflict classification is ambiguous (could be scope overlap OR invalidation), do NOT guess. Record both possibilities and surface them to the user in Step 4.
+If a conflict classification is ambiguous (could be scope overlap OR invalidation), do NOT guess. Record both possibilities and surface them to the user in Step 5.
 
 ---
 
@@ -245,7 +268,7 @@ Based on the conflict analysis, draft a plan of Linear changes. The plan consist
 
 If the finding represents genuinely new work not covered by any existing issue, draft a new issue description using all five schema sections.
 
-**Issue description generation rules** (same as harness-design Step 6):
+**Issue description generation rules** (derived from the canonical schema at `~/.claude/skills/harness-dev/schema.md`):
 
 The five required headings (verbatim, as level-2 markdown headings):
 - `## Context`
@@ -444,7 +467,8 @@ mcp__linear-server__get_issue(id: "<issue-id>")
 ```
 mcp__linear-server__save_issue(
   id: "<issue-id>",
-  description: "<updated description>"
+  description: "<updated description>",
+  blockedBy: ["<WHI-N>", ...]  // include if blockedBy relations need to change; omit if unchanged
 )
 ```
 
@@ -472,8 +496,6 @@ mcp__linear-server__save_comment(
 ```
 
 Print: `Modified: WHI-<N> "<title>" — <sections changed>`
-
-If `blockedBy` relations need to change, update them in the same `save_issue` call.
 
 ### 6c. Cancel issues
 
@@ -588,7 +610,7 @@ Invoke ──[Step 1]──► Input resolved ──[Step 2]──► Issues fet
                                                   [Step 5] Confirmation
                                                   gate (AskUserQuestion)
                                                    │    │       │
-                                              Yes  │    │ Mod   │ No
+                                              Yes  │    │ Mod   │ Cancel
                                                    │    │       │
                                                    │    └──► [adjust plan]
                                                    │         (max 3 rounds)
