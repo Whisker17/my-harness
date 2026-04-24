@@ -5,15 +5,16 @@ description: "Reactive course correction skill: formalizes mid-development findi
 allowed-tools:
   - Read
   - Bash
-  - Grep
-  - Glob
   - AskUserQuestion
   - mcp__linear-server__get_issue
   - mcp__linear-server__save_issue
   - mcp__linear-server__save_comment
   - mcp__linear-server__list_issues
+  - mcp__linear-server__list_comments
   - mcp__linear-server__get_project
   - mcp__linear-server__list_projects
+  - mcp__linear-server__list_teams
+  - mcp__linear-server__list_issue_statuses
 ---
 
 # harness-triage
@@ -57,6 +58,8 @@ If the schema is missing, print:
 ```
 
 Do NOT proceed without the schema.
+
+**CLAUDE.md tolerance:** harness-triage tolerates a missing CLAUDE.md. If CLAUDE.md is absent, print a warning and continue — the branch/repo context is informational only and is not required for Linear mutations.
 
 ---
 
@@ -134,12 +137,14 @@ Then resolve the project using Case B logic.
 **After input resolution, you must have:**
 - `PROJECT_ID` — the Linear project ID
 - `PROJECT_NAME` — the Linear project name
+- `TEAM_ID` — the Linear team ID (extracted from the project's `team`/`teamId` fields, or resolved via `mcp__linear-server__list_teams` and user selection)
 - `FINDING` — the natural language finding text
 
 Print:
 
 ```
 Project: <PROJECT_NAME> (<PROJECT_ID>)
+Team: <TEAM_ID>
 Finding: <FINDING>
 ```
 
@@ -147,14 +152,16 @@ Finding: <FINDING>
 
 ## Step 2 — Fetch Existing Issues
 
-Fetch all non-Done issues in the project to build the conflict detection surface. Query across all active states:
+Fetch all non-Done issues in the project to build the conflict detection surface. Use `PROJECT_ID` (not name) for precise matching. Set `limit: 250` to maximize coverage. Query across all active states:
 
 ```
-mcp__linear-server__list_issues(project: "<PROJECT_NAME>", state: "In Progress")
-mcp__linear-server__list_issues(project: "<PROJECT_NAME>", state: "Todo")
-mcp__linear-server__list_issues(project: "<PROJECT_NAME>", state: "Backlog")
-mcp__linear-server__list_issues(project: "<PROJECT_NAME>", state: "In Review")
+mcp__linear-server__list_issues(project: "<PROJECT_ID>", state: "In Progress", limit: 250)
+mcp__linear-server__list_issues(project: "<PROJECT_ID>", state: "Todo", limit: 250)
+mcp__linear-server__list_issues(project: "<PROJECT_ID>", state: "Backlog", limit: 250)
+mcp__linear-server__list_issues(project: "<PROJECT_ID>", state: "In Review", limit: 250)
 ```
+
+**Note:** Conflict detection scans up to 250 active issues per state. For projects with >250 issues per state, warn the user: "Large project — conflict scan may be incomplete. Manual verification recommended."
 
 **If any Linear API call fails:**
 - Print: `⚠️  Linear API unavailable — cannot check for conflicts. Please verify manually or retry.`
@@ -185,9 +192,9 @@ Analyze the finding against every issue in `EXISTING_ISSUES`. Check for four con
 The finding describes work that touches the same area as an existing issue.
 
 **Detection heuristics:**
-- Extract key terms from the finding (file paths, component names, feature names, function names)
-- For each existing issue, check if its `## Architecture Notes` or `## Acceptance Criteria` sections mention the same terms
-- Keyword overlap threshold: 2+ substantive shared terms (ignore common words like "the", "add", "update")
+- Extract key terms from the finding: file paths, component names, feature names, function names, API endpoints — terms longer than 5 characters that are not common stop words (e.g., ignore "should", "update", "create", "implement", "handle")
+- For each existing issue, scan its `## Architecture Notes` and `## Acceptance Criteria` sections for the same key terms. Skip `@@DEP:...@@` placeholder lines during scanning.
+- Overlap threshold: 2+ matching key terms in the same issue signals potential scope overlap
 
 **If detected:** Record as `SCOPE_OVERLAP` with the conflicting issue ID and the overlapping terms.
 
@@ -262,7 +269,7 @@ The five required headings (verbatim, as level-2 markdown headings):
 Before presenting any issue description to the user, validate:
 
 1. All five headings present (regex: `^## (Context|Acceptance Criteria|Architecture Notes|Dependencies|Scope Boundary)`)
-2. Strip placeholder lines matching `^[\[<].*[\]>]$`
+2. Strip placeholder lines matching `^\[.*\]$` (square-bracket placeholders only — matches the canonical schema at `~/.claude/skills/harness-dev/schema.md` and harness-dev's quality gate)
 3. Remaining non-whitespace chars >= 20 per section
 
 If validation fails, regenerate. If regeneration fails twice, warn and present anyway with a note about which section is weak.
@@ -361,10 +368,25 @@ AskUserQuestion(
 )
 ```
 
-Apply the user's adjustments to the plan, re-present it, and re-ask for confirmation. Maximum 3 modification rounds — if the user hasn't approved after 3 rounds, print:
+Apply the user's adjustments to the plan, then re-present the full updated plan and issue the **same three-option `AskUserQuestion`** again:
 
 ```
-⚠️  Plan modification limit reached. Please re-invoke /harness-triage with a refined finding.
+AskUserQuestion(
+  "Proceed with the updated triage plan above?",
+  options: [
+    "Yes — execute all proposed changes",
+    "Modify — I want to adjust the plan further",
+    "Cancel — do not make any changes"
+  ]
+)
+```
+
+**Do NOT proceed to Step 6 without a "Yes" answer.** This cycle repeats for a maximum of 3 modification rounds. If the user hasn't approved after 3 rounds, print:
+
+```
+⚠️  Modification limit reached. To proceed:
+    1. Manually apply the desired changes in Linear, then re-invoke to verify no remaining conflicts
+    2. Re-invoke /harness-triage with a more focused finding that targets only the specific change you need
 ```
 
 STOP.
@@ -383,7 +405,7 @@ For each new issue in the plan:
 
 ```
 mcp__linear-server__save_issue(
-  team: "<team-id>",
+  team: "<TEAM_ID>",
   project: "<PROJECT_ID>",
   title: "<issue title>",
   description: "<validated schema-compliant description>",
@@ -410,9 +432,14 @@ For each issue modification in the plan:
 mcp__linear-server__get_issue(id: "<issue-id>")
 ```
 
-2. **Apply the approved changes** to the description, preserving all five required sections. Only modify the sections that were flagged for change.
+2. **Validate the fetched description** before modifying. Check that all five required section headings (`## Context`, `## Acceptance Criteria`, `## Architecture Notes`, `## Dependencies`, `## Scope Boundary`) are present in the fetched description. If any are missing, abort the modification for this issue:
+   - Print: `⚠️  Skipping modification of WHI-<N>: fetched description missing required sections (possible API issue). Verify manually.`
+   - Record as a failure in the summary
+   - Continue with the next change
 
-3. **Update the issue:**
+3. **Apply the approved changes** to the description, preserving all five required sections. Only modify the sections that were flagged for change.
+
+4. **Update the issue:**
 
 ```
 mcp__linear-server__save_issue(
@@ -421,14 +448,18 @@ mcp__linear-server__save_issue(
 )
 ```
 
-4. **Add an explanatory comment:**
+5. **Add an explanatory comment** (idempotency check first):
+
+Before posting a comment, call `mcp__linear-server__list_comments(issueId: "<issue-id>")` and check for an existing comment containing `*Updated by /harness-triage*` with the same finding text. If found, skip the comment (a prior triage run already annotated this issue).
+
+If no prior comment exists:
 
 ```
 mcp__linear-server__save_comment(
   issueId: "<issue-id>",
-  body: "## Triage Update
+  body: "### Triage Update
 
-**Finding:** <FINDING>
+> <FINDING>
 
 **What changed:**
 <bullet list of changes made to this issue>
@@ -448,14 +479,18 @@ If `blockedBy` relations need to change, update them in the same `save_issue` ca
 
 For each issue cancellation in the plan:
 
-1. **Add an explanatory comment first:**
+1. **Add an explanatory comment first** (idempotency check):
+
+Check for an existing comment containing `*Canceled by /harness-triage*` on this issue via `mcp__linear-server__list_comments(issueId: "<issue-id>")`. Skip if found.
+
+If no prior cancellation comment exists:
 
 ```
 mcp__linear-server__save_comment(
   issueId: "<issue-id>",
-  body: "## Canceled by Triage
+  body: "### Canceled by Triage
 
-**Finding:** <FINDING>
+> <FINDING>
 
 **Reason:** <why this issue is no longer needed>
 
@@ -465,10 +500,12 @@ mcp__linear-server__save_comment(
 
 2. **Move to Canceled state:**
 
+Before the first cancellation in a triage run, verify the exact state name by calling `mcp__linear-server__list_issue_statuses(team: "<TEAM_ID>")` and finding the state with `type: "canceled"`. Use the returned state name verbatim (it may be "Canceled", "Cancelled", or a custom name).
+
 ```
 mcp__linear-server__save_issue(
   id: "<issue-id>",
-  state: "Canceled"
+  state: "<verified-canceled-state-name>"
 )
 ```
 
@@ -521,12 +558,14 @@ Failures:              <F>
 |---------------|-----------------|
 | Step 1 — project not found after 2 attempts | STOP with explicit message |
 | Step 1 — no arguments and user provides no finding | STOP gracefully |
+| Step 1 — team cannot be resolved from project | Call `list_teams`, ask user to select; STOP if still unresolved |
 | Step 2 — Linear API unavailable | Warn, ask user to retry or abort; do NOT skip conflict detection |
 | Step 3 — conflict classification ambiguous | Surface both possibilities to the user in Step 5 |
-| Step 5 — modification limit reached (3 rounds) | STOP with re-invoke suggestion |
+| Step 5 — modification limit reached (3 rounds) | STOP with manual-fix or re-invoke guidance |
 | Step 6 — issue creation fails | Log failure, continue with remaining changes |
-| Step 6 — issue modification fails | Log failure, continue with remaining changes |
+| Step 6 — issue modification fails (including stale description) | Log failure, continue with remaining changes |
 | Step 6 — issue cancellation fails | Log failure, continue with remaining changes |
+| Step 6 — partial execution (some changes succeed, some fail) | Report what succeeded and what failed in summary; triage comments serve as idempotency markers for safe re-invocation |
 | Any step — unexpected exception | Print the error, report what was changed so far, STOP |
 
 **Never silently skip conflict detection.** If the Linear API is unavailable, the skill must either retry or stop — proceeding without conflict detection defeats the purpose of triage.
@@ -548,9 +587,14 @@ Invoke ──[Step 1]──► Input resolved ──[Step 2]──► Issues fet
                                                         │
                                                   [Step 5] Confirmation
                                                   gate (AskUserQuestion)
-                                                   │          │
-                                              Yes  │      No  │
-                                                   ▼          ▼
+                                                   │    │       │
+                                              Yes  │    │ Mod   │ No
+                                                   │    │       │
+                                                   │    └──► [adjust plan]
+                                                   │         (max 3 rounds)
+                                                   │              │
+                                                   │    ◄─────────┘
+                                                   ▼
                                             [Step 6]      Aborted —
                                             Execute       no changes
                                             changes
