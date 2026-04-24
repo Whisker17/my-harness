@@ -431,6 +431,8 @@ Assemble the complete CLAUDE.md and write it to `CLAUDE.md` in the current worki
 | `<STATE_STARTED>` | Name of the first `started`-type state (e.g., "In Progress") from Step 1c |
 | `<STATE_REVIEW>` | Name of the second `started`-type state (e.g., "In Review") from Step 1c |
 | `<STATE_COMPLETED>` | Name of the `completed`-type state (e.g., "Done") from Step 1c |
+| `<STATE_BACKLOG>` | Name of the `backlog`-type state (e.g., "Backlog") from Step 1c |
+| `<STATE_TODO>` | Name of the `unstarted`-type state (e.g., "Todo") from Step 1c |
 
 If the project description in Linear is empty or a one-liner, add this note in the Project
 Overview section:
@@ -603,8 +605,8 @@ Before making any code or Linear changes, Claude:
 1. **Search existing issues** for potential conflicts (query the current project across all active states):
    ```
    list_issues(project: "<project-name>", state: "<STATE_STARTED>")
-   list_issues(project: "<project-name>", state: "Todo")
-   list_issues(project: "<project-name>", state: "Backlog")
+   list_issues(project: "<project-name>", state: "<STATE_TODO>")
+   list_issues(project: "<project-name>", state: "<STATE_BACKLOG>")
    list_issues(project: "<project-name>", state: "<STATE_REVIEW>")
    ```
    Use the project name from the current Linear issue context. If the Linear API call fails, warn the user ("Linear API unavailable — cannot check for conflicts. Please verify manually or retry.") and wait for the user to decide how to proceed. Do not silently skip conflict detection.
@@ -912,7 +914,7 @@ Before writing CLAUDE.md to disk, verify:
 - [ ] Issue-Driven Development section is present with Course Correction Workflow (4 steps),
       conflict detection table, and "When to Update an Issue Description" subsection
 - [ ] State placeholders in Course Correction Workflow `list_issues()` calls (`<STATE_STARTED>`,
-      `<STATE_REVIEW>`) are resolved to actual state names
+      `<STATE_TODO>`, `<STATE_BACKLOG>`, `<STATE_REVIEW>`) are resolved to actual state names
 - [ ] No `<placeholder>` tokens remain in the final output (except intentional TODO comments)
 - [ ] Code blocks in Build & Development Commands use real triple backticks (no backslash escapes)
 
