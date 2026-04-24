@@ -119,6 +119,76 @@ Backlog ──► Todo ──► In Progress ──► In Review ──► Done
 4. **After review is approved and code is merged to dev**: move the parent issue to `Done`
 5. **If blocked**: add a comment on the Linear issue explaining what's blocking
 
+## Issue-Driven Development
+
+**Core principle: every code change — new feature, bug fix, or course correction — MUST start with a Linear issue.** No cowboy coding. Linear is the single source of truth for what work is planned, in progress, and done.
+
+### Why This Matters
+
+- Issues capture intent before implementation — the "why" doesn't get lost
+- Conflict detection is impossible without a written record of planned work
+- The backlog stays alive: new discoveries update it rather than bypassing it
+- Review is meaningful because reviewers can compare implementation against spec
+
+### Principles
+
+1. **Issues before code.** When the user describes a problem, a feature idea, or a course correction, Claude's first action is to check Linear — not start coding. Search for existing issues that might already cover the request.
+2. **No cowboy coding.** If there is no Linear issue for the work, create one (or ask the user to confirm creation) before writing any implementation code.
+3. **Living backlog.** Issue descriptions are not write-once documents. When implementation reveals new information, update the issue description to reflect reality. Use `save_issue(id, description)` to keep descriptions current.
+
+### Course Correction Workflow
+
+When the user shares a finding mid-development (e.g., "我发现..." or "I noticed that..." or describes an unexpected problem):
+
+#### Step 1 — User shares finding
+
+The user describes something that changes the plan: a bug, a design flaw, a missing requirement, or a new insight. This can happen at any time during implementation.
+
+#### Step 2 — Claude creates or updates issues with conflict detection
+
+Before making any code changes, Claude:
+
+1. **Search existing issues** for conflicts:
+   ```
+   list_issues(project: "My Harness", state: "started")   # In Progress
+   list_issues(project: "My Harness", state: "unstarted")  # Todo / Backlog
+   ```
+
+2. **Run conflict detection** against every open issue. Check for:
+
+   | Conflict Type | Detection | Action |
+   |---------------|-----------|--------|
+   | **Scope overlap** | New work touches the same files/modules as an existing issue | Add a comment on the existing issue noting the overlap; consider merging scope or splitting cleanly |
+   | **Invalidation** | New finding makes an existing issue's approach wrong or unnecessary | Update the existing issue description with the new context; if fully invalidated, recommend cancellation to the user |
+   | **Dependency change** | New work must be done before an existing issue can proceed | Add a `blockedBy` relation on the dependent issue; update its Dependencies section |
+   | **Description staleness** | Implementation revealed that an issue's description no longer matches reality | Update the issue description with `save_issue(id, description)` to reflect current understanding |
+
+3. **Create or update the issue:**
+   - If the finding maps to an existing issue → update that issue's description with new context
+   - If it's genuinely new work → create a new issue following the schema (`~/.claude/skills/harness-dev/schema.md`)
+   - If it affects the current in-progress issue → update the current issue's Acceptance Criteria or Architecture Notes
+
+#### Step 3 — Claude reports back
+
+After checking conflicts and creating/updating issues, Claude reports to the user:
+
+- What issues were found as conflicts (if any)
+- What was created or updated
+- What the recommended next step is (continue current work, switch to the new issue, re-prioritize)
+
+The user decides the priority — Claude does not unilaterally switch tasks.
+
+### When to Update an Issue Description
+
+Update a Linear issue description when any of these are true:
+
+- Implementation reveals that the Architecture Notes are wrong or incomplete
+- A new acceptance criterion is discovered during development
+- A scope boundary needs to be added or adjusted
+- Dependencies have changed (new blocker discovered, or blocker resolved)
+
+Always preserve the five required sections (`## Context`, `## Acceptance Criteria`, `## Architecture Notes`, `## Dependencies`, `## Scope Boundary`) when updating. Add new information — do not delete existing content unless it is factually wrong.
+
 ## Schema Reference
 
 The shared issue schema is at `~/.claude/skills/harness-dev/schema.md`.
