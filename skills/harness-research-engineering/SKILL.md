@@ -40,9 +40,10 @@ You are a protocol analysis engine for blockchain engineering research. The user
 7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — treeless clone, fuzzy tag matching, SHA resolution, diff-map generation
 8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — claim batching, evidence mapping, code-first delta pass, quality gates
 9. [Phase 6: Verification](#phase-6-verification) — independent claim verification via Agent subagent, dispute detection, fix-verify loop
-10. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
-11. [Phase 7: Knowledge Index Management](#phase-7-knowledge-index-management) — dedup check, public/internal separation, append-only JSONL, malformed line handling
-11. [Failure and Abort](#failure-and-abort) — error handling and cleanup
+10. [Phase 4: Cross-Reference Analysis](#phase-4-cross-reference-analysis) — knowledge index query, chain association mapping, cross-version comparison
+11. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
+12. [Phase 7: Knowledge Index Management](#phase-7-knowledge-index-management) — dedup check, public/internal separation, append-only JSONL, malformed line handling
+13. [Failure and Abort](#failure-and-abort) — error handling and cleanup
 
 ---
 
@@ -234,19 +235,19 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
   - Machine gate: warn if confirmed+partial coverage < 30% (claims quality concern)
   - Progress output after each batch: "Batch N/M complete, X/Y claims processed"
 
-### 4. comparison_agent (Phase 4 — v2, not in M1)
+### 4. comparison_agent (Phase 4 — M2)
 
-<!-- v2: comparison_agent
-- Mission: Compare current implementation with prior architecture
-- Inputs: analysis.json, knowledge index entries for the chain
-- Tools: Read, Grep
-- Outputs: comparison.json — architectural delta map
-- Behavior:
-  - Cross-reference knowledge index for known patterns
-  - Identify what's novel, borrowed, or divergent
-  - Document implications for Mantle
-- Status: Deferred to v2. Phase 4 is skipped in M1 pipeline.
--->
+- **Mission:** Compare the current upgrade analysis against prior research on related chains and versions, identifying patterns, regressions, and novel changes
+- **Inputs:** `analysis.json`, knowledge index entries (`~/.gstack/research/research-index.jsonl`) for the same chain, same repo, and related chains
+- **Tools:** Read, Bash (grep), Write
+- **Outputs:** `comparison.json` — cross-version architectural delta map
+- **Behavior:**
+  - Query the knowledge index for related entries by chain, repo, and associated chains (hardcoded mapping)
+  - Compare current claims against historical claims at summary/category level
+  - Identify which files are repeatedly modified across upgrades
+  - Classify differences into schema arrays: `novel_features` (new capabilities), `divergent_features` (modified behavior), `borrowed_features` (unchanged/similar). Features not present in current upgrade but present in historical entries are noted in `divergent_features` with an appropriate `impact` description.
+  - Output `novel_features`, `borrowed_features`, `divergent_features` arrays
+  - When no historical data exists, output an empty comparison.json with empty arrays and log "no prior research found"
 
 ### 5. report_generation_agent (Phase 5)
 
@@ -255,13 +256,13 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
 - **Tools:** Write, Read
 - **Outputs:** `internal-report.draft.md` → promoted to `internal-report.md` after user approval (M1 only generates internal report; public summary is M3 scope per D15)
 - **Behavior:**
-  - Report sections: Executive Summary, Claims Analysis (per-claim with evidence), Unclaimed Changes, Independent Verification (if verification-report.json available), Methodology, Raw Data References
+  - Report sections: Executive Summary, Claims Analysis (per-claim with evidence), Unclaimed Changes, Independent Verification (if verification-report.json available), Cross-Chain Comparison (if comparison.json available with data), Methodology, Raw Data References
   - Every claim references its verification status from `analysis.json` (or marked `[DATA UNAVAILABLE]` if analysis is missing)
   - Internal report uses full code snippets (20-30 lines) from `analysis.json` code_snippets
   - Unclaimed Changes section lists all code-first delta findings from `analysis.json` unreported_changes
   - Metadata header includes repo URL, base/head SHA, source URL, generation timestamp
   - Graceful degradation: if any upstream artifact is missing, generate partial report with `[DATA UNAVAILABLE]` markers (D9)
-  - Cross-chain comparison sections are omitted in M1 (no Phase 4 data)
+  - Cross-chain comparison sections are included when comparison.json is available from Phase 4 (omitted when knowledge index was empty)
 
 ### 6. verification_agent (Phase 6 — M2)
 
@@ -462,7 +463,7 @@ If validation fails at any phase boundary:
 ### analysis.json
 
 **Produced by:** Phase 3 (Implementation Analysis)
-**Consumed by:** Phase 4 (Cross-Reference, v2 only), Phase 5 (Report Generation), Phase 6 (Verification)
+**Consumed by:** Phase 4 (Cross-Reference), Phase 5 (Report Generation), Phase 6 (Verification)
 
 ```json
 {
@@ -560,10 +561,10 @@ If validation fails at any phase boundary:
 
 ### comparison.json
 
-**Produced by:** Phase 4 (Cross-Reference Agent — v2 only, skipped in M1)
+**Produced by:** Phase 4 (Cross-Reference Agent — M2)
 **Consumed by:** Phase 5 (Report Generation — cross-chain sections)
 
-> **Note:** This schema is defined now for completeness but is only used when Phase 4 (cross-chain comparison) is implemented. In M1 and M2, this artifact does not exist and Phase 5 omits cross-chain comparison sections.
+> **Note:** When the knowledge index is empty (no prior analyses), Phase 4 outputs a comparison.json with empty `comparisons`, `novel_features`, `borrowed_features`, and `divergent_features` arrays. Phase 5 detects empty comparisons and omits cross-chain sections from the report.
 
 ```json
 {
@@ -620,7 +621,7 @@ If validation fails at any phase boundary:
 | `baseline.chain` | string | ✅ | Chain name |
 | `baseline.upgrade` | string | ✅ | Upgrade name |
 | `baseline.session_dir` | string | ✅ | Relative path to the session directory |
-| `comparisons` | array (non-empty) | ✅ | Prior analyses being compared against |
+| `comparisons` | array | ✅ | Prior analyses being compared against (empty when no relevant entries in knowledge index) |
 | `comparisons[].chain` | string | ✅ | Chain name |
 | `comparisons[].upgrade` | string | ✅ | Upgrade name |
 | `comparisons[].session_dir` | string | ✅ | Session directory of the compared analysis |
@@ -642,11 +643,12 @@ If validation fails at any phase boundary:
 | `divergent_features[].chains_compared` | array | ✅ | Which chains are being compared |
 | `divergent_features[].impact` | string | ✅ | Why the divergence matters |
 
-**Phase boundary validation (before Phase 5, v2 only):**
+**Phase boundary validation (before Phase 5, when comparison.json exists):**
 - `schema_version` must equal `1`
 - `baseline` must be present with non-null `chain`, `upgrade`, `session_dir`
-- `comparisons` array must be non-empty
+- `comparisons` array must be present (may be empty — empty signals no historical data available)
 - `novel_features`, `borrowed_features`, `divergent_features` must be present (may be empty arrays)
+- When `comparisons` is empty, Phase 5 omits the Cross-Chain Comparison section
 
 ### verification-report.json
 
@@ -761,7 +763,7 @@ Phase 6 outputs a structured JSON artifact containing the independent reviewer's
 ### research-index.jsonl (Knowledge Index Entry)
 
 **Produced by:** Phase 7 (Knowledge Index Management)
-**Consumed by:** Phase 4 (Cross-Reference Agent — v2 only), M3 public summary generation
+**Consumed by:** Phase 4 (Cross-Reference Agent), M3 public summary generation
 
 Each line in `~/.gstack/research/research-index.jsonl` is a standalone JSON object representing one completed analysis. Entries have two field sets: `public` (safe to share externally) and `internal` (full evidence, local paths, detailed data).
 
@@ -889,8 +891,8 @@ else:
 | Phase 1 | _(none — first phase)_ | — |
 | Phase 2 | _(none — independent of Phase 1 output)_ | — |
 | Phase 3 | claims.json, diff-map.json | Both must pass all validation rules |
-| Phase 4 (v2) | analysis.json, knowledge index | analysis.json must pass; index must have ≥1 entry for a different chain |
-| Phase 5 | claims.json, diff-map.json, analysis.json (+ comparison.json in v2, + verification-report.json in M2) | All must pass validation |
+| Phase 4 | analysis.json, knowledge index | analysis.json must pass; knowledge index read with graceful handling (empty index → skip comparison, output empty comparison.json) |
+| Phase 5 | claims.json, diff-map.json, analysis.json (+ comparison.json if Phase 4 ran, + verification-report.json in M2) | All must pass validation |
 | Phase 6 (verification) | analysis.json, claims.json | Both must pass all validation rules |
 | Phase 7 | internal-report.md, claims.json, diff-map.json, analysis.json | At least internal-report.md must exist; other artifacts used for field extraction |
 
@@ -2740,6 +2742,371 @@ If the user overrides verification results:
 
 ---
 
+## Phase 4: Cross-Reference Analysis
+
+> **Implemented by:** WHI-233
+
+Phase 4 queries the knowledge index for prior analyses on the same chain, same repo, or related chains, and compares them against the current analysis. This is the "research compound interest" mechanism — each new analysis builds on previous findings to detect cross-version evolution patterns.
+
+Phase 4 runs after Phase 6 (verification) and before Phase 5 (report generation). When the knowledge index is empty or contains no relevant entries, Phase 4 outputs an empty comparison.json and logs a skip message — the pipeline continues normally.
+
+**Agent role:** `comparison_agent` (see [Agent Roles > comparison_agent](#4-comparison_agent-phase-4--m2))
+
+### Step 4.0 — Input Validation
+
+Phase 4 requires `analysis.json` from Phase 3 and the knowledge index from `~/.gstack/research/research-index.jsonl`.
+
+**Recovering `session_dir`:** Phase 4 runs in the same session as Phases 1-3/6. The `SESSION_DIR` variable should still be available. If not (e.g., re-invocation), recover:
+
+```bash
+SESSION_DIR=$(ls -dt "$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-"* 2>/dev/null | head -1)
+if [ -z "$SESSION_DIR" ]; then
+  echo "❌ No session directory found. Run Phase 1 first."
+  exit 1
+fi
+echo "Session directory: $SESSION_DIR"
+```
+
+**Validate analysis.json:**
+
+```
+ANALYSIS_FILE = "{session_dir}/analysis.json"
+IF analysis.json does not exist OR is not valid JSON:
+  Log warning: "⚠️  analysis.json not found or corrupt — Phase 4 will produce empty comparison"
+  ANALYSIS_AVAILABLE = false
+ELSE:
+  Run schema validation (same rules as Phase 3 output validation)
+  IF validation fails:
+    Log warning: "⚠️  analysis.json fails validation — proceeding with available data"
+  ANALYSIS_AVAILABLE = true
+```
+
+**Check knowledge index:**
+
+```bash
+INDEX_FILE="$HOME/.gstack/research/research-index.jsonl"
+if [ ! -f "$INDEX_FILE" ]; then
+  echo "ℹ️  Knowledge index not found at $INDEX_FILE — no prior research to compare"
+  INDEX_AVAILABLE=false
+  INDEX_ENTRIES=0
+else
+  INDEX_ENTRIES=$(wc -l < "$INDEX_FILE" | tr -d ' ')
+  echo "Knowledge index: $INDEX_FILE ($INDEX_ENTRIES entries)"
+  INDEX_AVAILABLE=true
+fi
+```
+
+### Step 4.1 — Query Knowledge Index
+
+Read the knowledge index and filter for relevant entries. Use three query dimensions:
+
+**Chain association mapping (hardcoded):**
+
+```
+CHAIN_ASSOCIATIONS = {
+  "base":      ["optimism"],
+  "optimism":  ["base"],
+  "arbitrum":  ["nitro"],
+  "nitro":     ["arbitrum"],
+  "polygon":   ["zkevm"],
+  "zkevm":     ["polygon"]
+}
+```
+
+**Query dimensions:**
+
+1. **Same chain:** entries where `public.chain` matches the current chain (case-insensitive)
+2. **Same repo:** entries where `internal.repo` matches the current repo (normalized, case-insensitive)
+3. **Related chain:** entries where `public.chain` is in `CHAIN_ASSOCIATIONS[current_chain]`
+
+**Reading the index with malformed line handling:**
+
+```
+relevant_entries = []
+current_chain = <lowercase chain from session>
+current_repo = <normalized repo from diff-map.json, or "[UNAVAILABLE]">
+related_chains = CHAIN_ASSOCIATIONS.get(current_chain, [])
+
+For each line (1-indexed) in INDEX_FILE:
+  TRY: parse line as JSON
+  CATCH (malformed JSON):
+    Log: "⚠️  Malformed JSON at line <N> in research-index.jsonl — skipping."
+    CONTINUE
+
+  entry = parsed JSON
+  entry_chain = entry.public.chain (lowercase)
+  entry_repo = entry.internal.repo (lowercase)
+
+  # Skip the current analysis if it's already indexed (same dedup_key)
+  current_dedup_key = "{current_chain}:{current_upgrade_lower}:{current_repo}"
+  IF entry.dedup_key == current_dedup_key:
+    CONTINUE  # don't compare against self
+
+  match = false
+  match_reason = []
+
+  IF entry_chain == current_chain:
+    match = true
+    match_reason.append("same_chain")
+
+  IF current_repo != "[UNAVAILABLE]" AND entry_repo == current_repo.lowercase:
+    match = true
+    match_reason.append("same_repo")
+
+  IF entry_chain IN related_chains:
+    match = true
+    match_reason.append("related_chain")
+
+  IF match:
+    relevant_entries.append({
+      "entry": entry,
+      "match_reasons": match_reason
+    })
+```
+
+**Limit to most recent 5 entries** (sorted by `public.generated_at` descending):
+
+```
+relevant_entries.sort(by: entry.public.generated_at, descending)
+relevant_entries = relevant_entries[:5]
+```
+
+**If no relevant entries found:**
+
+```
+IF len(relevant_entries) == 0:
+  Log: "ℹ️  No prior research found for chain '{current_chain}' or related chains — skipping comparison"
+  → Jump to Step 4.4 (write empty comparison.json)
+```
+
+### Step 4.2 — Compare Current Analysis Against Historical Entries
+
+Dispatch the `comparison_agent` via the Agent tool for the actual comparison work.
+
+**Comparison prompt:**
+
+```
+You are the Cross-Reference Analyst. Your job is to compare the current upgrade
+analysis against prior research on related chains and versions, identifying
+patterns, regressions, and novel changes.
+
+## Current Analysis
+
+Chain: <current_chain>
+Upgrade: <current_upgrade>
+Repo: <current_repo>
+Session: <session_dir relative path>
+
+### Current Claims Summary
+Total claims: <analysis_summary.total_claims>
+Verified: <analysis_summary.verified>
+Partially verified: <analysis_summary.partially_verified>
+Unverified: <analysis_summary.unverified>
+
+### Current Claims (compact)
+<For each claim in analysis.claims_analyzed:>
+- [<claim_id>] <claim text snippet, first 100 chars> | category: <category> | status: <verification_status>
+<end for>
+
+### Current Unreported Changes
+<For each change in analysis.unreported_changes:>
+- <file>: <description> (significance: <significance>)
+<end for>
+
+## Historical Analyses (from knowledge index)
+
+<For each entry in relevant_entries:>
+### Entry: <entry.public.chain> — <entry.public.upgrade_name>
+Match reasons: <match_reasons as comma-separated>
+Generated: <entry.public.generated_at>
+Repo: <entry.internal.repo>
+Executive summary: <entry.public.executive_summary>
+Claims summary: <entry.public.claims_summary as JSON>
+Historical claims:
+<For each claim in entry.internal.full_claims:>
+- [<claim.id>] <claim.text, first 100 chars> | category: <claim.category> | status: <claim.verification_status>
+<end for>
+<end for>
+
+## Instructions
+
+Compare the current analysis against each historical entry. Produce a JSON
+object with the following structure. Output ONLY valid JSON — no markdown
+fences, no commentary.
+
+{
+  "novel_features": [
+    // Features in the current upgrade that do NOT appear in any historical analysis.
+    // Each: { "name": string, "description": string, "files": [string], "significance": "high"|"medium"|"low" }
+  ],
+  "borrowed_features": [
+    // Features that clearly correspond to something seen in a historical analysis.
+    // Each: { "name": string, "description": string, "source_chain": string, "similarity": "identical"|"structural"|"conceptual", "files": [string] }
+  ],
+  "divergent_features": [
+    // Features where the current upgrade takes a different approach than historical analyses.
+    // Each: { "name": string, "description": string, "chains_compared": [string], "impact": string }
+  ]
+}
+
+Rules:
+- Compare at claim/category level — NOT deep code comparison
+- "files" arrays should reference file paths from the current analysis claims or unreported changes
+- If a feature appears in both current and historical but with different behavior, it's divergent
+- If a feature appears in current but NOT in any historical, it's novel
+- If a feature clearly maps to a historical feature, it's borrowed
+- Significance for novel_features: "high" = security/consensus, "medium" = feature/architecture, "low" = parameter/config
+- Empty arrays are valid — not every comparison has all three categories
+```
+
+**Parse the agent response:**
+
+```
+TRY: parse response as JSON
+CATCH (invalid JSON):
+  # Recovery: strip markdown code fences, re-parse
+  stripped = remove leading/trailing ``` and any language hint
+  TRY: parse stripped as JSON
+  CATCH:
+    Log: "⚠️  comparison_agent returned invalid JSON — writing empty comparison.json"
+    → Jump to Step 4.4 (write empty comparison.json)
+
+comparison_result = parsed JSON
+```
+
+### Step 4.3 — Validate Comparison Result
+
+Validate the agent output before writing:
+
+```
+REQUIRED_ARRAYS = ["novel_features", "borrowed_features", "divergent_features"]
+For each array_name in REQUIRED_ARRAYS:
+  IF array_name NOT in comparison_result:
+    comparison_result[array_name] = []
+    Log: "⚠️  comparison_agent omitted '{array_name}' — defaulting to empty array"
+
+For each item in comparison_result.novel_features:
+  IF item missing "name" or "description": remove item, log warning
+  IF item missing "files": set item.files = []
+  IF item missing "significance" or item.significance NOT in ["high", "medium", "low"]:
+    item.significance = "medium"
+
+For each item in comparison_result.borrowed_features:
+  IF item missing "name" or "description" or "source_chain": remove item, log warning
+  IF item missing "files": set item.files = []
+  IF item missing "similarity" or item.similarity NOT in ["identical", "structural", "conceptual"]:
+    item.similarity = "conceptual"
+
+For each item in comparison_result.divergent_features:
+  IF item missing "name" or "description": remove item, log warning
+  IF item missing "chains_compared": set item.chains_compared = [current_chain]
+  IF item missing "impact": set item.impact = "Impact not assessed"
+```
+
+### Step 4.4 — Write comparison.json
+
+Assemble the full comparison.json following the schema:
+
+```
+comparison_json = {
+  "schema_version": 1,
+  "generated_at": <current ISO 8601 timestamp>,
+  "baseline": {
+    "chain": current_chain,
+    "upgrade": current_upgrade,
+    "session_dir": <relative session dir path from ~/.gstack/research/>
+  },
+  "comparisons": [
+    // For each entry in relevant_entries:
+    {
+      "chain": entry.public.chain,
+      "upgrade": entry.public.upgrade_name,
+      "session_dir": <extract from entry.internal.evidence_map_path, parent dir>,
+      "index_entry_date": entry.public.generated_at
+    }
+  ],
+  "novel_features": comparison_result.novel_features,    // or [] if no comparison ran
+  "borrowed_features": comparison_result.borrowed_features, // or [] if no comparison ran
+  "divergent_features": comparison_result.divergent_features // or [] if no comparison ran
+}
+```
+
+**Empty comparison case** (no relevant entries found or agent failed):
+
+When `relevant_entries` is empty or the agent returned invalid output, write a minimal comparison.json:
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "<current ISO 8601 timestamp>",
+  "baseline": {
+    "chain": "<current_chain>",
+    "upgrade": "<current_upgrade>",
+    "session_dir": "<relative session dir>"
+  },
+  "comparisons": [],
+  "novel_features": [],
+  "borrowed_features": [],
+  "divergent_features": []
+}
+```
+
+> **Note:** The schema requires `comparisons` to be non-empty for a full comparison. An empty `comparisons` array signals to Phase 5 that no cross-reference data is available, and the Cross-Chain Comparison report section should be omitted.
+
+Write to disk:
+
+```bash
+# Write comparison.json using the Write tool
+# File: {session_dir}/comparison.json
+```
+
+### Step 4.5 — Summary Output
+
+Print the Phase 4 summary:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 Phase 4 Complete — Cross-Reference Analysis
+
+Session:    {session_dir}
+Index:      <INDEX_ENTRIES> entries in knowledge index
+Relevant:   <len(relevant_entries)> entries matched
+
+<if relevant_entries is empty:>
+  ℹ️  No prior research found — comparison.json written with empty arrays
+
+<else:>
+  Compared against:
+  <for each entry in relevant_entries:>
+    - <entry.public.chain> / <entry.public.upgrade_name> (<match_reasons>)
+  <end for>
+
+  Novel features:    <count> items
+  Borrowed features: <count> items
+  Divergent features: <count> items
+
+<end if>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Per-Phase Error Handling
+
+| Failure Scenario | Recovery Action |
+|-----------------|-----------------|
+| analysis.json missing/corrupt | Produce empty comparison.json, log warning, continue to Phase 5 |
+| Knowledge index missing | Produce empty comparison.json, log "no prior research found", continue |
+| Knowledge index has malformed lines | Skip malformed lines with warning, process valid lines |
+| comparison_agent returns invalid JSON | Strip markdown fences, retry parse. If still invalid, produce empty comparison.json |
+| comparison_agent omits required arrays | Default to empty arrays |
+| No relevant entries in index | Produce empty comparison.json (comparisons=[]), continue |
+
+**Output artifacts:**
+```
+~/.gstack/research/sessions/<chain>-<upgrade>-<date>/comparison.json
+```
+
+---
+
 ## Phase 5: Report Generation
 
 > **Implemented by:** WHI-232
@@ -2770,7 +3137,7 @@ For each upstream artifact, attempt to load and validate. Track availability sta
 ```
 ARTIFACTS_STATUS = {}
 
-For each artifact in [claims.json, diff-map.json, analysis.json, verification-report.json]:
+For each artifact in [claims.json, diff-map.json, analysis.json, comparison.json, verification-report.json]:
   1. Check file exists: {session_dir}/<artifact>
   2. If exists: parse JSON, run schema validation (same rules as Phase 3 Step 3.0 / Phase 6 Step 6.6)
   3. Record status:
@@ -2796,6 +3163,10 @@ For each artifact in [claims.json, diff-map.json, analysis.json, verification-re
 | `verification-report.json` | available | Add "Independent Verification" section to report with per-claim reviewer assessments, disputes, and concerns |
 | `verification-report.json` | missing | Omit "Independent Verification" section entirely (Phase 6 is optional — M1 pipelines won't have this artifact) |
 | `verification-report.json` | corrupt/partial | Add "Independent Verification" section with `[DATA PARTIALLY AVAILABLE]` markers for corrupt fields; use whatever is parseable |
+| `comparison.json` | available with non-empty `comparisons` | Add "Cross-Chain Comparison" section with novel, borrowed, and divergent features from Phase 4 |
+| `comparison.json` | available with empty `comparisons` | Omit "Cross-Chain Comparison" section (no historical data was available for comparison) |
+| `comparison.json` | missing | Omit "Cross-Chain Comparison" section entirely (Phase 4 may not have run or knowledge index was empty) |
+| `comparison.json` | corrupt/partial | Add "Cross-Chain Comparison" section with `[DATA PARTIALLY AVAILABLE]` markers; use whatever is parseable |
 
 **If ALL three required artifacts** (`claims.json`, `diff-map.json`, `analysis.json`) **are missing or corrupt (no required artifact has status "available" or "partial"):** abort Phase 5 with:
 ```
@@ -2855,6 +3226,18 @@ verification_summary = verification.summary  // aggregate verification stats
 total_rounds = verification.total_rounds  // fix-verify rounds executed
 ```
 
+**From `comparison.json` (if available — Phase 4 M2):**
+```
+comparison_baseline = comparison.baseline  // current analysis metadata
+comparison_entries = comparison.comparisons  // prior analyses compared against
+novel_features = comparison.novel_features  // features unique to current upgrade
+borrowed_features = comparison.borrowed_features  // features seen in prior analyses
+divergent_features = comparison.divergent_features  // features that differ across chains
+
+COMPARISON_HAS_DATA = len(comparison_entries) > 0
+// When comparisons is empty, the knowledge index had no relevant entries — omit cross-chain section
+```
+
 **Cross-reference claims with analysis and verification:** If `claims.json`, `analysis.json`, and optionally `verification-report.json` are available, join claims with their analysis and verification results by `claim_id`:
 
 ```
@@ -2907,6 +3290,16 @@ blockchain researcher can act on.
 
 ### Verification Data (if Phase 6 was executed, otherwise "[NOT AVAILABLE]")
 <verification_status, verification_reviews, reviewer_concerns, verification_summary, or "[NOT AVAILABLE]">
+
+### Cross-Chain Comparison Data (if Phase 4 produced data, otherwise "[NOT AVAILABLE]")
+<if COMPARISON_HAS_DATA:>
+Compared against: <comparison_entries as JSON>
+Novel features: <novel_features as JSON>
+Borrowed features: <borrowed_features as JSON>
+Divergent features: <divergent_features as JSON>
+<else:>
+[NOT AVAILABLE — no prior research in knowledge index]
+<end if>
 
 ### Diff Summary
 <diff-map summary stats, or "[DATA UNAVAILABLE]">
@@ -3000,6 +3393,51 @@ AND list a summary here:
 [Phase 6 (Independent Verification) was not executed for this analysis. Claims Analysis reflects Phase 3 assessments only.]
 <end if>
 
+## Cross-Chain Comparison
+
+<if comparison.json is available AND COMPARISON_HAS_DATA:>
+
+**Compared against:** <count> prior analyses
+<for each entry in comparison_entries:>
+- <chain> / <upgrade> (indexed: <index_entry_date>)
+<end for>
+
+### Novel Features
+
+Features in this upgrade not found in any prior analysis:
+
+<for each feature in novel_features:>
+- **<name>** (<significance>) — <description>
+  Files: <files as comma-separated>
+<end for>
+<if novel_features is empty:> No novel features identified. <end if>
+
+### Borrowed Features
+
+Features that correspond to prior analyses on related chains:
+
+<for each feature in borrowed_features:>
+- **<name>** — <description>
+  Source: <source_chain> | Similarity: <similarity>
+  Files: <files as comma-separated>
+<end for>
+<if borrowed_features is empty:> No borrowed features identified. <end if>
+
+### Divergent Features
+
+Features where this upgrade takes a different approach than prior analyses:
+
+<for each feature in divergent_features:>
+- **<name>** — <description>
+  Chains compared: <chains_compared as comma-separated>
+  Impact: <impact>
+<end for>
+<if divergent_features is empty:> No divergent features identified. <end if>
+
+<else:>
+[Phase 4 (Cross-Chain Comparison) was not executed or no prior research was available for comparison.]
+<end if>
+
 ## Methodology
 
 Document the pipeline execution:
@@ -3016,6 +3454,7 @@ Document the pipeline execution:
 - Claims: <session_dir>/claims.json
 - Diff map: <session_dir>/diff-map.json
 - Analysis: <session_dir>/analysis.json
+- Comparison: <session_dir>/comparison.json (if Phase 4 was executed)
 - Verification: <session_dir>/verification-report.json (if Phase 6 was executed)
 - Source snapshot: <session_dir>/source-snapshot.md
 
@@ -3048,19 +3487,21 @@ Validate the draft report at `{session_dir}/internal-report.draft.md` before pre
 **Validation checks:**
 
 1. **Metadata header present:** The first non-empty line of the report must be `# Protocol Upgrade Analysis:` (prefix match). If the agent prepended commentary or a code fence, this check catches it.
-2. **Required sections present:** All required sections exist as level-2 headings (exact string match at start of line) — 5 sections when Phase 6 was not executed, 6 sections when Phase 6 data is available:
+2. **Required sections present:** All required sections exist as level-2 headings (exact string match at start of line) — 5 base sections, plus optional sections when Phase 6 or Phase 4 data is available:
    - `## Executive Summary`
    - `## Claims Analysis`
    - `## Unclaimed Changes`
    - `## Methodology`
    - `## Raw Data References`
    - `## Independent Verification` — check this heading ONLY if `verification-report.json` was available. Omit this check entirely if Phase 6 was not executed.
+   - `## Cross-Chain Comparison` — check this heading ONLY if `comparison.json` was available AND had non-empty `comparisons` array. Omit this check entirely if Phase 4 was not executed or knowledge index was empty.
 3. **No duplicate sections:** Each required level-2 heading appears exactly once. Duplicate headings indicate a splicing error.
 4. **Metadata fields present:** Report contains `**Repo:**`, `**Commits:**`, `**Source:**`, `**Generated:**`
 5. **Claims completeness:** If `claims.json` was available, count the number of `### Claim ` sub-headings (note trailing space — match `### Claim \d+:` pattern to avoid false positives from claim text). The count must equal the number of input claims. If any claims are missing from the report, list the missing claim IDs.
 6. **No empty sections:** Each section has at least 20 characters of non-whitespace content below its heading. `[DATA UNAVAILABLE ...]` and `[Phase 6 ... was not executed ...]` markers count as valid content (they are the expected output for degraded/skipped sections).
 7. **Unreported changes completeness:** If `analysis.json` was available and had `unreported_changes`, verify they appear in the report
 8. **Verification completeness:** If `verification-report.json` was available, verify that the `## Independent Verification` section contains the verification summary table and reviewer concerns
+9. **Comparison completeness:** If `comparison.json` was available and had non-empty `comparisons`, verify that the `## Cross-Chain Comparison` section exists and contains at least the "Novel Features", "Borrowed Features", and "Divergent Features" sub-sections
 
 **On validation failure:**
 
@@ -3119,6 +3560,14 @@ Independent Verification:
   Reviewed:   <N> / <total> claims
   Disputes:   <N found> → <N resolved> ✅ / <N unresolved> ❌
   Rounds:     <total_rounds>
+<end if>
+
+<if comparison.json was available AND COMPARISON_HAS_DATA:>
+Cross-Chain Comparison:
+  Compared:   <N> prior analyses
+  Novel:      <N> features
+  Borrowed:   <N> features
+  Divergent:  <N> features
 <end if>
 ```
 
@@ -3190,6 +3639,10 @@ The following error handling framework applies across all pipeline phases. Phase
 | Phase 2 | Clone timeout | Fall back to shallow clone; if still fails, request local path |
 | Phase 2 | Fuzzy match returns 0 results | Show all tags, user selects manually |
 | Phase 3 | A batch of claims fails processing | Skip batch, mark claims as `unverified` with `analysis_notes` indicating batch failure, continue remaining |
+| Phase 4 | analysis.json missing/corrupt | Produce empty comparison.json, log warning, continue to Phase 5 |
+| Phase 4 | Knowledge index missing or empty | Produce empty comparison.json, log "no prior research found", continue |
+| Phase 4 | Malformed JSON lines in knowledge index | Skip malformed lines with warning, process valid lines |
+| Phase 4 | comparison_agent returns invalid JSON | Strip markdown fences, retry parse. If still invalid, produce empty comparison.json |
 | Phase 5 | Upstream artifact missing | Generate partial report, mark missing sections `[DATA UNAVAILABLE]` |
 | Phase 5 | Upstream artifact corrupt (invalid JSON) | Treat as missing; note corruption in Methodology section |
 | Phase 5 | Report generation agent produces incomplete output | Auto-fix: regenerate failed sections (max 1 retry) |
@@ -3647,7 +4100,7 @@ Session:     <session_dir>
 
 If the skill is interrupted, errors out, or the user aborts mid-pipeline:
 
-- **Phases 1-6:** Partial artifacts are saved to disk. No knowledge index entry is created. v1 does NOT support resume-from-phase. If interrupted, re-run from scratch. Partial artifacts remain on disk for manual reference.
+- **Phases 1-4, 6:** Partial artifacts are saved to disk. No knowledge index entry is created. v1 does NOT support resume-from-phase. If interrupted, re-run from scratch. Partial artifacts remain on disk for manual reference.
 - **Phase 7:** If interrupted after the append but before confirmation, the index entry is already written (append-only). On re-invocation, the dedup check (Step 7.4) will detect the existing entry and offer overwrite/keep-both/skip. If interrupted before the append, no index entry exists — re-run Phase 7 after ensuring the report is approved.
 - **Temp repo clone:** Always clean up on exit (success, error, or abort). Stale directories (>24h in `~/.gstack/tmp/research-*`) are cleaned on next invocation by the preamble.
 - **Linear issues:** Sub-issues remain in their current state (In Progress, not Done). The user must manually resolve or re-run.
