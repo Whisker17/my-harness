@@ -1249,7 +1249,53 @@ After the console output, proceed to Step 9 (Approval) or Step 10 (Rejection) ba
 
 **Only proceed here if: `LOOP_STATUS` is `PASS` or `PASS_WITH_NOTES`.**
 
+### 9-pre. Precondition checks
+
+**Verify a PR exists:** Step 9 requires `REVIEW_MODE == "pr"` (set in Step 1d). If the skill ran in `local-diff` mode, there is no PR to merge. In this case:
+
+```
+❌  STOP: Cannot auto-merge — no PR found (REVIEW_MODE=local-diff).
+
+The convergence review passed, but there is no PR to merge.
+Create a PR and re-invoke /harness-review-v2, or merge manually.
+```
+
+STOP — do not proceed with any cleanup steps.
+
+**Capture the feature branch name** before any `git checkout` changes context:
+
+```bash
+FEATURE_BRANCH=$(git branch --show-current)
+```
+
+**Extract the issue ID** from the branch name:
+
+```bash
+ISSUE_ID=$(echo "$FEATURE_BRANCH" | grep -oE 'WHI-[0-9]+' | head -1)
+if [ -z "$ISSUE_ID" ]; then
+  echo "ERROR: Cannot extract issue ID from branch name '$FEATURE_BRANCH'"
+  echo "Expected pattern: WHI-<N> in branch name"
+  # Do NOT stop — proceed with merge but skip Linear updates
+fi
+```
+
+**Check PR state** to ensure idempotency on re-invocation:
+
+```bash
+PR_STATE=$(gh pr view ${PR_NUMBER} --json state --jq '.state' 2>/dev/null)
+if [ "$PR_STATE" = "MERGED" ]; then
+  echo "PR #${PR_NUMBER} is already merged — skipping merge, proceeding to cleanup."
+  # Skip directly to Step 9c
+fi
+if [ "$PR_STATE" = "CLOSED" ]; then
+  echo "WARNING: PR #${PR_NUMBER} is closed (not merged). Cannot proceed."
+  # STOP
+fi
+```
+
 ### 9a. CI Check (pre-merge safety)
+
+**Skip if PR is already merged** (detected in 9-pre).
 
 Before merging, verify CI status on the PR:
 
@@ -1277,9 +1323,11 @@ sleep 30
 gh pr checks ${PR_NUMBER} 2>/dev/null
 ```
 
-If still pending after the second check, report the pending state and ask the user whether to wait or abort. Do NOT auto-merge with pending checks.
+If still pending after the second check, report the pending state and ask the user whether to wait or abort. Do NOT auto-merge with pending checks. **If no user response is received (e.g., in autonomous/auto mode), STOP and do not merge.** Do not infer consent from silence.
 
 ### 9b. Merge the PR
+
+**Skip if PR is already merged** (detected in 9-pre).
 
 ```bash
 gh pr merge ${PR_NUMBER} --merge --delete-branch
@@ -1291,18 +1339,25 @@ Verify the merge succeeded by checking the output for "Merged pull request".
 
 ### 9c. Sync dev branch
 
+Navigate to the **main repo root** (not the worktree root) before checking out dev. The preamble's `REPO_ROOT` may point to the worktree when the skill is invoked from inside one. Use the git common dir to find the real repo root:
+
 ```bash
-cd "$REPO_ROOT"
+MAIN_REPO_ROOT=$(git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel)
+cd "$MAIN_REPO_ROOT"
 git checkout dev && git pull origin dev
 ```
 
 ### 9d. Remove the worktree
 
-Detect the worktree path from the feature branch:
+Detect the worktree path using the bracketed branch name as printed by `git worktree list` (avoids ambiguous substring matches):
 
 ```bash
-WORKTREE_PATH=$(git worktree list | grep "${BRANCH_NAME}" | awk '{print $1}')
-git worktree remove "$WORKTREE_PATH"
+WORKTREE_PATH=$(git worktree list | grep "\[${FEATURE_BRANCH}\]" | awk '{print $1}')
+if [ -n "$WORKTREE_PATH" ]; then
+  git worktree remove "$WORKTREE_PATH"
+else
+  echo "WARNING: Could not find worktree for branch $FEATURE_BRANCH"
+fi
 ```
 
 If the worktree removal fails (uncommitted changes, etc.), warn but do NOT block — the merge already happened. Tell the user to clean it up manually.
@@ -1310,7 +1365,7 @@ If the worktree removal fails (uncommitted changes, etc.), warn but do NOT block
 ### 9e. Delete the local feature branch
 
 ```bash
-git branch -d "$BRANCH_NAME"
+git branch -d "$FEATURE_BRANCH"
 ```
 
 If the branch deletion fails, warn but do NOT block.
@@ -1320,28 +1375,30 @@ If the branch deletion fails, warn but do NOT block.
 `--delete-branch` on `gh pr merge` is unreliable when run inside a worktree. Always verify:
 
 ```bash
-git ls-remote --heads origin "$BRANCH_NAME" | grep -q . && git push origin --delete "$BRANCH_NAME"
+git ls-remote --heads origin "$FEATURE_BRANCH" | grep -q . && git push origin --delete "$FEATURE_BRANCH"
 ```
 
 ### 9g. Move Linear issue to Done
 
-Extract the issue ID from the branch name (pattern: `WHI-<N>`).
+**Skip if `ISSUE_ID` is empty** (extraction failed in 9-pre).
 
-Use `mcp__linear-server__save_issue` with `id: "<issue-id>", state: "Done"`.
+Use `mcp__linear-server__save_issue` with `id: "<ISSUE_ID>", state: "Done"`.
 
-Also move any sub-issues that are not yet Done: use `mcp__linear-server__list_issues` with `parentId: "<issue-id>"` then update each to Done.
+If the parent issue update succeeds, also move any sub-issues that are not yet Done: use `mcp__linear-server__list_issues` with `parentId: "<ISSUE_ID>"` then update each to Done. **Only attempt sub-issue updates if the parent `save_issue` call succeeded.**
 
 **On failure:** Warn, but do NOT roll back the merge. The code is merged — Linear state can be fixed manually.
 
 ### 9h. Post Linear comment
 
-Use `mcp__linear-server__save_comment` with `issueId: "<issue-id>"` and body:
+**Skip if `ISSUE_ID` is empty** (extraction failed in 9-pre).
+
+Use `mcp__linear-server__save_comment` with `issueId: "<ISSUE_ID>"` and body:
 
 ```markdown
 ## Review v2: Approved & Merged
 
 **PR:** <PR URL> (merged)
-**Branch:** <BRANCH_NAME> (deleted)
+**Branch:** <FEATURE_BRANCH> (deleted)
 **Rounds:** {ROUND_N}
 **Status:** {LOOP_STATUS}
 
@@ -1360,7 +1417,7 @@ Review report: `.reviews/{BRANCH_SAFE}/review-report.md`
 ✅  Review PASSED — merged and closed
 
 PR:      <PR URL> (merged)
-Branch:  <BRANCH_NAME> (deleted)
+Branch:  <FEATURE_BRANCH> (deleted)
 Status:  Done (Linear updated)
 
 Rounds:  {ROUND_N}
@@ -1377,7 +1434,18 @@ Review report: .reviews/{BRANCH_SAFE}/review-report.md
 
 Do NOT merge. Do NOT move the issue out of "In Review".
 
+### 10-pre. Capture branch context
+
+Capture the feature branch name before any context changes (same pattern as Step 9-pre):
+
+```bash
+FEATURE_BRANCH=$(git branch --show-current)
+ISSUE_ID=$(echo "$FEATURE_BRANCH" | grep -oE 'WHI-[0-9]+' | head -1)
+```
+
 ### 10a. Post GitHub PR review comment
+
+**Skip if `REVIEW_MODE != "pr"`** — no PR exists to comment on. In local-diff mode, the rejection summary (Step 10c) is the only output.
 
 Use `gh pr review` to post a review requesting changes:
 
@@ -1405,7 +1473,7 @@ gh pr review ${PR_NUMBER} --request-changes --body "$(cat <<'REVIEW_EOF'
 
 1. Review the unresolved findings in `.reviews/{BRANCH_SAFE}/review-report.md`
 2. Fix or rebut the remaining issues in the feature branch
-3. Push the fixes to `{BRANCH_NAME}`
+3. Push the fixes to `{FEATURE_BRANCH}`
 4. Re-invoke `/harness-review-v2` for another review pass
 
 *Reviewed by harness-review-v2 (Codex↔Opus convergence) — do not merge until all medium+ findings are resolved*
@@ -1415,7 +1483,9 @@ REVIEW_EOF
 
 ### 10b. Post Linear comment
 
-Use `mcp__linear-server__save_comment` with `issueId: "<issue-id>"` and body:
+**Skip if `ISSUE_ID` is empty** (extraction failed in 10-pre).
+
+Use `mcp__linear-server__save_comment` with `issueId: "<ISSUE_ID>"` and body:
 
 ```markdown
 ## Review v2: Changes Requested
@@ -1429,7 +1499,7 @@ Use `mcp__linear-server__save_comment` with `issueId: "<issue-id>"` and body:
 
 ### Next Step
 
-Review the findings in `.reviews/{BRANCH_SAFE}/review-report.md`, fix or rebut the remaining issues, push to `{BRANCH_NAME}`, and re-invoke `/harness-review-v2`.
+Review the findings in `.reviews/{BRANCH_SAFE}/review-report.md`, fix or rebut the remaining issues, push to `{FEATURE_BRANCH}`, and re-invoke `/harness-review-v2`.
 ```
 
 ### 10c. Output rejection summary
