@@ -2046,6 +2046,56 @@ Parse and check using the validation rules from [Artifact Schemas > claims.json]
 
 Report ALL failures (not just the first one), then abort.
 
+**Validate diff-map.json** (required for fix-verify loop repository context):
+
+```bash
+DIFFMAP_FILE="$SESSION_DIR/diff-map.json"
+if [ ! -f "$DIFFMAP_FILE" ]; then
+  echo "⚠️  diff-map.json not found at $DIFFMAP_FILE"
+  echo "   Fix-verify loop will be disabled — disputed claims cannot be rechecked without repo context."
+  DIFFMAP_AVAILABLE=false
+else
+  DIFFMAP_AVAILABLE=true
+fi
+```
+
+If `DIFFMAP_AVAILABLE=true`, validate:
+
+1. File must be valid JSON
+2. `clone_path` must be a non-empty string
+3. The directory at `clone_path` must exist and contain a `.git` directory
+4. `base_sha` and `head_sha` must be non-empty strings
+
+```bash
+if [ "$DIFFMAP_AVAILABLE" = true ]; then
+  CLONE_PATH=$(jq -r '.clone_path // empty' "$DIFFMAP_FILE")
+  BASE_SHA=$(jq -r '.base_sha // empty' "$DIFFMAP_FILE")
+  HEAD_SHA=$(jq -r '.head_sha // empty' "$DIFFMAP_FILE")
+
+  DIFFMAP_VALID=true
+  if [ -z "$CLONE_PATH" ]; then
+    echo "⚠️  diff-map.json: clone_path is missing or empty"
+    DIFFMAP_VALID=false
+  elif [ ! -d "$CLONE_PATH/.git" ]; then
+    echo "⚠️  diff-map.json: clone_path ($CLONE_PATH) is not a valid git repository"
+    DIFFMAP_VALID=false
+  fi
+  if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+    echo "⚠️  diff-map.json: base_sha or head_sha is missing"
+    DIFFMAP_VALID=false
+  fi
+
+  if [ "$DIFFMAP_VALID" = false ]; then
+    echo "   Fix-verify loop will be disabled — repo context is incomplete."
+    DIFFMAP_AVAILABLE=false
+  else
+    echo "Repository context: $CLONE_PATH ($BASE_SHA..$HEAD_SHA)"
+  fi
+fi
+```
+
+> **Impact of missing diff-map.json:** Phase 6 claim selection and initial verification proceed normally (they only need analysis.json and claims.json). Only the fix-verify loop in Step 6.3 is affected — if `DIFFMAP_AVAILABLE=false`, disputed claims are marked as unresolved instead of entering the recheck cycle.
+
 **Extract working variables after validation passes:**
 
 ```bash
@@ -2054,6 +2104,7 @@ TOTAL_ANALYZED=$(cat "$ANALYSIS_FILE" | jq '.claims_analyzed | length')
 
 echo "Total claims: $TOTAL_CLAIMS"
 echo "Total analyzed: $TOTAL_ANALYZED"
+echo "Diff-map available: $DIFFMAP_AVAILABLE"
 ```
 
 ### Step 6.1 — Top 10 Claim Selection (D2)
@@ -2231,7 +2282,14 @@ A dispute occurs when `agrees_with_original == false` AND the status mapping abo
 
 **Fix-verify loop:**
 
+> **Pre-condition:** The fix-verify loop requires `DIFFMAP_AVAILABLE=true` (set in Step 6.0). If `DIFFMAP_AVAILABLE=false`, skip the loop entirely — mark all disputed claims as unresolved and set `verification_status = "partial"` with a note: "Fix-verify loop skipped — repository context unavailable (diff-map.json missing or invalid)."
+
 ```
+IF DIFFMAP_AVAILABLE == false AND DISPUTES is non-empty:
+  Print: "⚠️  Skipping fix-verify loop — diff-map.json unavailable. <len(DISPUTES)> disputes remain unresolved."
+  Mark verification_status = "partial"
+  SKIP to Step 6.4
+
 DISPUTES = [claims where dispute == true]
 ROUND = 0
 MAX_ROUNDS = 3
@@ -2997,6 +3055,7 @@ The following error handling framework applies across all pipeline phases. Phase
 | Phase 6 | Verification subagent drops claims from response | Mark missing claims as `unconfirmed` with reasoning noting agent failure |
 | Phase 6 | Fix-verify loop cap reached (3 rounds) | Preserve both assessments, mark `verification_status: "partial"`, proceed to report |
 | Phase 6 | analysis.json or claims.json missing/corrupt | Abort Phase 6 — verification cannot proceed without upstream analysis. Pipeline continues to Phase 5 without verification data. |
+| Phase 6 | diff-map.json missing/corrupt or clone_path invalid | Skip fix-verify loop only — initial verification (Steps 6.1-6.2) proceeds normally. Disputed claims remain unresolved, `verification_status: "partial"`. |
 
 **Error handling philosophy:** Phase 5 always attempts to produce output. The only condition that aborts Phase 5 is ALL upstream artifacts being missing. Any other combination of missing/partial/corrupt artifacts results in a degraded but functional report.
 
