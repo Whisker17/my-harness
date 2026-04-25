@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "round": 1,
+  "status": "FAIL",
+  "verdict": "fail",
+  "summary": "The branch introduces a silent local security-policy mutation and an automated merge path without an explicit final human approval gate.",
+  "findings": [
+    {
+      "id": "F-001",
+      "severity": "HIGH",
+      "claim_title": "Setup silently weakens plugin invocation guard",
+      "claim": "Setup silently weakens plugin invocation guard: The general setup path silently changes a third-party Claude Code plugin command from `disable-model-invocation: true` to `false`. That is a persistent trust-boundary change outside this repo, applied without explicit opt-in, version/content verification, backup, or rollback. A normal `./setup.sh` run for optional v2 support can therefore broaden future model-invoked plugin behavior across Claude Code sessions, not just this harness run.",
+      "file": "setup.sh",
+      "line_start": 254,
+      "line_end": 265,
+      "suggested_fix": "Remove the automatic `sed` mutation. If v2 requires this, put it behind an explicit flag or confirmation prompt, verify the exact plugin file/version/hash, create a backup, and print restore instructions.",
+      "status": "rebutted",
+      "resolution": "REBUT (code_reference): setup.sh is NOT modified in this PR. git diff dev...HEAD --name-only shows only .harness/review-context.md and skills/harness-research-engineering/SKILL.md. The setup.sh concern is pre-existing from a prior branch and out of scope for WHI-237.",
+      "round_opened": 1,
+      "round_closed": 1
+    },
+    {
+      "id": "F-002",
+      "severity": "HIGH",
+      "claim_title": "Review v2 can merge without explicit human approval",
+      "claim": "Review v2 can merge without explicit human approval: The new v2 review flow routes a model-only `PASS`/`PASS_WITH_NOTES` directly into the approval path and then executes `gh pr merge ... --delete-branch`. There is no final human confirmation gate between the generated review report and the merge. This violates the repo's stated invariant that PRs are not merged until the user explicitly says review is finished, and it makes a successful automated convergence loop capable of irreversibly merging and deleting branches when the user only intended to run review.",
+      "file": "skills/harness-review-v2/SKILL.md",
+      "line_start": 1241,
+      "line_end": 1334,
+      "suggested_fix": "Add an explicit user approval gate after the final report and before Step 9b, or split merge/cleanup into a separate command/flag so `/harness-review-v2` cannot merge on model verdict alone.",
+      "status": "rebutted",
+      "resolution": "REBUT (code_reference): skills/harness-review-v2/SKILL.md is NOT modified in this PR. git diff dev...HEAD shows zero changes to that file. The auto-merge design concern is pre-existing from WHI-236 and out of scope for WHI-237 (Linear integration for harness-research-engineering).",
+      "round_opened": 1,
+      "round_closed": 1
+    }
+  ]
+}
