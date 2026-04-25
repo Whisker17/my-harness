@@ -2100,15 +2100,15 @@ Document the pipeline execution:
 - Keep the Executive Summary concise but substantive (not generic platitudes)
 ```
 
-### Step 5.3 — Write Report to Disk
+### Step 5.3 — Write Draft Report to Disk
 
-**File:** `{session_dir}/internal-report.md`
+**File:** `{session_dir}/internal-report.draft.md`
 
-Write the generated report content using the Write tool.
+Write the generated report content to the **draft** path using the Write tool. The draft file is NOT the final deliverable — it is promoted to `internal-report.md` only after user approval in Step 5.5. This ensures the mandatory user checkpoint cannot be bypassed by a premature write.
 
 ### Step 5.4 — Self-Validation Gate
 
-Validate the generated report structure before presenting to the user.
+Validate the draft report at `{session_dir}/internal-report.draft.md` before presenting to the user.
 
 **Validation checks:**
 
@@ -2149,7 +2149,7 @@ The following validation checks failed and could not be auto-fixed:
 
 ### Step 5.5 — User Checkpoint 🧑
 
-Present the report summary to the user for confirmation. This is a mandatory checkpoint — do NOT save the final report without user approval.
+Present the report summary to the user for confirmation. This is a mandatory checkpoint — the draft report at `{session_dir}/internal-report.draft.md` is NOT promoted to the final path until the user approves.
 
 **Display format:**
 
@@ -2157,7 +2157,7 @@ Present the report summary to the user for confirmation. This is a mandatory che
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 📄 Phase 5 Complete — Internal Report Generated
 
-Report:     {session_dir}/internal-report.md
+Report:     {session_dir}/internal-report.draft.md (pending approval)
 Artifacts:  <N available> / 3 total
 <if any missing: list missing artifacts>
 
@@ -2197,7 +2197,7 @@ Use AskUserQuestion:
 
 If the user provides edits:
 1. Apply the requested changes to the report content
-2. Re-write `{session_dir}/internal-report.md`
+2. Re-write `{session_dir}/internal-report.draft.md`
 3. Re-validate (Step 5.4)
 4. Re-display the summary
 
@@ -2205,13 +2205,20 @@ If the user requests section regeneration:
 1. Ask which sections to regenerate
 2. For each section, use the same auto-fix strategy as Step 5.4: dispatch the agent with a section-specific prompt containing the relevant input data and the instruction to output only that section
 3. Replace the section content in the report (between heading and next `## ` heading)
-4. Re-write `{session_dir}/internal-report.md`
+4. Re-write `{session_dir}/internal-report.draft.md`
 5. Re-validate (Step 5.4)
 6. Re-display the summary
 
 If the user approves:
-1. The report at `{session_dir}/internal-report.md` is the final deliverable
-2. Print confirmation and proceed to pipeline completion
+1. Rename the draft to the final path: move `{session_dir}/internal-report.draft.md` → `{session_dir}/internal-report.md`
+2. Delete the draft file if it still exists (the rename should have removed it)
+3. The report at `{session_dir}/internal-report.md` is the final deliverable
+4. Print confirmation and proceed to pipeline completion
+
+If the user aborts:
+1. Delete `{session_dir}/internal-report.draft.md`
+2. Print: "Draft report discarded. No final report was saved."
+3. The session directory retains upstream artifacts but has no `internal-report.md`
 
 **Output artifacts:**
 ```
