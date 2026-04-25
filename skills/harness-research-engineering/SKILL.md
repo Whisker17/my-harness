@@ -251,7 +251,7 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
 - **Mission:** Synthesize all upstream artifacts into a structured internal technical report
 - **Inputs:** `claims.json`, `diff-map.json`, `analysis.json` (all optional — handles partial availability)
 - **Tools:** Write, Read
-- **Outputs:** `internal-report.md` (M1 only generates internal report; public summary is M3 scope per D15)
+- **Outputs:** `internal-report.draft.md` → promoted to `internal-report.md` after user approval (M1 only generates internal report; public summary is M3 scope per D15)
 - **Behavior:**
   - Report sections: Executive Summary, Claims Analysis (per-claim with evidence), Unclaimed Changes, Methodology, Raw Data References
   - Every claim references its verification status from `analysis.json` (or marked `[DATA UNAVAILABLE]` if analysis is missing)
@@ -2175,6 +2175,15 @@ Claims Breakdown:
   Unavailable:  <N> 🔲
 
 Unreported Changes: <N total> (<N high> 🔴, <N medium> 🟡, <N low> 🟢)
+```
+
+**Claims Breakdown computation:**
+- **Confirmed** = claims with `verification_status == "verified"`
+- **Partial** = claims with `verification_status == "partially_verified"`
+- **Unconfirmed** = claims with `verification_status == "unverified"` AND analysis.json was available (i.e., the claim was analyzed but not confirmed)
+- **Unavailable** = claims with `verification_status == "not_analyzed"` (set during Step 5.1 when analysis.json was missing or when the claim had no matching entry in `claims_analyzed`)
+
+```
 
 <if any degradation occurred:>
 ⚠️  Degradation Notes:
@@ -2235,7 +2244,7 @@ The following error handling framework applies across all pipeline phases. Phase
 | Phase 1 | Claims extraction yields 0 claims | Warn user, ask whether to continue |
 | Phase 2 | Clone timeout | Fall back to shallow clone; if still fails, request local path |
 | Phase 2 | Fuzzy match returns 0 results | Show all tags, user selects manually |
-| Phase 3 | A batch of claims fails processing | Skip batch, mark claims as `analysis_error`, continue remaining |
+| Phase 3 | A batch of claims fails processing | Skip batch, mark claims as `unverified` with `analysis_notes` indicating batch failure, continue remaining |
 | Phase 5 | Upstream artifact missing | Generate partial report, mark missing sections `[DATA UNAVAILABLE]` |
 | Phase 5 | Upstream artifact corrupt (invalid JSON) | Treat as missing; note corruption in Methodology section |
 | Phase 5 | Report generation agent produces incomplete output | Auto-fix: regenerate failed sections (max 1 retry) |
