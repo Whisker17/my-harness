@@ -1,57 +1,62 @@
-# Review Context — WHI-222: convergence loop and final report generation
+# Review Context — WHI-239: harness-review-v2 Approval/Rejection Path
 
 ## Implementation Summary
 
-Added Steps 6-8 to the harness-review-v2 SKILL.md, completing the v2 review pipeline:
-- **Step 6 (Convergence Loop):** Orchestrates the outer loop — after Opus fixes, re-invoke Codex on the full branch diff, normalize with round merge, run Opus fix again, check convergence. Max 3 rounds.
-- **Step 7 (Convergence Check):** Evaluates PASS → PASS_WITH_NOTES → STALE → MAX_ROUNDS → CONTINUE in order. Both stale and max-rounds produce ESCALATED status.
-- **Step 8 (Final Report):** Generates review-report.md with branch, date, rounds, status, summary counts, findings detail table, and unresolved section (ESCALATED only).
+Added Steps 9 (Approval Path) and Step 10 (Rejection Path) to `skills/harness-review-v2/SKILL.md`, completing the v2 review pipeline's full lifecycle to match v1's harness-review behavior.
 
-Updated all existing placeholder references to WHI-222 with direct step references. Updated intro, output contract, error recovery table, and scope boundary.
+**Step 9 (Approval Path)** — triggered when `LOOP_STATUS` is `PASS` or `PASS_WITH_NOTES`:
+- 9-pre: Precondition checks (REVIEW_MODE gate, FEATURE_BRANCH capture, ISSUE_ID extraction, PR state idempotency check)
+- 9a: CI check via `gh pr checks` — failing CI blocks merge, pending CI asks user (with "do not infer consent from silence" guard for auto mode)
+- 9b: PR merge via `gh pr merge --merge --delete-branch`
+- 9c: Sync dev branch from main repo root (uses `git rev-parse --git-common-dir` to escape worktree)
+- 9d: Remove worktree (with bracketed branch format detection)
+- 9d-2: Delete local feature branch
+- 9d-3: Verify and delete remote feature branch (git ls-remote fallback per CLAUDE.md)
+- 9e: Move Linear issue to Done (with sub-issue handling)
+- 9f: Success output message
+
+**Step 10 (Rejection Path)** — triggered when `LOOP_STATUS` is `ESCALATED`:
+- 10-pre: Branch context capture and guards (REVIEW_MODE gate, ISSUE_ID gate)
+- 10a: Post GitHub PR review with `--request-changes` (includes verdict, findings table, unresolved details, next steps)
+- 10b: Post Linear comment (review summary, unresolved findings, next steps)
+- 10c: Rejection output message
 
 Key design decisions:
-- STALE is not a separate enum value — both stale and max-rounds produce `ESCALATED`. The distinction is logged for debugging.
-- Report template intentionally extends the AC's minimal template with separate "Disputed" and "Open" lines for more granularity.
-- `PREV_ACTIVE_IDS` is mutated inside Step 7b (convergence check) to update the outer loop state from Step 6a. This cross-step mutation is explicitly documented.
+- Reused v1 patterns (merge commit strategy, worktree cleanup chain, remote branch verification) adapted to v2's convergence loop semantics
+- Added precondition blocks (9-pre, 10-pre) to capture branch context before any `git checkout` changes state
+- REVIEW_MODE gate prevents merge attempts when running in local-diff mode (no PR exists)
+- PR state check provides idempotency on re-invocation (already-merged PR skips merge)
 
 ## Files Changed
 
-- `skills/harness-review-v2/SKILL.md` — Added Steps 6-8 (convergence loop, convergence check, final report). Updated intro text, Step 4a quick exit reference, Step 5a reference, output contract, error recovery table, and scope boundary.
+- `skills/harness-review-v2/SKILL.md` — Added Steps 9-10 (approval/rejection paths), updated output contract table, updated error recovery table, updated scope boundary, updated state machine diagram
 
 ## Adversarial Review Findings
 
 ### Addressed (Critical/High)
 
-1. **STALE ambiguity** — Clarified in Step 7c that both stale and max-rounds produce `ESCALATED`, not a separate enum value. Updated Scope Boundary.
-2. **PREV_ACTIVE_IDS state mutation** — Added explicit comments in Step 6a (initialization) and Step 7b (update) documenting the cross-step state mutation.
-3. **Round 3 diagram** — Fixed to say "exits ESCALATED unless PASS or PASS_WITH_NOTES" (was missing PASS_WITH_NOTES).
-4. **Severity case mismatch** — Added note in Step 7c that severity values are uppercase per Step 4b normalization.
-5. **Stale branch invariant** — Added comment that the stale branch is only reached when ACTIVE_COUNT > 0.
-6. **Broken markdown fence** — Restructured Step 8c to avoid unclosed code fences.
-7. **LOW_ONLY_COUNT undefined** — Added computation in Step 8a for the PASS_WITH_NOTES console banner.
-8. **claim_title empty string** — Fixed jq fallback to handle empty string claim_title.
+1. **CRITICAL — No PR gate on merge path:** Step 9 assumed a PR always exists. Fixed: added `REVIEW_MODE == "pr"` check in Step 9-pre; if local-diff mode, skip merge and output warning.
+2. **CRITICAL — No issue ID extraction:** Steps 9/10 referenced `$ISSUE_ID` without extracting it. Fixed: added `grep -oE 'WHI-[0-9]+'` extraction with empty check and error message.
+3. **HIGH — Auto-mode silence consent:** CI pending path asked user to decide but didn't handle autonomous/auto mode. Fixed: added "do not infer consent from silence" instruction.
+4. **HIGH — Worktree root vs main repo root:** `cd "$REPO_ROOT"` inside a worktree stays in the worktree. Fixed: use `git -C "$(git rev-parse --git-common-dir)/.." rev-parse --show-toplevel` to find the real repo root.
+5. **HIGH — No idempotency on re-invocation:** Re-running after a successful merge would attempt to merge again. Fixed: added `gh pr view --json state` check; if MERGED, skip merge.
+6. **HIGH — Ambiguous worktree grep:** `grep "$FEATURE_BRANCH"` could match substrings. Fixed: match `"\[${FEATURE_BRANCH}\]"` (bracketed format from `git worktree list`).
 
 ### Remaining (Medium/Low — not auto-fixed)
 
-1. **Minor** — Step 4a quick-exit uses `$ROUND_N` before Step 6a initializes it (pre-existing from WHI-219, mitigated by `${ROUND_N:-1}` default in Step 4b)
-2. **Minor** — Step 3b hardcodes `round-1` filename in parse-failure handler (pre-existing from WHI-219, affects round 2+ reuse)
-3. **Minor** — Loop diagram doesn't show PREV_ACTIVE_IDS state update for every round (partially addressed by adding to Round 1/2)
+1. **MEDIUM — Duplicate reviews on re-invoke (M-3):** If skill is re-invoked after rejection, it re-runs the entire convergence loop from scratch rather than resuming. Not fixed — matches v2's existing no-retry/no-resume scope boundary.
+2. **LOW — Output contract table not updated (L-1):** The output contract table at the top of SKILL.md may not reflect all new outputs from Steps 9-10. Human reviewer should verify.
+3. **LOW — Template variable fallbacks (L-2):** Some bash variables in Steps 9-10 don't have `${VAR:-default}` fallback syntax. Low risk since precondition checks catch missing values early.
 
 ## PR
 
-https://github.com/Whisker17/my-harness/pull/13
+https://github.com/Whisker17/my-harness/pull/17
 
 ## Acceptance Criteria Status
 
-- [x] After Opus commits fixes, re-invoke `codex:adversarial-review` for the updated diff — Step 6c
-- [x] Codex re-reviews the FULL branch diff (git diff dev...HEAD), not just the fix commit — Step 6c explicitly states this
-- [x] Convergence check evaluates in order: PASS → PASS_WITH_NOTES → STALE → MAX_ROUNDS → continue — Step 7b if-elif chain
-- [x] PASS: 0 active findings with severity in (critical, high, medium); active = status in (open, disputed) — Step 7b
-- [x] PASS_WITH_NOTES: 0 medium+ active, but low-severity findings remain open — Step 7b
-- [x] STALE: set of active finding IDs identical to previous round's active IDs; only evaluated from round 2+ — Step 7b with ROUND_N >= 2 guard
-- [x] MAX_ROUNDS: current round >= 3 — Step 7b with ROUND_N >= MAX_ROUNDS
-- [x] STALE and MAX_ROUNDS produce ESCALATED status — Step 7b and 7c note
-- [x] Loop orchestration: round 1 → fix → round 2 → fix → round 3 → final — Step 6d diagram
-- [x] Final report at .reviews/{branch_safe}/review-report.md with all required fields — Step 8b template
-- [x] ESCALATED prints console message with unresolved count and report path — Step 8d
-- [x] PASS/PASS_WITH_NOTES prints summary and exits successfully — Step 8d
+- [x] PASS / PASS_WITH_NOTES triggers Approval Path: merge → sync dev → cleanup worktree/branch → verify remote branch → Linear Done — Step 9 (9a-9f)
+- [x] ESCALATED triggers Rejection Path: `gh pr review --request-changes` with findings → Linear comment → issue stays In Review — Step 10 (10a-10c)
+- [x] Approval Path includes CI check; CI failure blocks merge — Step 9a
+- [x] Rejection Path PR comment includes verdict, findings table, unresolved details, next steps — Step 10a template
+- [x] Linear comment format consistent with v1 (Approval: merged + Done; Rejection: changes requested + specific gaps) — Steps 9e and 10b
+- [x] Error recovery: merge failure warns + preserves worktree; worktree deletion failure warns + doesn't block; Linear failure doesn't rollback merge — Step 9 error handling and updated error recovery table
