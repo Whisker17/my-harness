@@ -302,7 +302,7 @@ Before normalizing, check if the review can exit early:
 
 ```bash
 VERDICT=$(jq -r '.verdict' ".reviews/${BRANCH_SAFE}/codex-findings-round-${ROUND_N}.json")
-MEDIUM_PLUS=$(jq '[.findings[] | select(.severity == "CRITICAL" or .severity == "HIGH" or .severity == "MEDIUM")] | length' ".reviews/${BRANCH_SAFE}/codex-findings-round-${ROUND_N}.json")
+MEDIUM_PLUS=$(jq '[.findings[] | select((.severity | ascii_upcase) == "CRITICAL" or (.severity | ascii_upcase) == "HIGH" or (.severity | ascii_upcase) == "MEDIUM")] | length' ".reviews/${BRANCH_SAFE}/codex-findings-round-${ROUND_N}.json")
 ```
 
 **If `VERDICT == "approve"` (case-insensitive) AND `MEDIUM_PLUS == 0`:**
@@ -319,15 +319,9 @@ Status: PASS — skip to report
 Write a minimal findings file and skip to the report step (WHI-222):
 
 ```bash
-cat > ".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json" <<'FINDINGS_EOF'
-{
-  "schema_version": 1,
-  "round": <ROUND_N>,
-  "status": "PASS",
-  "verdict": "approve",
-  "findings": []
-}
-FINDINGS_EOF
+jq -n --argjson round "$ROUND_N" \
+  '{schema_version:1, round:$round, status:"PASS", verdict:"approve", findings:[]}' \
+  > ".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json"
 ```
 
 STOP further normalization — the convergence loop (WHI-222) will handle the report.
@@ -404,8 +398,8 @@ jq --argjson round "$ROUND_N" '
     {
       id: ("F-" + ((.key + 1) | tostring | if length == 1 then "00" + . elif length == 2 then "0" + . else . end)),
       severity: (.value.severity | ascii_upcase | if . == "CRITICAL" or . == "HIGH" or . == "MEDIUM" or . == "LOW" then . else "MEDIUM" end),
-      claim_title: .value.title,
-      claim: (.value.title + ": " + (.value.description // .value.body // "")),
+      claim_title: (.value.title // ""),
+      claim: ((.value.title // "") + ": " + (.value.description // .value.body // "")),
       file: (if (.value.file // "") == "" then null else .value.file end),
       line_start: (if (.value.file // "") == "" then null elif .value.line_start then .value.line_start elif .value.line then .value.line else null end),
       line_end: (if (.value.file // "") == "" then null elif .value.line_end then .value.line_end elif .value.line_start then .value.line_start elif .value.line then .value.line else null end),
@@ -430,7 +424,7 @@ FINDINGS_FILE=".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json"
 SCHEMA_VER=$(jq -r '.schema_version' "$FINDINGS_FILE")
 if [ "$SCHEMA_VER" != "1" ]; then
   echo "ERROR: findings-round-${ROUND_N}.json has invalid schema_version: $SCHEMA_VER (expected 1)"
-  # Attempt to fix by re-running normalization
+  exit 1
 fi
 
 # Validate all findings have required fields
@@ -476,10 +470,12 @@ When processing round N+1, merge the new Codex findings with the findings from r
 
 For each new Codex finding in round N+1, check it against every finding from round N:
 
-**Match 1 — Exact title match:**
+**Match 1 — Exact title match (non-null only):**
 
 ```
-new_finding.claim_title == existing_finding.claim_title
+new_finding.claim_title is not null
+AND existing_finding.claim_title is not null
+AND new_finding.claim_title == existing_finding.claim_title
 ```
 
 If matched → this is a re-raise of the existing finding.
@@ -549,60 +545,73 @@ MERGED_OUTPUT=".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json"
 # Extract max ID from previous round
 MAX_ID=$(jq '[.findings[].id | ltrimstr("F-") | tonumber] | max // 0' "$PREV_FINDINGS")
 
+# Extract verdict and summary from the NEW Codex round (not previous)
+NEW_VERDICT=$(jq -r '.verdict' "$NEW_CODEX")
+NEW_SUMMARY=$(jq -r '.summary' "$NEW_CODEX")
+
 # Normalize new findings from Codex (temporary, for matching)
+TMP_NORM=$(mktemp)
 jq --argjson round "$ROUND_N" '
   .findings | to_entries | map({
     idx: .key,
-    severity: (.value.severity | ascii_upcase),
-    claim_title: .value.title,
-    claim: (.value.title + ": " + (.value.description // .value.body // "")),
+    severity: (.value.severity | ascii_upcase | if . == "CRITICAL" or . == "HIGH" or . == "MEDIUM" or . == "LOW" then . else "MEDIUM" end),
+    claim_title: (.value.title // ""),
+    claim: ((.value.title // "") + ": " + (.value.description // .value.body // "")),
     file: (if (.value.file // "") == "" then null else .value.file end),
     line_start: (if (.value.file // "") == "" then null elif .value.line_start then .value.line_start elif .value.line then .value.line else null end),
     line_end: (if (.value.file // "") == "" then null elif .value.line_end then .value.line_end elif .value.line_start then .value.line_start elif .value.line then .value.line else null end),
     suggested_fix: (.value.recommendation // .value.description // .value.body // ""),
     round: $round
   })
-' "$NEW_CODEX" > "/tmp/new_normalized.json"
+' "$NEW_CODEX" > "$TMP_NORM"
 
 # Run the merge with re-raise detection
-jq -s --argjson round "$ROUND_N" --argjson max_id "$MAX_ID" '
+jq -s --argjson round "$ROUND_N" --argjson max_id "$MAX_ID" --arg new_verdict "$NEW_VERDICT" --arg new_summary "$NEW_SUMMARY" '
   .[0] as $prev | .[1] as $new_findings |
 
   # For each new finding, check if it re-raises an existing one
   # Build a map of re-raises: existing_id → new_finding
+  # For each new finding, check if it re-raises an existing one
+  # Build a map of re-raises: existing_id → new_finding
+  # Guard: only match if the existing finding hasn't already been claimed by a prior new finding
   (reduce $new_findings[] as $nf (
-    {};
+    {"map": {}, "claimed": []};
     . as $acc |
     ($prev.findings | to_entries | map(
       select(
-        # Match 1: exact title match
-        (.value.claim_title == $nf.claim_title)
-        or
-        # Match 2: same file + overlapping lines ±15
+        # Skip already-claimed existing findings (prevents overwrite when two new findings match the same existing one)
+        ([.value.id] | inside($acc.claimed) | not)
+        and
         (
-          .value.file != null and $nf.file != null and
-          .value.file == $nf.file and
-          .value.line_start != null and .value.line_end != null and
-          $nf.line_start != null and $nf.line_end != null and
-          ($nf.line_start - 15) <= .value.line_end and
-          ($nf.line_end + 15) >= .value.line_start
+          # Match 1: exact title match (guard against null == null)
+          (.value.claim_title != null and $nf.claim_title != null and .value.claim_title == $nf.claim_title)
+          or
+          # Match 2: same file + overlapping lines ±15
+          (
+            .value.file != null and $nf.file != null and
+            .value.file == $nf.file and
+            .value.line_start != null and .value.line_end != null and
+            $nf.line_start != null and $nf.line_end != null and
+            ($nf.line_start - 15) <= .value.line_end and
+            ($nf.line_end + 15) >= .value.line_start
+          )
         )
       )
     ) | first // null) as $match |
     if $match != null then
-      $acc + {($match.value.id): $nf}
+      {map: ($acc.map + {($match.value.id): $nf}), claimed: ($acc.claimed + [$match.value.id])}
     else
-      $acc + {("__new_" + ($nf.idx | tostring)): $nf}
+      {map: ($acc.map + {("__new_" + ($nf.idx | tostring)): $nf}), claimed: $acc.claimed}
     end
-  )) as $reraise_map |
+  ) | .map) as $reraise_map |
 
   # Build merged findings
   {
     schema_version: 1,
     round: $round,
-    status: $prev.status,
-    verdict: $prev.verdict,
-    summary: $prev.summary,
+    status: (if $new_verdict == "approve" then "PASS" else "FAIL" end),
+    verdict: $new_verdict,
+    summary: $new_summary,
     findings: (
       # Process existing findings
       [
@@ -615,7 +624,7 @@ jq -s --argjson round "$ROUND_N" --argjson max_id "$MAX_ID" '
           elif .status == "rebutted" then
             .status = "disputed"
           elif .status == "confirmed_fixed" then
-            .status = "open" | .resolution = null | .round_opened = $round
+            .status = "open" | .resolution = null | .round_opened = $round | .round_closed = null
           else
             .
           end
@@ -653,9 +662,9 @@ jq -s --argjson round "$ROUND_N" --argjson max_id "$MAX_ID" '
       ]
     )
   }
-' "$PREV_FINDINGS" "/tmp/new_normalized.json" > "$MERGED_OUTPUT"
+' "$PREV_FINDINGS" "$TMP_NORM" > "$MERGED_OUTPUT"
 
-rm -f /tmp/new_normalized.json
+rm -f "$TMP_NORM"
 ```
 
 ### 4e. Display Findings Summary
