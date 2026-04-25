@@ -191,12 +191,14 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
 
 - **Mission:** Fetch and parse external signals — blog posts, EIPs, release notes
 - **Inputs:** `announcement_url`
-- **Tools:** WebFetch, WebSearch
-- **Outputs:** `claims.json` — structured list of claims extracted from the source
+- **Tools:** WebFetch, WebSearch, AskUserQuestion
+- **Outputs:** `claims.json` — structured list of claims extracted from the source; `source-snapshot.md` — reproducible snapshot of raw fetched content
 - **Behavior:**
-  - Fetch the announcement URL, extract full text content
+  - Fetch source using 3-tier fallback chain: WebFetch → WebSearch → AskUserQuestion (D10)
+  - Save raw fetched content as `source-snapshot.md` with YAML frontmatter before processing (D13)
   - Identify and extract discrete claims: "Feature X was added", "Removed dependency on Y", "Changed architecture of Z"
-  - For each claim: extract a short title, full description, and any referenced code artifacts (PRs, commits, files)
+  - For each claim: extract id, text, source_section, category, confidence, and any referenced code artifacts (PRs, commits, files)
+  - If claims exceed 15, re-extract in chunks of 5-8 claims per section and deduplicate (D1)
   - If the source references additional URLs (linked blog posts, specs), fetch those too
   - Output structured JSON, NOT prose
 
@@ -309,7 +311,7 @@ If validation fails at any phase boundary:
 {
   "schema_version": 1,
   "source_url": "https://blog.example.com/upgrade-announcement",
-  "source_snapshot_path": "sources/announcement-2026-04-25.md",
+  "source_snapshot_path": "source-snapshot.md",
   "fetched_at": "2026-04-25T11:00:00Z",
   "claims": [
     {
@@ -668,6 +670,8 @@ Use WebSearch with:
 
 From the search results, fetch the most relevant result(s) using WebFetch. Combine content if multiple sources provide complementary information.
 
+**Success criteria:** At least one search result is found AND the content fetched from the top result(s) meets the same 200-character meaningful content threshold as Tier 1. **Failure criteria:** No results returned from either search query, OR all fetched results contain only error messages, login prompts, or content shorter than 200 characters.
+
 If WebSearch yields usable content → set `fetch_method = "websearch"` → proceed to Step 1.2.
 
 **Tier 3: User paste (last resort)**
@@ -685,6 +689,7 @@ Use AskUserQuestion:
 ```
 
 If user provides content → set `fetch_method = "user_paste"` → proceed to Step 1.2.
+If user chooses "Try a different URL" → restart from Tier 1 with the new URL. **Limit: 3 alternate URL attempts.** After the third failure, only offer "I'll paste the content" and "Skip Phase 1".
 If user chooses "Skip Phase 1" → abort with message: "Phase 1 skipped. Pipeline cannot continue without source content."
 
 ### Step 1.2 — Source Snapshot (D13)
@@ -770,7 +775,9 @@ Assemble the final `claims.json` artifact following the schema from [Artifact Sc
 
 ### Step 1.6 — Self-Validation Gate
 
-Before presenting to the user, validate claims.json against the schema:
+Before presenting to the user, validate claims.json against the schema. **Note:** This is a pre-output self-validation, not a phase-boundary gate. Unlike the inter-phase validation rules in [Artifact Schemas > Validation Gate](#validation-gate--general-rules) (which abort immediately), Phase 1 self-validation allows one auto-fix attempt because the artifact hasn't been committed yet — the user hasn't seen it, and no downstream phase depends on it at this point.
+
+Validation checks:
 
 1. `schema_version` equals `1`
 2. `source_url` is a non-empty string
