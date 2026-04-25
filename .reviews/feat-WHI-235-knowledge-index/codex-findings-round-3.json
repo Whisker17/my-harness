@@ -1,0 +1,18 @@
+{
+  "verdict": "needs-attention",
+  "summary": "Phase 7 can falsely claim the knowledge index was updated after a failed append, which defeats the persistence guarantee and makes later cross-reference behavior silently incomplete.",
+  "findings": [
+    {
+      "severity": "HIGH",
+      "title": "Append failure can be reported as a successful index write",
+      "description": "The append-failure path only prints an error and then continues into the tail-based verification. If the user chose 'Keep both' for an existing duplicate, or if the last existing record already has the same dedup_key, a failed append can still pass the LAST_DEDUP_KEY check and allow Step 7.6 to report success even though the new entry was never persisted. The verification also checks only dedup_key, not the new entry id or full serialized record, so it cannot distinguish the intended write from an older same-key line.",
+      "file": "skills/harness-research-engineering/SKILL.md",
+      "line_start": 2743,
+      "line_end": 2757,
+      "recommendation": "Make append failure terminal (exit 1/return nonzero) before any read-back check, gate Step 7.6 on an explicit success flag, and verify the last line matches the new entry's unique id or full JSON hash in addition to dedup_key."
+    }
+  ],
+  "next_steps": [
+    "Make append failure terminal and verify new entry's unique id in the read-back check."
+  ]
+}

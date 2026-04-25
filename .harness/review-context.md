@@ -1,84 +1,80 @@
-# Review Context — WHI-234: Phase 6：验证代理（Agent subagent + 有界 prompt + fix-verify 循环）
+# Review Context — WHI-235: Phase 7 Knowledge Index Management
 
 ## Implementation Summary
 
-Added Phase 6 (Verification Agent) to the `harness-research-engineering` skill's multi-phase analysis pipeline. Phase 6 dispatches an independent Agent subagent as a Devil's Advocate reviewer to verify the top 10 claims from Phase 3's analysis. When disputes are found, a fix-verify loop (max 3 rounds) attempts resolution. The Phase 5 report generation was updated to consume verification data when available.
+Added the complete Phase 7 (Knowledge Index Management) section to `harness-research-engineering/SKILL.md`. Phase 7 persists analysis results to `~/.gstack/research/research-index.jsonl` as append-only JSONL entries with public/internal field separation. Implementation includes dedup check with composite key, malformed JSON resilience, atomic overwrite operations, and comprehensive error handling.
 
-Key design decisions:
-- Phase 6 is opt-in via the Phase 3 checkpoint ("Run verification first" option)
-- Document ordering: Phase 6 precedes Phase 5 (matches data flow dependency)
-- Verification subagent receives bounded ~8KB prompt, does NOT access the codebase
-- Fix-verify loop dispatches Phase 3 recheck subagent WITH codebase access, then a new verification subagent
-- Summary counts reflect initial reviewer assessments, not post-round resolution
+Key decisions:
+- Dedup key uses all-lowercase fields for case-insensitive matching (addresses D4)
+- Repo URL normalization is explicit with 5-step rules (strip protocol, hostname, .git, trailing slash)
+- Overwrite operation is atomic: filter + append + mv in single pass with cleanup trap
+- Write verification failure blocks the success checkpoint (no false success)
+- Claims summary field names are explicitly cross-referenced with analysis.json schema
 
 ## Files Changed
 
-- `skills/harness-research-engineering/SKILL.md` — the only file changed (+782/-758 net lines in round 1, +6/-6 in round 2)
-  - Added `verification_agent` role definition with D2 design decision
-  - Added `verification-report.json` schema with example and field reference
-  - Added Phase 6 section (Steps 6.0-6.7): validation gate, claim selection, subagent dispatch, dispute detection, fix-verify loop, artifact assembly, user checkpoint
-  - Updated Phase 5 to consume verification data: degradation table, data extraction, claim join logic, report template (Independent Verification section), validation checks
-  - Updated Phase 3 checkpoint with Phase 6 invocation option
-  - Updated TOC and document ordering (Phase 6 before Phase 5)
-  - Updated error handling table with Phase 6 failure scenarios
-  - Updated agent role and consumed-by metadata
+- `skills/harness-research-engineering/SKILL.md` — Added Phase 7 section (Steps 7.0-7.6), knowledge_index_agent role, research-index.jsonl schema, updated ToC, validation summary table, D9 error handling table, and Failure/Abort section
 
 ## Adversarial Review Findings
 
-### Round 1 — Addressed (Critical/High)
+### Addressed (Critical/High)
 
-| # | Severity | Finding | Fix Applied |
-|---|----------|---------|-------------|
-| 1 | CRITICAL | Phase 6 never triggered — no invocation point | Added "Run verification first (Phase 6 — M2)" option to Phase 3 checkpoint |
-| 2 | CRITICAL | TOC/document ordering inversion | Reordered Phase 6 before Phase 5 in TOC and document body |
-| 3 | CRITICAL | ROUND counter off-by-one (total_rounds=4 fails validation) | Moved increment after cap check (`IF ROUND >= MAX_ROUNDS` before `ROUND += 1`) |
-| 4 | HIGH | M2 label collision (Phase 4 vs Phase 6) | Disambiguated: comparison.json note says "when Phase 4 is implemented", Phase 6 labeled "M2 (verification)" |
-| 5 | HIGH | summary.confirmed description contradicts validation math | Fixed to "Count of claims where reviewer_assessment == 'confirmed' (initial assessment)" |
-| 6 | HIGH | Re-verify payload under-specified | Added recheck_context field to re-verify payload from Phase 3's recheck_notes |
-| 7 | HIGH | Per-claim verification note format undefined | Added Verification field to Claims Analysis per-claim template |
-| 8 | HIGH | Phase 3 recheck missing file-system paths | Added Context block with session_dir, clone_path, BASE_SHA, HEAD_SHA to recheck prompt |
-
-### Round 1 — Also Addressed (Medium, fixed opportunistically)
-
-| # | Finding | Fix Applied |
-|---|---------|-------------|
-| 9 | analysis.json/claims.json "Consumed by" missing Phase 6 | Updated both headers |
-| 10 | Phase 5 abort condition says "three artifacts" | Changed to "three required artifacts" |
-| 11 | D2 design decision referenced but never defined | Defined D2 in verification_agent role |
-| 12 | Duplicate error handling paragraph | Removed duplicate |
-| 13 | Clone cleanup comment says "Phase 5 in M1" | Updated for M2 lifetime |
-| 14 | report_generation_agent role missing Independent Verification | Added to section list |
-| 15 | Validation check #2 says "five" but lists six | Fixed to "5 or 6 depending on Phase 6" |
-| 16 | summary.confirmed computation formula absent from Step 6.4 | Added explicit formula |
-| 17-18 | "All claims verified" inconsistency | Standardized to "All reviewed claims verified" |
-
-### Round 2 — Addressed (High)
-
-| # | Severity | Finding | Fix Applied |
-|---|----------|---------|-------------|
-| 1 | HIGH | Example JSON: verification_status "verified" with disputes_unresolved=1 | Fixed summary to 0 unresolved disputes, consistent with "verified" status |
-| 2 | HIGH | Example JSON: summary counts (10) don't match reviews array (2) | Fixed summary to match reviews array (1+1+0+0=2), added clarifying note |
+| ID | Severity | Description | Fix |
+|----|----------|-------------|-----|
+| C1 | CRITICAL | Non-atomic overwrite creates corruption window | Made overwrite atomic: filter + append in temp file, then single mv |
+| C2 | CRITICAL | mktemp temp file leaks on failure | Added trap for cleanup, temp file in same directory as index |
+| H1 | HIGH | Dedup key case-sensitive on upgrade_name | Lowercase all components in dedup_key |
+| H2 | HIGH | No repo URL normalization algorithm | Added explicit 5-step normalization rules with examples |
+| H3 | HIGH | Write verification non-fatal, shows success after corruption | Verification failure now blocks Step 7.6 success banner |
+| H4 | HIGH | claims_summary field name mismatch not cross-validated | Added explicit mapping table and missing-field warnings |
+| H5 | HIGH | full_claims join key unspecified | Specified join on claim.id == claims_analyzed[].claim_id |
+| H6 | HIGH | trap cleared before confirming mv success | Added mv failure guard with abort and recovery info |
 
 ### Remaining (Medium/Low — not auto-fixed)
 
-| # | Severity | Description | Recommendation |
-|---|----------|-------------|----------------|
-| R2-3 | MEDIUM | clone_path/BASE_SHA/HEAD_SHA used in recheck prompt but not extracted in Step 6.0 | Step 6.0 extracts from analysis.json; diff-map.json vars need explicit extraction. Recommend adding CLONE_PATH extraction from diff-map.json in Step 6.0. |
-| R2-4 | MEDIUM | reviewer_assessment_emoji placeholder used but never formally defined | Should define emoji mapping (✅ confirmed, ⚠️ partial, ❌ unconfirmed, 🔴 contradicted). Low impact — LLM will infer from context. |
-| R2-5 | LOW | reviewer_concerns from re-verify rounds silently dropped | Loop accumulates reviews but doesn't merge concerns from subsequent rounds. Recommend appending re-verify concerns to reviewer_concerns array. |
-| R1-19 | LOW | verification_status field name collision between schemas | Low impact — context makes clear which is per-claim vs aggregate. |
+| ID | Severity | Description | Recommendation |
+|----|----------|-------------|----------------|
+| M1 | MEDIUM | Phase numbering gap in ToC (1,2,3,5,7) | Cosmetic — matches the actual phase numbers used in the project |
+| M2 | MEDIUM | Session dir recovery glob injection | Mitigated by Phase 1 slugification which strips special chars |
+| M3 | MEDIUM | Executive summary truncation at non-sentence boundary | Consider adding sentence-boundary detection in future |
+| M4 | MEDIUM | contradicted field forward-compatibility hazard | Document in schema when Phase 6 verification is implemented |
+| M5 | MEDIUM | Informational checkpoint can't rollback | By design — append-only. Dedup handles re-runs. |
+| M6 | MEDIUM | ARTIFACTS_STATUS variable defined but unused | Remove or reference in Step 7.2; low impact |
+| M7 | MEDIUM | executive_summary truncation byte-unsafe for UTF-8 | Specify "500 Unicode characters" in future |
+| M8 | MEDIUM | evidence_map_path base not guaranteed consistent | RESEARCH_DIR is hardcoded; document if made configurable |
+| L1 | LOW | schema_version has no migration path | Document when schema v2 is needed |
+| L2 | LOW | Total entry count includes malformed lines | Fixed — now counts parseable entries only |
+| L3 | LOW | generated_at semantics inconsistent | The "current time at Phase 7" interpretation is simpler and documented |
+| L4 | LOW | Overwrite bash snippet used placeholder notation | Fixed — uses bash variables |
+| L5 | LOW | total_claims may under-count if Phase 3 truncated | Pre-existing limitation from Phase 3 spec |
+| L6 | LOW | Step 7.6 had no explicit skip guard | Fixed — added explicit guard |
 
 ## PR
 
-https://github.com/Whisker17/my-harness/pull/24
+https://github.com/Whisker17/my-harness/pull/25
+
+## V2 Convergence Review (Codex↔Opus)
+
+**Rounds:** 3 | **Final verdict:** ✅ PASS — converged
+
+| ID | Sev | Finding | Status | Round |
+|----|-----|---------|--------|-------|
+| F-001 | HIGH | Setup silently weakens Codex plugin invocation guard (setup.sh — not in PR diff) | Rebutted | R1 |
+| F-002 | HIGH | Append verification reports false success after failed write | Confirmed fixed | R2→R3 |
+| F-003 | MEDIUM | Overwrite recovery temp file deleted by trap on mv failure | Confirmed fixed | R2 |
+
+Fix commits: `86ffab7`, `0afa7b7`
+
+Full report: `.reviews/feat-WHI-235-knowledge-index/convergence-report.md`
 
 ## Acceptance Criteria Status
 
-- ✅ 使用 Agent tool 启动独立子代理，prompt 限制在 ~8KB — Step 6.2 dispatches via Agent tool with bounded prompt (~8KB budget documented)
-- ✅ 子代理只接收 top 10 claims（按 significance 排序）— Step 6.1 implements significance-based selection with priority mapping table
-- ✅ 子代理独立判定每个 claim 的 evidence 是否充分，输出 verification-report.md — Step 6.5 generates verification-report.md
-- ✅ verification-report.md 包含：逐条 claim 的独立判定 + "Reviewer Concerns" section — Template includes both (Step 6.5)
-- ✅ 如果子代理发现分歧（status 与 Phase 3 不同），标记为 dispute — Step 6.3 implements dispute detection with full status mapping table
-- ✅ dispute 触发修正循环：Phase 3 重新检查 → 子代理 re-verify → 最多 3 轮 — Fix-verify loop with MAX_ROUNDS=3, ROUND incremented after cap check
-- ✅ 3 轮后仍有分歧，保留双方意见，标记 verification_status: "partial" — Loop cap behavior documented in Step 6.3
-- ✅ 无 dispute 时标记 verification_status: "verified" — Determination logic in Step 6.4
+- [x] 索引文件位于 `~/.gstack/research/research-index.jsonl` — Step 7.1 defines this path
+- [x] 每次分析完成后 append 一条 JSONL 记录 — Step 7.5 appends single-line JSON
+- [x] dedup 检查：写入前查找 chain+upgrade_name+repo — Step 7.4 with composite key
+- [x] 发现重复时提供三选一：overwrite/keep-both/skip — Step 7.4 AskUserQuestion
+- [x] 索引条目包含 public 字段集和 internal 字段集 — Schema + Step 7.3
+- [x] public 字段：chain, upgrade_name, source_url, executive_summary, claims_summary, generated_at — Schema field reference table
+- [x] internal 字段：repo, base_sha, head_sha, base_ref, head_ref, full_claims, evidence_map_path, verification_status, unclaimed_changes_count — Schema field reference table
+- [x] 读取时能处理 malformed JSON 行（跳过 + 警告） — Step 7.4 malformed JSON handling
+- [x] 目录不存在时自动创建 `~/.gstack/research/` — Step 7.1 mkdir -p

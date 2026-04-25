@@ -1,0 +1,24 @@
+[codex] Starting Codex task thread.
+[codex] Thread ready (019dc4a5-3428-72c1-837c-6d9f41b8cf64).
+[codex] Turn started (019dc4a5-34f0-7063-9af2-070af7292692).
+[codex] Assistant message captured: {"findings":[],"next_steps":[],"summary":"dummy","verdict":"approve"}
+[codex] Assistant message captured: {"findings":[],"next_steps":[],"summary":"noop","verdict":"approve"}
+[codex] Assistant message captured: {"findings":[],"next_steps":[],"summary":"I'll inspect the exact line numbers for the risky s...
+[codex] Running command: bash -lc "nl -ba setup.sh | sed -n '230,285p'"
+[codex] Command completed: bash -lc "nl -ba setup.sh | sed -n '230,285p'" (exit 0)
+[codex] Assistant message captured: {"findings":[{"body":"`setup.sh` now mutates the installed `codex-plugin-cc` command file und...
+[codex] Turn completion inferred after the main thread finished and subagent work drained.
+# Codex Adversarial Review
+
+Target: branch diff against main
+Verdict: needs-attention
+
+No-ship: setup performs a persistent, silent trust-boundary change in a third-party plugin cache to enable model invocation.
+
+Findings:
+- [high] Setup silently weakens Codex plugin invocation guard (setup.sh:258-265)
+  `setup.sh` now mutates the installed `codex-plugin-cc` command file under `~/.claude/plugins/cache` by flipping `disable-model-invocation` to `false` during a general setup run. That flag is a trust-boundary guard on model-triggered plugin invocation; changing third-party plugin metadata in-place broadens what can invoke `codex:adversarial-review` without any user confirmation, provenance check, backup, or rollback. The likely impact is a persistent local security-policy change outside this repository, affecting future Claude Code sessions and surviving until the plugin cache is reinstalled or manually repaired. Do not silently patch plugin cache files from setup; require an explicit opt-in command/flag, verify the exact plugin/version/content hash, create a backup, and document how to restore the original setting.
+  Recommendation: Remove the automatic `sed` mutation from `setup.sh`; if v2 truly requires this policy change, gate it behind explicit user consent with backup/restore and exact plugin file verification.
+
+Next steps:
+- Make v2 setup report the blocked plugin setting as an actionable warning instead of mutating plugin cache state automatically.

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "round": 3,
+  "status": "PASS",
+  "verdict": "approve",
+  "summary": "All findings resolved. F-001 rebutted (out-of-scope). F-002 resolved across rounds 2-3 (append failure now terminal, verification checks dedup_key+generated_at, WRITE_OK flag gates success). F-003 resolved in round 2 (trap disabled before exit in mv failure handler).",
+  "findings": [
+    {
+      "id": "F-001",
+      "severity": "HIGH",
+      "claim_title": "Setup silently weakens Codex plugin invocation guard",
+      "claim": "Setup silently weakens Codex plugin invocation guard: `setup.sh` now mutates the installed `codex-plugin-cc` command file under `~/.claude/plugins/cache` by flipping `disable-model-invocation` to `false` during a general setup run.",
+      "file": "setup.sh",
+      "line_start": 258,
+      "line_end": 265,
+      "suggested_fix": "Remove the automatic `sed` mutation from `setup.sh`; if v2 truly requires this policy change, gate it behind explicit user consent with backup/restore and exact plugin file verification.",
+      "status": "rebutted",
+      "resolution": "REBUT: setup.sh is not modified in this PR. Codex reviewed diff against main instead of dev in round 1. Not re-raised in rounds 2-3 (which used correct --base dev).",
+      "round_opened": 1,
+      "round_closed": 1
+    },
+    {
+      "id": "F-002",
+      "severity": "HIGH",
+      "claim_title": "Append verification can report success after a failed write",
+      "claim": "Append verification can report success after a failed write: The append path did not check exit status and the read-back only checked schema_version, allowing false-success. Re-raised in round 3: failure path fell through and dedup_key check could false-pass against older same-key entries.",
+      "file": "skills/harness-research-engineering/SKILL.md",
+      "line_start": 2729,
+      "line_end": 2757,
+      "suggested_fix": "Make append failure terminal, gate Step 7.6 on explicit success flag, verify last line matches new entry's dedup_key AND generated_at.",
+      "status": "confirmed_fixed",
+      "resolution": "RESOLVE: Round 2 added exit-status check and dedup_key verification. Round 3 made failure path terminal (return 1), added generated_at to verification, added WRITE_OK flag as defense-in-depth gate. Commits 86ffab7, 0afa7b7.",
+      "round_opened": 2,
+      "round_closed": 3
+    },
+    {
+      "id": "F-003",
+      "severity": "MEDIUM",
+      "claim_title": "Overwrite recovery file is deleted on mv failure",
+      "claim": "Overwrite recovery file is deleted on mv failure: The cleanup trap was still active when mv fails and exit 1 runs, deleting the temp file that was supposed to be preserved for recovery.",
+      "file": "skills/harness-research-engineering/SKILL.md",
+      "line_start": 2692,
+      "line_end": 2713,
+      "suggested_fix": "Disable cleanup trap before exit in mv failure handler.",
+      "status": "confirmed_fixed",
+      "resolution": "RESOLVE: mv failure handler now runs 'trap - EXIT' before exit 1. Not re-raised in round 3. Commit 86ffab7.",
+      "round_opened": 2,
+      "round_closed": 2
+    }
+  ]
+}

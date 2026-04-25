@@ -1,0 +1,28 @@
+{
+  "verdict": "needs-attention",
+  "summary": "Phase 7 can falsely report successful persistence and its advertised overwrite recovery path deletes the recovery artifact.",
+  "findings": [
+    {
+      "severity": "HIGH",
+      "title": "Append verification can report success after a failed write",
+      "description": "The append path never checks whether the append command actually succeeded, and the read-back only proves that the current last line has a `schema_version`. If `echo ... >> \"$INDEX_FILE\"` fails on an existing index because of quota, permissions changes, NFS/transient I/O, or shell redirection failure, `tail -1` can still read the previous valid entry and the flow will print success even though the new entry was never persisted. That creates a false-success checkpoint for the storage layer and makes reruns/recovery unreliable because the user believes the analysis is indexed when it is not.",
+      "file": "skills/harness-research-engineering/SKILL.md",
+      "line_start": 2729,
+      "line_end": 2745,
+      "recommendation": "Check the append command exit status before validation, then validate that the last parsed line matches the new entry's exact `id` and `dedup_key` rather than only checking `.schema_version`; preferably write via temp file plus atomic rename or use `flock` around dedup+append."
+    },
+    {
+      "severity": "MEDIUM",
+      "title": "Overwrite recovery file is deleted on mv failure",
+      "description": "The overwrite failure branch promises that the temp file is preserved for manual recovery, but the cleanup trap is still active when `mv` fails and `exit 1` runs. In that failure path the trap removes `$TEMP_FILE`, so the new combined index that was supposed to be recoverable is deleted. This turns a partial-failure recovery path into a dead end and gives the operator incorrect recovery instructions at exactly the point where the index update failed.",
+      "file": "skills/harness-research-engineering/SKILL.md",
+      "line_start": 2692,
+      "line_end": 2713,
+      "recommendation": "Disable or adjust the cleanup trap before the `mv` failure handler if the temp file should be preserved, e.g. `mv ... || { trap - EXIT; echo ...; exit 1; }`, or change the message and recovery procedure to reflect that the temp file is intentionally removed."
+    }
+  ],
+  "next_steps": [
+    "Fix the write verification to prove the new entry persisted, not just that the file remains parseable.",
+    "Correct the overwrite failure trap/message so manual recovery is possible and truthful."
+  ]
+}
