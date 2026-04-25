@@ -1,64 +1,49 @@
-# Review Context — WHI-230: Phase 2 Codebase Navigation
+# Review Context — WHI-231: Phase 3 — 实现分析代理（分块处理 + code-first delta + 证据映射）
 
 ## Implementation Summary
 
-Implemented the full Phase 2 (Codebase Navigation) section in SKILL.md, replacing the placeholder with detailed step-by-step instructions for:
-- Treeless clone with timeout, known-large-repo depth limiting, and shallow clone fallback
-- Fuzzy tag matching using Levenshtein distance with confidence-based thresholds
-- SHA resolution with chronological order validation and shallow-clone deepening
-- Diff-map generation with file categorization and hunk counting
-- Self-validation gate against WHI-228 schema
-- User checkpoint with summary display
+Replaced the Phase 3 placeholder in `skills/harness-research-engineering/SKILL.md` with a full 8-step implementation that processes claims in batches, maps evidence to code diffs, runs an independent code-first delta pass for unreported changes, validates the output against the WHI-228 schema, and presents results via a user checkpoint.
 
-Also updated the Artifact Schemas section to add `num_hunks` and `summary.renamed` fields to the diff-map.json schema, and fixed the cleanup trap in the Failure and Abort section.
+Key design decisions:
+- Used `verified`/`partially_verified`/`unverified` status values (aligning with WHI-228 schema) instead of the issue's `confirmed`/`partial`/`unconfirmed`/`contradicted` — the schema is the canonical source.
+- Output file is `analysis.json` (per schema), not `evidence-map.json` (per issue description) — same artifact, different naming in different contexts.
+- Batch completeness check with recovery mechanism added after adversarial review identified silent claim drops as a risk.
 
 ## Files Changed
 
-- `skills/harness-research-engineering/SKILL.md` — replaced Phase 2 placeholder (~15 lines) with full implementation (~480 lines); updated artifact schema, validation rules, Table of Contents, and cleanup trap
+- `skills/harness-research-engineering/SKILL.md` — Replaced Phase 3 placeholder (12 lines) with full implementation (488 lines). Updated Agent Role definition for `implementation_analysis_agent`. Updated Table of Contents. Also updated the Artifact Schemas section to add `partially_verified` to summary and `manual_override` optional field.
 
 ## Adversarial Review Findings
 
 ### Addressed (Critical/High)
 
-**Round 1:**
-- CRITICAL: `REPO_URL` never assigned in bash code → added explicit assignment at top of Step 2.1
-- CRITICAL: `--no-checkout` without `git checkout` → added `git checkout HEAD` after treeless clone
-- CRITICAL: `TAG_COUNT=0` check broken (`echo "" | wc -l` = 1) → switched to `grep -c .`
-- CRITICAL: `summary.renamed` missing from schema → added to schema, JSON examples, field reference, and validation
-- HIGH: No URL integrity check on reused clone → added `remote get-url` comparison with mismatch handling
-- HIGH: `/tmp/` paths for diff output → changed to write to `$SESSION_DIR`
-- HIGH: `git rev-parse` fails on shallow clones → added `git fetch --depth=500` fallback
-- HIGH: `FILTERED_TAGS` string concatenation corruption → rewrote with proper newline handling
-- HIGH: AC-6 hunks not implemented → added `num_hunks` field to schema, extraction logic with per-file and batch counting
-- HIGH: Local path never sets `REPO_URL` → documented in Step 2.0
-- HIGH: Cleanup trap uses unslugified variables → trap now references `$CLONE_DIR` directly
+1. **🔴 Critical: `summary` missing `partially_verified` counter** — Added `partially_verified` to schema JSON example, field reference table, Step 3.4 template, Phase boundary validation, and fixed Step 3.6 rule 14 to explicitly sum all three statuses.
 
-**Round 2:**
-- CRITICAL: Reused clone falls through to re-clone → added `clone_method` skip guard
-- CRITICAL: Batch awk hunk counter always outputs 0 → fixed count/reset ordering
-- HIGH: SHA deepen fallback only covers BASE_REF → added HEAD_REF deepen
-- HIGH: Large-repo clone missing `git checkout HEAD` → added checkout step
+2. **🟡 Major: Batching merge rule ambiguity** — Rewrote rule 4 to be deterministic: never create batches >8, allow small batches when no valid merge target exists.
+
+3. **🟡 Major: Gate 2 denominator unspecified** — Made the denominator explicit: `unverified / total_claims > 0.50` in both Step 3.5 and Step 3.7.
+
+4. **🟢 Minor: `unreported_changes[].status` enum not validated** — Added `status` enum check to Step 3.6.
+
+5. **🟢 Minor: Batch completeness check missing** — Added post-merge completeness check with recovery batch and fallback to `unverified`.
+
+6. **🟢 Minor: `manual_override` field undocumented** — Added to schema field reference table as optional boolean.
 
 ### Remaining (Medium/Low — not auto-fixed)
 
-- MEDIUM (NEW-6): `other` category is unreachable but appears in validation/display — cosmetic, no data integrity impact. Suggestion: either add a path pattern for `other` or remove from categorization enum.
-- MEDIUM: `new_module` detection for root-level files always returns non-empty from `git ls-tree` — minor categorization quirk for files in repo root.
-- MEDIUM: D13 label reused for two different concepts (source snapshot vs SHA resolution) — documentation clarity issue.
-- LOW (NEW-7): Shallow-clone fallback missing `cd $CLONE_DIR` — Step 2.2 re-cd's immediately, so no functional impact.
-- LOW: Substring containment boost can produce scores near 1.0 for short inputs — rare edge case.
-- LOW: Phase 2 checkpoint uses different emoji vs Phase 1 — cosmetic only.
+None — all findings were addressed.
 
 ## PR
 
-https://github.com/Whisker17/my-harness/pull/21
+https://github.com/Whisker17/my-harness/pull/22
 
 ## Acceptance Criteria Status
 
-- ✅ AC-1: Treeless clone (`--filter=blob:none --no-checkout`) — Step 2.1
-- ✅ AC-2: Clone timeout (5 min) + cleanup — Step 2.1 with `timeout 300`
-- ✅ AC-3: Fuzzy tag matching with similarity scoring — Step 2.2
-- ✅ AC-4: Confidence thresholds (≥0.8 auto, ≥0.5/<0.8 candidates, <0.5 full list) — Step 2.2c
-- ✅ AC-5: `base_sha`/`head_sha` via `git rev-parse` in diff-map.json — Step 2.3
-- ✅ AC-6: diff-map.json with additions/deletions/hunks per file — Step 2.4b with `num_hunks`
-- ✅ AC-7: diff-map.json matches WHI-228 schema — Step 2.6 self-validation + schema updates
-- ✅ AC-8: Local repo path skips clone — Step 2.0 with `clone_method = "local"`
+- [x] 将 claims 按 5-8 个一批分组处理 — Step 3.1 with category-based batching
+- [x] 每批处理：读取相关 diff hunks → 匹配 claim → 记录 evidence — Step 3.2 with Agent prompt
+- [x] 每个 claim 产出 evidence 状态 — `verified`/`partially_verified`/`unverified` (aligned with WHI-228 schema)
+- [x] code-first delta pass — Step 3.3 with independent Agent prompt
+- [x] delta 发现输出为 `unclaimed_changes` 数组 — `unreported_changes` array in analysis.json (per schema naming)
+- [x] 输出符合 WHI-228 schema — Step 3.4 + Step 3.6 self-validation
+- [x] 机器门控：confirmed + partial 比例 < 30% 时发出警告 — Step 3.5 Gate 1
+- [x] 处理过程中每批完成后输出进度 — Step 3.2 progress output format
