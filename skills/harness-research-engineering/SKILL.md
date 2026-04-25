@@ -37,7 +37,7 @@ You are a protocol analysis engine for blockchain engineering research. The user
 4. [Agent Roles](#agent-roles) — role definitions for pipeline agents
 5. [Artifact Schemas](#artifact-schemas) — JSON schemas for intermediate artifacts and validation gates
 6. [Phase 1: Source Ingestion](#phase-1-source-ingestion) — fallback chain fetch, claims extraction, source snapshot, user checkpoint
-7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — clone, map, diff
+7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — treeless clone, fuzzy tag matching, SHA resolution, diff-map generation
 8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — trace claims to code
 9. [Phase 5: Report Generation](#phase-5-report-generation) — produce internal + public reports
 10. [Failure and Abort](#failure-and-abort) — error handling and cleanup
@@ -875,21 +875,433 @@ If the user provides corrections or additions, update claims.json, re-run valida
 
 ## Phase 2: Codebase Navigation
 
-> **Implemented by:** WHI-230 (not yet implemented — this is a placeholder)
+> **Implemented by:** WHI-230
 
-Dispatch `codebase_navigation_agent`. See [Agent Roles > codebase_navigation_agent](#2-codebase_navigation_agent-phase-2) for behavior.
+Phase 2 clones the target repository, identifies the git refs that bracket the upgrade, and produces a structured diff map of every file that changed. This bridges "what the announcement claimed" to "what the code actually changed."
 
-**Repo clone location:**
+**Agent role:** `codebase_navigation_agent` (see [Agent Roles](#2-codebase_navigation_agent-phase-2))
+
+### Step 2.0 — Input Validation
+
+Before cloning, validate that the required inputs are available:
+
+| Input | Source | Required |
+|-------|--------|----------|
+| `repo` | Input Resolution (user-provided or Linear lookup) | ✅ |
+| `base_ref` | User-provided OR auto-detected via fuzzy tag matching | ❌ (auto-detect) |
+| `head_ref` | User-provided OR auto-detected via fuzzy tag matching | ❌ (auto-detect) |
+| `session_dir` | Created in Phase 1, Step 1.0 | ✅ |
+
+If `repo` is missing, use AskUserQuestion:
+
 ```
-~/.gstack/tmp/research-<chain>-<upgrade>/
+Use AskUserQuestion:
+  question: "What's the git repository URL to analyze?"
+  options:
+    - "Enter URL" (user provides a git-cloneable URL)
+    - "Use local path" (user provides a local path to an existing repo)
+    - "Abort pipeline"
 ```
 
-**Cleanup:** Clone is kept alive until the pipeline completes (Phase 5 in M1). Cleaned up via bash trap on exit. Stale directories (>24h) are cleaned by the preamble on next invocation.
+If user provides a local path → skip to Step 2.2 (set `CLONE_DIR` to the local path, `clone_method = "local"`).
+
+### Step 2.1 — Repository Clone (D6: Treeless Clone)
+
+Clone the target repository using a treeless clone to avoid downloading full blob history.
+
+**Clone directory:**
+```bash
+CHAIN_SLUG=$(echo "<chain>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
+UPGRADE_SLUG=$(echo "<upgrade>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
+CLONE_DIR="$HOME/.gstack/tmp/research-${CHAIN_SLUG}-${UPGRADE_SLUG}"
+```
+
+If `CLONE_DIR` already exists from a previous run, reuse it:
+```bash
+if [ -d "$CLONE_DIR/.git" ]; then
+  echo "Reusing existing clone at $CLONE_DIR"
+  git -C "$CLONE_DIR" fetch --tags --force
+  clone_method="reused"
+else
+  # Fresh clone below
+fi
+```
+
+**Primary clone strategy: treeless clone**
+
+```bash
+timeout 300 git clone --filter=blob:none --no-checkout "$REPO_URL" "$CLONE_DIR" 2>&1
+```
+
+The 300-second (5 minute) timeout prevents hanging on very large repositories. If the clone succeeds:
+
+```bash
+cd "$CLONE_DIR"
+git sparse-checkout set --no-cone '/*'
+clone_method="treeless"
+```
+
+**Known large repositories** — for these repos, add depth limiting to the treeless clone:
+
+| Repository pattern | Extra flags |
+|-------------------|-------------|
+| `*op-geth*`, `*go-ethereum*` | `--depth=1000` |
+| `*optimism*` (monorepo) | `--depth=1000` |
+| `*reth*` | `--depth=1000` |
+| `*prysm*`, `*lighthouse*` | `--depth=1000` |
+
+Detection: match the repo URL against these patterns before cloning. If matched:
+```bash
+timeout 300 git clone --filter=blob:none --no-checkout --depth=1000 "$REPO_URL" "$CLONE_DIR" 2>&1
+```
+
+**Fallback: shallow clone**
+
+If the treeless clone fails (exit code ≠ 0, timeout, or the remote doesn't support partial clone):
+
+```bash
+# Clean up failed attempt
+rm -rf "$CLONE_DIR"
+
+# Fallback to shallow clone
+timeout 300 git clone --depth=100 "$REPO_URL" "$CLONE_DIR" 2>&1
+clone_method="shallow"
+```
+
+**If both strategies fail:** abort Phase 2 with:
+```
+❌ Phase 2 aborted: Could not clone repository.
+   URL: <repo_url>
+   Treeless clone: <error>
+   Shallow clone: <error>
+   
+   Check: Is the URL correct? Is the repo public? Is git configured for this host?
+```
+
+**Cleanup on failure:** If `CLONE_DIR` was partially created, remove it:
+```bash
+[ -d "$CLONE_DIR" ] && rm -rf "$CLONE_DIR"
+```
+
+### Step 2.2 — Tag Listing and Fuzzy Matching (D3)
+
+If `base_ref` and `head_ref` are already provided by the user, skip to Step 2.3 (SHA Resolution).
+
+Otherwise, auto-detect the relevant tags using fuzzy matching.
+
+**Step 2.2a — List all tags**
+
+```bash
+cd "$CLONE_DIR"
+ALL_TAGS=$(git tag -l | sort -V)
+TAG_COUNT=$(echo "$ALL_TAGS" | wc -l | tr -d ' ')
+echo "Found $TAG_COUNT tags"
+```
+
+If `TAG_COUNT` is 0:
+```
+Use AskUserQuestion:
+  question: "No tags found in the repository. Please provide the base and head git refs manually (branch names, commit SHAs, or any valid git ref)."
+  options:
+    - "Enter refs" (user provides base_ref and head_ref)
+    - "Abort pipeline"
+```
+
+**Step 2.2b — Fuzzy match algorithm**
+
+For each user-provided version hint (the `<upgrade>` name, or explicit version strings), compute a similarity score against every tag.
+
+**Levenshtein distance normalization:**
+
+```
+similarity(a, b) = 1 - (levenshtein_distance(a, b) / max(len(a), len(b)))
+```
+
+**Pre-processing before comparison — strip common prefixes:**
+
+For each tag AND for the user input, apply these transformations before computing similarity:
+1. Remove leading `v` (e.g., `v1.0.0` → `1.0.0`)
+2. Remove leading `release-` or `release/` (e.g., `release-1.0` → `1.0`)
+3. Remove leading `tag/` (e.g., `tag/v1.0.0` → `v1.0.0` → `1.0.0`)
+4. Remove leading `<project-name>/` (e.g., `op-node/v1.7.0` → `v1.7.0` → `1.7.0`)
+
+**Scoring strategy:**
+
+Compute TWO scores for each tag and take the maximum:
+1. **Full match:** `similarity(stripped_user_input, stripped_tag)`
+2. **Substring containment:** If the stripped user input appears as a substring of the stripped tag (case-insensitive), boost the score: `score = max(score, 0.7 + 0.3 * (len(user_input) / len(tag)))`
+
+This handles cases like user input "ecotone" matching tag "op-node/v1.7.0-rc.1-ecotone" (substring match gives ~0.85).
+
+**Implementation approach:**
+
+The fuzzy matching is implemented as inline logic within the SKILL.md instruction set, NOT as an external script. The orchestrating LLM (Claude) performs the matching by:
+
+1. Reading the tag list via `git tag -l | sort -V`
+2. Evaluating Levenshtein similarity mentally or via a bash one-liner for simple cases
+3. For large tag lists (>100 tags), first filter to tags containing any token from the user input (case-insensitive substring), then compute similarity only on the filtered set
+
+```bash
+# Pre-filter: tags containing any token from the user input
+USER_TOKENS=$(echo "<upgrade_name>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '\n' | sort -u)
+FILTERED_TAGS=""
+for token in $USER_TOKENS; do
+  FILTERED_TAGS="$FILTERED_TAGS$(echo "$ALL_TAGS" | grep -i "$token")"$'\n'
+done
+FILTERED_TAGS=$(echo "$FILTERED_TAGS" | sort -V | uniq)
+```
+
+If `FILTERED_TAGS` is empty, fall through to scoring ALL tags.
+
+**Step 2.2c — Confidence-based selection**
+
+Rank all tags by similarity score. Apply these thresholds:
+
+| Confidence | Score Range | Action |
+|-----------|-------------|--------|
+| **Auto-select** | ≥ 0.8 | Use the highest-scoring tag automatically. Print: `Auto-selected tag: <tag> (confidence: <score>)` |
+| **Candidate list** | 0.5 – 0.8 | Present top 5 candidates to user for confirmation |
+| **Full list** | < 0.5 (all tags) | Present all tags for manual selection |
+
+**For the candidate list (0.5-0.8):**
+
+```
+Use AskUserQuestion:
+  question: "I found these candidate tags for '<user_input>'. Which one is correct?"
+  options:
+    - "<tag1> (score: 0.75)"
+    - "<tag2> (score: 0.68)"
+    - "<tag3> (score: 0.62)"
+    - "None of these — show all tags"
+```
+
+**For the full list (<0.5):**
+
+```
+Use AskUserQuestion:
+  question: "I couldn't find a confident match for '<user_input>'. Here are all available tags. Which one should I use for <base|head>?"
+  options:
+    - "<most recent tags — show last 10 by version sort>"
+    - "Let me type the exact ref"
+```
+
+**Repeat for both `base_ref` and `head_ref`.**
+
+If the user needs to identify which tag is "before" and which is "after" the upgrade, use commit dates to help:
+```bash
+git log -1 --format="%ai" "$TAG" 2>/dev/null
+```
+
+### Step 2.3 — SHA Resolution (D13)
+
+Once `base_ref` and `head_ref` are determined (either user-provided or fuzzy-matched), resolve them to full SHAs:
+
+```bash
+cd "$CLONE_DIR"
+BASE_SHA=$(git rev-parse "$BASE_REF" 2>/dev/null)
+HEAD_SHA=$(git rev-parse "$HEAD_REF" 2>/dev/null)
+```
+
+**Validation:**
+- If `git rev-parse` fails for either ref → error:
+  ```
+  ❌ Cannot resolve ref: <ref>
+     Available tags: <list first 10 tags>
+     Did you mean: <closest fuzzy match>?
+  ```
+  Use AskUserQuestion to let the user correct the ref.
+
+- Verify the refs are in the correct chronological order:
+  ```bash
+  BASE_DATE=$(git log -1 --format="%ct" "$BASE_SHA")
+  HEAD_DATE=$(git log -1 --format="%ct" "$HEAD_SHA")
+  if [ "$BASE_DATE" -gt "$HEAD_DATE" ]; then
+    echo "⚠️  Warning: base ref ($BASE_REF) is NEWER than head ref ($HEAD_REF). Refs may be swapped."
+  fi
+  ```
+  If swapped, ask the user to confirm or swap them.
+
+Print the resolved refs:
+```
+Resolved refs:
+  base: $BASE_REF → $BASE_SHA
+  head: $HEAD_REF → $HEAD_SHA
+```
+
+### Step 2.4 — Diff Generation
+
+Generate the file-level diff between `BASE_SHA` and `HEAD_SHA`.
+
+**Step 2.4a — File list with stats**
+
+```bash
+cd "$CLONE_DIR"
+git diff --stat "$BASE_SHA..$HEAD_SHA" > /tmp/diff-stat.txt
+git diff --numstat "$BASE_SHA..$HEAD_SHA" > /tmp/diff-numstat.txt
+git diff --name-status "$BASE_SHA..$HEAD_SHA" > /tmp/diff-name-status.txt
+```
+
+**Step 2.4b — Parse diff data**
+
+For each changed file, extract:
+- `path`: file path relative to repo root (from `--name-status`)
+- `status`: A (added), M (modified), D (deleted), R (renamed) → map to `added`, `modified`, `deleted`, `renamed`
+- `lines_added`: from `--numstat` (column 1)
+- `lines_deleted`: from `--numstat` (column 2)
+- `lines_changed`: `lines_added + lines_deleted`
+
+**Step 2.4c — Categorize files**
+
+Assign a category to each file based on its path patterns:
+
+| Category | Path patterns |
+|----------|---------------|
+| `test` | `*_test.*`, `*_test/*`, `*/test/*`, `*/tests/*`, `*_spec.*`, `*/spec/*`, `*/__tests__/*` |
+| `docs` | `*.md`, `*.rst`, `*.txt` (in docs/ or root), `*/docs/*`, `*/documentation/*` |
+| `config` | `*.json`, `*.yaml`, `*.yml`, `*.toml`, `*.ini`, `*.cfg`, `Makefile`, `Dockerfile`, `*.Dockerfile`, `docker-compose*`, `.github/*`, `.circleci/*` |
+| `dependency` | `go.mod`, `go.sum`, `package.json`, `package-lock.json`, `yarn.lock`, `Cargo.toml`, `Cargo.lock`, `requirements.txt`, `Pipfile*` |
+| `new_module` | File has status `added` AND the parent directory is also new (no files with status `modified` in the same directory) |
+| `core` | Everything else (production source code) |
+
+For `new_module` detection, check if the directory existed in the base commit:
+```bash
+git ls-tree --name-only "$BASE_SHA" "$(dirname "$FILE_PATH")" 2>/dev/null
+```
+If the directory didn't exist in the base commit and the file is `added`, it's a `new_module`. Otherwise, it's `core` for added files in existing directories.
+
+### Step 2.5 — Build diff-map.json
+
+Assemble the `diff-map.json` artifact following the schema from [Artifact Schemas > diff-map.json](#diff-mapjson):
+
+```json
+{
+  "schema_version": 1,
+  "repo": "<repo_url>",
+  "base_sha": "<full_sha>",
+  "head_sha": "<full_sha>",
+  "base_ref": "<user-facing ref name>",
+  "head_ref": "<user-facing ref name>",
+  "generated_at": "<ISO 8601 timestamp>",
+  "clone_path": "<absolute path to CLONE_DIR>",
+  "files": [
+    {
+      "path": "pkg/example/file.go",
+      "status": "modified",
+      "category": "core",
+      "lines_changed": 42,
+      "lines_added": 30,
+      "lines_deleted": 12
+    }
+  ],
+  "summary": {
+    "total_files": 47,
+    "added": 12,
+    "modified": 30,
+    "deleted": 5,
+    "total_lines_changed": 4200
+  }
+}
+```
+
+**Write to:** `{session_dir}/diff-map.json`
+
+### Step 2.6 — Self-Validation Gate
+
+Before presenting to the user, validate diff-map.json against the schema. This is a pre-output self-validation (same approach as Phase 1, Step 1.6).
+
+Validation checks:
+
+1. `schema_version` equals `1`
+2. `repo` is a non-empty string
+3. `base_sha`, `head_sha` are non-empty strings (must look like hex SHAs, 7-40 chars)
+4. `base_ref`, `head_ref` are non-empty strings
+5. `generated_at` is a valid ISO 8601 timestamp
+6. `clone_path` is a non-empty string
+7. `files` array is non-empty
+8. Each file has non-null `path`, `status`, `category`, `lines_changed`, `lines_added`, `lines_deleted`
+9. Each `status` is one of: `added`, `modified`, `deleted`, `renamed`
+10. Each `category` is one of: `core`, `new_module`, `config`, `test`, `docs`, `dependency`, `other`
+11. `summary` is present with all required sub-fields (`total_files`, `added`, `modified`, `deleted`, `total_lines_changed`)
+12. `summary.total_files` equals `len(files)`
+13. `summary.added + summary.modified + summary.deleted` equals `summary.total_files` (renamed files count as modified for this check)
+
+**On validation failure:**
+
+```
+❌ Validation failed: diff-map.json
+   Field: <field_name>
+   Error: <missing | null | empty array | wrong type | invalid enum value>
+   Phase 2 self-validation failed. Attempting auto-fix...
+```
+
+Auto-fix attempt: Re-generate the problematic field(s) from the raw git diff data. If the second attempt also fails validation, abort Phase 2 with the error.
+
+### Step 2.7 — User Checkpoint 🧑
+
+Present the diff map summary to the user for confirmation. This is a mandatory checkpoint — do NOT proceed to Phase 3 without user approval.
+
+**Display format:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📂 Phase 2 Complete — Codebase Navigation
+
+Repo:       <repo_url>
+Clone:      <clone_method> (<clone_path>)
+Base ref:   <base_ref> → <base_sha (first 8 chars)>
+Head ref:   <head_ref> → <head_sha (first 8 chars)>
+
+Summary:
+  Total files changed:  <N>
+  Added:                <N>
+  Modified:             <N>
+  Deleted:              <N>
+  Total lines changed:  <N>
+
+Top changed files (by lines changed):
+  1. <path> (+<added>/-<deleted>) [<category>]
+  2. <path> (+<added>/-<deleted>) [<category>]
+  3. <path> (+<added>/-<deleted>) [<category>]
+  ... (top 10)
+
+Category breakdown:
+  core:        <N> files (<N> lines)
+  new_module:  <N> files (<N> lines)
+  test:        <N> files (<N> lines)
+  config:      <N> files (<N> lines)
+  docs:        <N> files (<N> lines)
+  dependency:  <N> files (<N> lines)
+
+Artifacts saved:
+  • {session_dir}/diff-map.json
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Then ask:
+
+```
+Use AskUserQuestion:
+  question: "Does the diff map look correct? Are the refs and file changes what you expected?"
+  options:
+    - "Looks good — proceed to Phase 3"
+    - "Wrong refs — let me correct them" (user provides corrected refs → re-run from Step 2.3)
+    - "Unexpected changes — let me investigate" (pause for manual review, resume when ready)
+    - "Abort pipeline"
+```
+
+If the user provides corrections, update the relevant steps, re-generate diff-map.json, re-validate, and re-display.
 
 **Output artifacts:**
 ```
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/diff-map.json
 ```
+
+**Repo clone retained at:**
+```
+~/.gstack/tmp/research-<chain>-<upgrade>/
+```
+
+Cleanup: Clone is kept alive until the pipeline completes (Phase 5 in M1). Cleaned up via bash trap on exit. Stale directories (>24h) are cleaned by the preamble on next invocation.
 
 ---
 
