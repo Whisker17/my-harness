@@ -241,6 +241,41 @@ else
   echo "         Install the codex plugin first, then re-run setup.sh"
 fi
 
+# ── Step 7: Check for v2 dependency updates ────────────
+
+header "Step 7: Checking for v2 dependency updates"
+
+# codex-plugin-cc — check installed vs latest version
+if command -v npm &>/dev/null; then
+  INSTALLED_CC=$(npm list -g codex-plugin-cc --depth=0 2>/dev/null | grep codex-plugin-cc | sed 's/.*@//')
+  if [ -n "$INSTALLED_CC" ]; then
+    LATEST_CC=$(npm view codex-plugin-cc version 2>/dev/null || echo "")
+    if [ -n "$LATEST_CC" ] && [ "$INSTALLED_CC" != "$LATEST_CC" ]; then
+      check_warn "codex-plugin-cc outdated: $INSTALLED_CC → $LATEST_CC"
+      echo "         Update: npm update -g codex-plugin-cc"
+    else
+      check_pass "codex-plugin-cc up to date ($INSTALLED_CC)"
+    fi
+  else
+    check_warn "codex-plugin-cc not installed"
+    echo "         Install: npm install -g codex-plugin-cc"
+  fi
+
+  # @openai/codex CLI — check installed vs latest version
+  INSTALLED_CODEX=$(npm list -g @openai/codex --depth=0 2>/dev/null | grep @openai/codex | sed 's/.*@openai\/codex@//')
+  if [ -n "$INSTALLED_CODEX" ]; then
+    LATEST_CODEX=$(npm view @openai/codex version 2>/dev/null || echo "")
+    if [ -n "$LATEST_CODEX" ] && [ "$INSTALLED_CODEX" != "$LATEST_CODEX" ]; then
+      check_warn "Codex CLI outdated: $INSTALLED_CODEX → $LATEST_CODEX"
+      echo "         Update: npm update -g @openai/codex"
+    else
+      check_pass "Codex CLI up to date ($INSTALLED_CODEX)"
+    fi
+  fi
+else
+  check_warn "npm not found — cannot check for updates"
+fi
+
 # ── Summary ─────────────────────────────────────────────
 
 header "Summary"
