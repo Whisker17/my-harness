@@ -86,14 +86,38 @@ for skill in "${HARNESS_SKILLS[@]}"; do
   fi
 
   mkdir -p "$dst"
-  cp -r "$src"/* "$dst"/ 2>/dev/null || true
+  # Copy skill files — handle macOS "identical file" error (exit code 1)
+  # but fail on real copy errors (permissions, disk full, etc.)
+  CP_OUTPUT=$(cp -r "$src"/* "$dst"/ 2>&1)
+  CP_EXIT=$?
+  if [ $CP_EXIT -ne 0 ]; then
+    # macOS cp returns "are identical" for same-file copies — that's OK
+    if echo "$CP_OUTPUT" | grep -qi "identical"; then
+      : # Safe to ignore — files already in place
+    else
+      check_fail "$skill — copy failed: $CP_OUTPUT"
+      continue
+    fi
+  fi
+  # Verify the critical SKILL.md file exists after copy
+  if [ ! -f "$dst/SKILL.md" ]; then
+    check_fail "$skill — SKILL.md missing after copy (expected at $dst/SKILL.md)"
+    continue
+  fi
   check_pass "$skill installed → $dst"
 done
 
 # Copy shared schema (required by harness-dev quality gate)
 if [ -f "$SKILLS_SRC/harness-dev/schema.md" ]; then
-  cp "$SKILLS_SRC/harness-dev/schema.md" "$SKILLS_DST/harness-dev/schema.md" 2>/dev/null || true
-  check_pass "schema.md copied to $SKILLS_DST/harness-dev/"
+  CP_OUTPUT=$(cp "$SKILLS_SRC/harness-dev/schema.md" "$SKILLS_DST/harness-dev/schema.md" 2>&1)
+  CP_EXIT=$?
+  if [ $CP_EXIT -ne 0 ] && ! echo "$CP_OUTPUT" | grep -qi "identical"; then
+    check_fail "schema.md copy failed: $CP_OUTPUT"
+  elif [ -f "$SKILLS_DST/harness-dev/schema.md" ]; then
+    check_pass "schema.md copied to $SKILLS_DST/harness-dev/"
+  else
+    check_fail "schema.md missing after copy at $SKILLS_DST/harness-dev/schema.md"
+  fi
 fi
 
 # ── Step 3: Check external skill dependencies ───────────

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "round": 1,
+  "status": "FAIL",
+  "verdict": "fail",
+  "summary": "Setup can silently fail while claiming the new skill set was installed, creating a hard-to-detect broken harness installation.",
+  "findings": [
+    {
+      "id": "F-001",
+      "severity": "HIGH",
+      "claim_title": "Setup reports successful installs after failed copies",
+      "claim": "Setup reports successful installs after failed copies: The installer now suppresses every cp failure and still reports success. If the destination is unwritable, the source glob expands to nothing, or a copy is interrupted/partially fails, the script continues and prints check_pass, leaving users with stale or missing skill files while setup.sh exits successfully. That is especially risky here because the branch adds multiple new skills; a failed copy can make /harness-review-v2 or /harness-research-engineering unavailable or outdated with no signal.",
+      "file": "setup.sh",
+      "line_start": 89,
+      "line_end": 96,
+      "suggested_fix": "Do not blanket || true copy operations. Handle only the known macOS identical-file case explicitly, or copy via a temp directory/rsync and verify required files like SKILL.md exist in each destination before calling check_pass; increment FAIL and exit nonzero on real copy errors.",
+      "status": "resolved",
+      "resolution": "Replaced blanket || true with explicit macOS identical-file detection, real error propagation via check_fail, and post-copy SKILL.md verification for both skill loop and schema.md copy.",
+      "round_opened": 1,
+      "round_closed": 1
+    }
+  ]
+}
