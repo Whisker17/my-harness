@@ -40,7 +40,8 @@ You are a protocol analysis engine for blockchain engineering research. The user
 7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — treeless clone, fuzzy tag matching, SHA resolution, diff-map generation
 8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — claim batching, evidence mapping, code-first delta pass, quality gates
 9. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
-10. [Failure and Abort](#failure-and-abort) — error handling and cleanup
+10. [Phase 7: Knowledge Index Management](#phase-7-knowledge-index-management) — dedup check, public/internal separation, append-only JSONL, malformed line handling
+11. [Failure and Abort](#failure-and-abort) — error handling and cleanup
 
 ---
 
@@ -276,6 +277,22 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
   - Quality gate: no HIGH findings to proceed. Max 2 fix+re-verify rounds.
 - Status: Deferred to v2. Phase 6 is skipped in M1 pipeline.
 -->
+
+### 7. knowledge_index_agent (Phase 7)
+
+- **Mission:** Persist analysis results to the knowledge index for future cross-reference
+- **Inputs:** `internal-report.md`, `claims.json`, `diff-map.json`, `analysis.json`, session metadata
+- **Tools:** Read, Write, Bash, AskUserQuestion
+- **Outputs:** Appended entry in `~/.gstack/research/research-index.jsonl`
+- **Behavior:**
+  - Read the final internal report and upstream artifacts to extract index entry fields
+  - Build a structured index entry with `public` and `internal` field sets (D15)
+  - Compute the dedup composite key: `chain:upgrade_name:repo` (D4)
+  - Read the existing knowledge index, checking for duplicate entries
+  - If a duplicate is found: present the user with three choices via AskUserQuestion — overwrite, keep-both, or skip
+  - Handle malformed JSON lines gracefully: skip the line, log a warning with the line number, continue reading
+  - Auto-create `~/.gstack/research/` directory if it does not exist
+  - Append the entry as a single-line JSON record to the JSONL file
 
 ---
 
@@ -628,6 +645,112 @@ If validation fails at any phase boundary:
 - `comparisons` array must be non-empty
 - `novel_features`, `borrowed_features`, `divergent_features` must be present (may be empty arrays)
 
+### research-index.jsonl (Knowledge Index Entry)
+
+**Produced by:** Phase 7 (Knowledge Index Management)
+**Consumed by:** Phase 4 (Cross-Reference Agent — v2 only), M3 public summary generation
+
+Each line in `~/.gstack/research/research-index.jsonl` is a standalone JSON object representing one completed analysis. Entries have two field sets: `public` (safe to share externally) and `internal` (full evidence, local paths, detailed data).
+
+```json
+{
+  "schema_version": 1,
+  "id": "base-azul-20260425-120000",
+  "dedup_key": "base:Azul:base-org/base-contracts",
+  "public": {
+    "chain": "base",
+    "upgrade_name": "Azul",
+    "source_url": "https://blog.base.org/azul-upgrade",
+    "executive_summary": "Base Azul introduces independent derivation pipeline, governance module, and zstd batch compression...",
+    "claims_summary": {
+      "total": 12,
+      "confirmed": 8,
+      "partial": 2,
+      "unconfirmed": 1,
+      "contradicted": 1
+    },
+    "generated_at": "2026-04-25T12:00:00Z"
+  },
+  "internal": {
+    "repo": "base-org/base-contracts",
+    "base_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+    "head_sha": "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
+    "base_ref": "v0.8.0",
+    "head_ref": "v0.9.0-azul",
+    "full_claims": [
+      {
+        "id": "claim-001",
+        "text": "Added independent derivation pipeline",
+        "category": "architecture",
+        "verification_status": "verified"
+      }
+    ],
+    "evidence_map_path": "sessions/base-azul-20260425-120000/analysis.json",
+    "verification_status": "verified",
+    "unclaimed_changes_count": 3
+  }
+}
+```
+
+**Field reference:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `schema_version` | number | ✅ | Always `1` for v1 |
+| `id` | string | ✅ | Unique entry ID: `{chain_slug}-{upgrade_slug}-{YYYYMMDD}-{HHMMSS}` |
+| `dedup_key` | string | ✅ | Composite key for dedup: `{chain}:{upgrade_name}:{repo}` (D4) |
+| **public fields** | | | |
+| `public.chain` | string | ✅ | Blockchain name (lowercase) |
+| `public.upgrade_name` | string | ✅ | Upgrade/hardfork name |
+| `public.source_url` | string | ✅ | Announcement URL |
+| `public.executive_summary` | string | ✅ | 2-3 sentence summary of the analysis findings |
+| `public.claims_summary` | object | ✅ | Aggregate claim verification stats |
+| `public.claims_summary.total` | number | ✅ | Total claims analyzed |
+| `public.claims_summary.confirmed` | number | ✅ | Claims with status `verified` |
+| `public.claims_summary.partial` | number | ✅ | Claims with status `partially_verified` |
+| `public.claims_summary.unconfirmed` | number | ✅ | Claims with status `unverified` |
+| `public.claims_summary.contradicted` | number | ✅ | Claims with contradictory evidence (0 in M1/M2 — reserved for future use) |
+| `public.generated_at` | string (ISO 8601) | ✅ | Timestamp when the analysis was completed |
+| **internal fields** | | | |
+| `internal.repo` | string | ✅ | Repository identifier (org/repo format) |
+| `internal.base_sha` | string | ✅ | Full SHA of the base commit (D13) |
+| `internal.head_sha` | string | ✅ | Full SHA of the head commit (D13) |
+| `internal.base_ref` | string | ✅ | Human-readable base ref (tag/branch name) |
+| `internal.head_ref` | string | ✅ | Human-readable head ref (tag/branch name) |
+| `internal.full_claims` | array | ✅ | Compact claim array: id, text, category, verification_status for each |
+| `internal.evidence_map_path` | string | ✅ | Relative path (from `~/.gstack/research/`) to the analysis.json |
+| `internal.verification_status` | string | ✅ | Overall verification status: `verified` (>70% confirmed+partial), `partial` (30-70%), `low_confidence` (<30%) |
+| `internal.unclaimed_changes_count` | number | ✅ | Count of unreported changes from code-first delta pass |
+
+**Dedup key construction (D4):**
+
+The dedup key is a composite of three fields joined by colons:
+```
+dedup_key = "{chain}:{upgrade_name}:{repo}"
+```
+Where:
+- `chain` = `public.chain` (lowercase)
+- `upgrade_name` = `public.upgrade_name` (original case preserved)
+- `repo` = `internal.repo` (org/repo format, no protocol prefix)
+
+Example: `base:Azul:base-org/base-contracts`
+
+**Overall verification_status computation:**
+
+```
+confirmed_and_partial = claims_summary.confirmed + claims_summary.partial
+total = claims_summary.total
+
+if total == 0:
+  verification_status = "low_confidence"
+elif confirmed_and_partial / total > 0.70:
+  verification_status = "verified"
+elif confirmed_and_partial / total >= 0.30:
+  verification_status = "partial"
+else:
+  verification_status = "low_confidence"
+```
+
 ### Per-Phase Validation Summary
 
 | Phase | Validates Before Processing | Artifacts Checked |
@@ -637,6 +760,7 @@ If validation fails at any phase boundary:
 | Phase 3 | claims.json, diff-map.json | Both must pass all validation rules |
 | Phase 4 (v2) | analysis.json, knowledge index | analysis.json must pass; index must have ≥1 entry for a different chain |
 | Phase 5 | claims.json, diff-map.json, analysis.json (+ comparison.json in v2) | All must pass validation |
+| Phase 7 | internal-report.md, claims.json, diff-map.json, analysis.json | At least internal-report.md must exist; other artifacts used for field extraction |
 
 ---
 
@@ -2248,8 +2372,362 @@ The following error handling framework applies across all pipeline phases. Phase
 | Phase 5 | Upstream artifact missing | Generate partial report, mark missing sections `[DATA UNAVAILABLE]` |
 | Phase 5 | Upstream artifact corrupt (invalid JSON) | Treat as missing; note corruption in Methodology section |
 | Phase 5 | Report generation agent produces incomplete output | Auto-fix: regenerate failed sections (max 1 retry) |
+| Phase 7 | `internal-report.md` missing | Abort Phase 7; report must be approved in Phase 5 first |
+| Phase 7 | Other upstream artifacts missing | Extract from available artifacts; use `"[UNAVAILABLE]"` for missing fields |
+| Phase 7 | Malformed JSON in existing index | Skip the malformed line, log warning, continue reading |
+| Phase 7 | Duplicate entry detected | AskUserQuestion: overwrite / keep-both / skip |
+| Phase 7 | Index directory creation fails | Abort with clear error message |
 
 **Error handling philosophy:** Phase 5 always attempts to produce output. The only condition that aborts Phase 5 is ALL upstream artifacts being missing. Any other combination of missing/partial/corrupt artifacts results in a degraded but functional report.
+
+---
+
+## Phase 7: Knowledge Index Management
+
+> **Implemented by:** WHI-235
+
+Phase 7 persists the analysis results to the knowledge index — an append-only JSONL file at `~/.gstack/research/research-index.jsonl`. This is the "research compound interest" storage layer: as analyses accumulate, cross-referencing (Phase 4) becomes increasingly valuable.
+
+Phase 7 runs after Phase 5 (report generation) and after the user has approved the final report. It is the last phase in the M2 pipeline.
+
+**Agent role:** `knowledge_index_agent` (see [Agent Roles > knowledge_index_agent](#7-knowledge_index_agent-phase-7))
+
+### Step 7.0 — Input Validation
+
+Phase 7 requires the final report and upstream artifacts to extract index entry fields. Validate availability:
+
+**Recovering `session_dir`:** Phase 7 runs in the same session as Phases 1-5. The `SESSION_DIR` variable should still be available. If not (e.g., re-invocation), recover:
+
+```bash
+SESSION_DIR=$(ls -dt "$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-"* 2>/dev/null | head -1)
+if [ -z "$SESSION_DIR" ]; then
+  echo "❌ No session directory found. Run Phase 1 first."
+  exit 1
+fi
+echo "Session directory: $SESSION_DIR"
+```
+
+**Required artifact: internal-report.md**
+
+```bash
+REPORT_FILE="$SESSION_DIR/internal-report.md"
+if [ ! -f "$REPORT_FILE" ]; then
+  echo "❌ Phase 7 aborted: internal-report.md not found at $REPORT_FILE"
+  echo "   Phase 5 must complete and the user must approve the report before Phase 7 can run."
+  exit 1
+fi
+```
+
+**Optional artifacts (used for field extraction):**
+
+For each of `claims.json`, `diff-map.json`, `analysis.json`:
+1. Check file exists in `$SESSION_DIR`
+2. If exists: parse JSON and extract needed fields
+3. If missing: use fallback values derived from the internal report content or mark as `"[UNAVAILABLE]"`
+
+```
+ARTIFACTS_STATUS = {}
+For each artifact in [claims.json, diff-map.json, analysis.json]:
+  Check existence and parsability
+  Record: "available" or "missing"
+```
+
+### Step 7.1 — Directory Bootstrap
+
+Ensure the knowledge index directory exists:
+
+```bash
+RESEARCH_DIR="$HOME/.gstack/research"
+INDEX_FILE="$RESEARCH_DIR/research-index.jsonl"
+mkdir -p "$RESEARCH_DIR"
+```
+
+If `mkdir -p` fails (permissions, disk full): abort with `"❌ Cannot create research directory at $RESEARCH_DIR"`.
+
+### Step 7.2 — Extract Index Entry Fields
+
+Build the index entry by extracting fields from available artifacts.
+
+**From `diff-map.json` (if available):**
+```
+repo = diff_map.repo  // e.g., "https://github.com/base-org/base-contracts"
+repo_short = extract org/repo from URL  // e.g., "base-org/base-contracts"
+base_sha = diff_map.base_sha
+head_sha = diff_map.head_sha
+base_ref = diff_map.base_ref
+head_ref = diff_map.head_ref
+```
+
+If `diff-map.json` is missing: set all fields to `"[UNAVAILABLE]"`. These fields will be present in the index entry but with placeholder values.
+
+**From `claims.json` (if available):**
+```
+source_url = claims.source_url
+```
+
+If `claims.json` is missing: set `source_url = "[UNAVAILABLE]"`.
+
+**From `analysis.json` (if available):**
+```
+claims_analyzed = analysis.claims_analyzed
+unreported_changes = analysis.unreported_changes
+analysis_summary = analysis.summary
+```
+
+**Compute `claims_summary`:**
+```
+IF analysis.json is available:
+  claims_summary = {
+    "total": analysis_summary.total_claims,
+    "confirmed": analysis_summary.verified,
+    "partial": analysis_summary.partially_verified,
+    "unconfirmed": analysis_summary.unverified,
+    "contradicted": 0  // reserved for future use
+  }
+ELSE:
+  claims_summary = {
+    "total": 0,
+    "confirmed": 0,
+    "partial": 0,
+    "unconfirmed": 0,
+    "contradicted": 0
+  }
+```
+
+**Compute `full_claims` (compact claim array for internal fields):**
+```
+IF analysis.json is available AND claims.json is available:
+  For each claim in claims.json.claims:
+    Find matching entry in analysis.claims_analyzed
+    full_claims.append({
+      "id": claim.id,
+      "text": claim.text,
+      "category": claim.category,
+      "verification_status": matched_entry.verification_status or "not_analyzed"
+    })
+ELSE:
+  full_claims = []
+```
+
+**Extract `executive_summary` from the internal report:**
+
+Read the Executive Summary section from `internal-report.md`:
+```bash
+# Extract text between "## Executive Summary" and the next "## " heading
+sed -n '/^## Executive Summary$/,/^## /{/^## Executive Summary$/d;/^## /d;p}' "$REPORT_FILE" | head -20
+```
+
+Truncate to 500 characters if longer. If the section contains `[DATA UNAVAILABLE]`, use that as the summary.
+
+**Compute overall `verification_status`:**
+```
+confirmed_and_partial = claims_summary.confirmed + claims_summary.partial
+total = claims_summary.total
+
+if total == 0:
+  verification_status = "low_confidence"
+elif confirmed_and_partial / total > 0.70:
+  verification_status = "verified"
+elif confirmed_and_partial / total >= 0.30:
+  verification_status = "partial"
+else:
+  verification_status = "low_confidence"
+```
+
+**Build the `evidence_map_path`:**
+```
+# Relative path from ~/.gstack/research/ to the analysis.json
+# e.g., "sessions/base-azul-20260425-120000/analysis.json"
+evidence_map_path = relative path from RESEARCH_DIR to SESSION_DIR/analysis.json
+```
+
+**Compute `unclaimed_changes_count`:**
+```
+IF analysis.json is available:
+  unclaimed_changes_count = len(analysis.unreported_changes)
+ELSE:
+  unclaimed_changes_count = 0
+```
+
+### Step 7.3 — Build Index Entry
+
+Assemble the complete index entry following the schema from [Artifact Schemas > research-index.jsonl](#research-indexjsonl-knowledge-index-entry):
+
+```
+TIMESTAMP = current ISO 8601 timestamp
+CHAIN_SLUG = lowercase chain name
+UPGRADE_SLUG = lowercase upgrade name
+DATE_SLUG = YYYYMMDD-HHMMSS from TIMESTAMP
+
+entry = {
+  "schema_version": 1,
+  "id": "{CHAIN_SLUG}-{UPGRADE_SLUG}-{DATE_SLUG}",
+  "dedup_key": "{chain}:{upgrade_name}:{repo_short}",
+  "public": {
+    "chain": CHAIN_SLUG,
+    "upgrade_name": "<upgrade name, original case>",
+    "source_url": source_url,
+    "executive_summary": "<extracted from report>",
+    "claims_summary": claims_summary,
+    "generated_at": TIMESTAMP
+  },
+  "internal": {
+    "repo": repo_short,
+    "base_sha": base_sha,
+    "head_sha": head_sha,
+    "base_ref": base_ref,
+    "head_ref": head_ref,
+    "full_claims": full_claims,
+    "evidence_map_path": evidence_map_path,
+    "verification_status": verification_status,
+    "unclaimed_changes_count": unclaimed_changes_count
+  }
+}
+```
+
+### Step 7.4 — Dedup Check (D4)
+
+Before appending, check the existing index for duplicate entries.
+
+**Read and parse the existing index:**
+
+```bash
+INDEX_FILE="$HOME/.gstack/research/research-index.jsonl"
+```
+
+If the file does not exist: no duplicates possible — skip to Step 7.5.
+
+If the file exists:
+
+1. Read the file line by line
+2. For each line, attempt to parse as JSON:
+   - **Success:** Extract `dedup_key` field, add to the known-keys set
+   - **Failure (malformed JSON):** Log a warning and skip the line:
+     ```
+     ⚠️  Malformed JSON at line <N> in research-index.jsonl — skipping.
+         Content: <first 80 chars of the line>
+     ```
+     Continue processing remaining lines. Do NOT abort.
+
+3. Check if the new entry's `dedup_key` matches any existing entry's `dedup_key`
+
+**If no duplicate found:** Proceed to Step 7.5.
+
+**If duplicate found:**
+
+Present the user with three choices via AskUserQuestion:
+
+```
+Use AskUserQuestion:
+  question: "A previous analysis with the same key already exists in the knowledge index.
+             Existing: <existing_entry.id> (generated <existing_entry.public.generated_at>)
+             New:      <new_entry.id> (generated <new_entry.public.generated_at>)
+             Key:      <dedup_key>
+             
+             How should I handle this?"
+  options:
+    - "Overwrite" — replace the old entry with the new one
+    - "Keep both" — append the new entry alongside the old one (both will appear in queries)
+    - "Skip" — do not write the new entry (keep the existing one)
+```
+
+**On "Overwrite":**
+1. Read the entire index file
+2. Filter out all lines whose parsed `dedup_key` matches the new entry's `dedup_key`
+3. Write the filtered lines back to the file (this removes the old entry)
+4. Proceed to Step 7.5 to append the new entry
+
+```bash
+# Overwrite: remove old entry, then append new
+TEMP_FILE=$(mktemp)
+while IFS= read -r line; do
+  KEY=$(echo "$line" | jq -r '.dedup_key // empty' 2>/dev/null)
+  if [ "$KEY" != "<new_dedup_key>" ]; then
+    echo "$line"
+  fi
+done < "$INDEX_FILE" > "$TEMP_FILE"
+mv "$TEMP_FILE" "$INDEX_FILE"
+```
+
+**On "Keep both":** Proceed to Step 7.5 (append normally — both entries coexist).
+
+**On "Skip":** Print `"Skipping index write. Existing entry preserved."` and skip Step 7.5 entirely. Phase 7 is complete.
+
+### Step 7.5 — Append Entry
+
+Write the index entry as a single-line JSON record appended to the JSONL file.
+
+```bash
+# Serialize the entry as compact single-line JSON and append
+echo '<entry as single-line JSON>' >> "$INDEX_FILE"
+```
+
+**Validation after write:**
+
+Verify the append succeeded:
+```bash
+# Read back the last line and verify it parses
+LAST_LINE=$(tail -1 "$INDEX_FILE")
+echo "$LAST_LINE" | jq -e '.schema_version' > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+  echo "❌ Write verification failed: last line of $INDEX_FILE is not valid JSON."
+  echo "   The index file may be corrupted. Manual inspection required."
+fi
+```
+
+Print confirmation:
+```
+✅ Knowledge index updated: <entry.id>
+   File: ~/.gstack/research/research-index.jsonl
+   Key:  <dedup_key>
+   Total entries: <line count of INDEX_FILE>
+```
+
+### Step 7.6 — User Checkpoint 🧑
+
+Present the index entry summary to the user for confirmation. This checkpoint is informational — the entry has already been written (it's append-only, and the user already approved the report in Phase 5).
+
+**Display format:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📚 Phase 7 Complete — Knowledge Index Updated
+
+Entry ID:    <entry.id>
+Dedup key:   <dedup_key>
+Index file:  ~/.gstack/research/research-index.jsonl
+Total entries: <count>
+
+Public fields:
+  Chain:      <chain>
+  Upgrade:    <upgrade_name>
+  Source:     <source_url>
+  Summary:    <first 100 chars of executive_summary>...
+  Claims:     <total> total (<confirmed> confirmed, <partial> partial, <unconfirmed> unconfirmed)
+
+Internal fields:
+  Repo:       <repo>
+  Refs:       <base_ref> → <head_ref>
+  SHAs:       <base_sha first 8>...<head_sha first 8>
+  Verification: <verification_status>
+  Unclaimed changes: <unclaimed_changes_count>
+
+Session:     <session_dir>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+### Per-Phase Error Handling (Phase 7)
+
+| Phase 7 Scenario | Recovery Action |
+|-------------------|-----------------|
+| `internal-report.md` missing | Abort — report must be approved first |
+| Other artifacts missing | Extract fields from available artifacts; use `"[UNAVAILABLE]"` for missing fields |
+| Index directory cannot be created | Abort with clear error message |
+| Malformed JSON lines in existing index | Skip the line, log warning with line number, continue reading |
+| Dedup found + user chooses "skip" | Do not write; Phase 7 completes without index mutation |
+| Dedup found + user chooses "overwrite" | Remove old entry, append new entry |
+| Write verification fails (last line not valid JSON) | Warn user; manual inspection required |
+| Index file does not exist | Create it; no dedup check needed |
 
 ---
 
@@ -2258,6 +2736,7 @@ The following error handling framework applies across all pipeline phases. Phase
 If the skill is interrupted, errors out, or the user aborts mid-pipeline:
 
 - **Phases 1-5:** Partial artifacts are saved to disk. No knowledge index entry is created. v1 does NOT support resume-from-phase. If interrupted, re-run from scratch. Partial artifacts remain on disk for manual reference.
+- **Phase 7:** If interrupted after the append but before confirmation, the index entry is already written (append-only). On re-invocation, the dedup check (Step 7.4) will detect the existing entry and offer overwrite/keep-both/skip. If interrupted before the append, no index entry exists — re-run Phase 7 after ensuring the report is approved.
 - **Temp repo clone:** Always clean up on exit (success, error, or abort). Stale directories (>24h in `~/.gstack/tmp/research-*`) are cleaned on next invocation by the preamble.
 - **Linear issues:** Sub-issues remain in their current state (In Progress, not Done). The user must manually resolve or re-run.
 
