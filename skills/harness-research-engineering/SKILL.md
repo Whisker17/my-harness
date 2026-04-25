@@ -39,8 +39,9 @@ You are a protocol analysis engine for blockchain engineering research. The user
 6. [Phase 1: Source Ingestion](#phase-1-source-ingestion) — fallback chain fetch, claims extraction, source snapshot, user checkpoint
 7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — treeless clone, fuzzy tag matching, SHA resolution, diff-map generation
 8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — claim batching, evidence mapping, code-first delta pass, quality gates
-9. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
-10. [Failure and Abort](#failure-and-abort) — error handling and cleanup
+9. [Phase 6: Verification](#phase-6-verification) — independent claim verification via Agent subagent, dispute detection, fix-verify loop
+10. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
+11. [Failure and Abort](#failure-and-abort) — error handling and cleanup
 
 ---
 
@@ -253,7 +254,7 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
 - **Tools:** Write, Read
 - **Outputs:** `internal-report.draft.md` → promoted to `internal-report.md` after user approval (M1 only generates internal report; public summary is M3 scope per D15)
 - **Behavior:**
-  - Report sections: Executive Summary, Claims Analysis (per-claim with evidence), Unclaimed Changes, Methodology, Raw Data References
+  - Report sections: Executive Summary, Claims Analysis (per-claim with evidence), Unclaimed Changes, Independent Verification (if verification-report.json available), Methodology, Raw Data References
   - Every claim references its verification status from `analysis.json` (or marked `[DATA UNAVAILABLE]` if analysis is missing)
   - Internal report uses full code snippets (20-30 lines) from `analysis.json` code_snippets
   - Unclaimed Changes section lists all code-first delta findings from `analysis.json` unreported_changes
@@ -261,21 +262,23 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
   - Graceful degradation: if any upstream artifact is missing, generate partial report with `[DATA UNAVAILABLE]` markers (D9)
   - Cross-chain comparison sections are omitted in M1 (no Phase 4 data)
 
-### 6. verification_agent (Phase 6 — v2, not in M1)
+### 6. verification_agent (Phase 6 — M2)
 
-<!-- v2: verification_agent
-- Mission: Devil's advocate — challenge claims, flag hallucinations
-- Inputs: internal-report.md, cloned repo path
-- Tools: Read, Grep, Bash (dispatched as independent Agent subagent)
-- Outputs: verification-report.md — findings with severity
-- Behavior:
-  - Re-read source files independently (same temp clone from Phase 2)
-  - Verify code references in the report actually exist
-  - Challenge each claim: is it supported by evidence?
-  - Flag unsupported assertions with severity: HIGH, MEDIUM, LOW
-  - Quality gate: no HIGH findings to proceed. Max 2 fix+re-verify rounds.
-- Status: Deferred to v2. Phase 6 is skipped in M1 pipeline.
--->
+- **Mission:** Devil's advocate — independently verify whether evidence supports each claim, flag hallucinations and mismatches
+- **Inputs:** `analysis.json` (top 10 claims by significance + their evidence), `claims.json` (for claim text/category)
+- **Tools:** Dispatched as independent Agent subagent (not same context)
+- **Outputs:** `verification-report.json` — structured per-claim assessment with disputes; `verification-report.md` — human-readable summary
+- **Behavior:**
+  - D2: Significance-based top-N selection and bounded-prompt subagent dispatch — select claims by significance tier, enforce ~8KB prompt budget, dispatch as independent Agent subagent
+  - Receives ONLY the top 10 claims (selected by significance priority: security > consensus > feature > parameter) and their evidence from `analysis.json`
+  - Does NOT access the original codebase — judges solely from the evidence snippets provided
+  - For each claim, independently assesses whether the evidence actually supports the claim
+  - Outputs assessment per claim: `confirmed` (evidence fully supports), `partial` (evidence partly supports), `unconfirmed` (evidence insufficient), `contradicted` (evidence contradicts claim)
+  - When assessment disagrees with Phase 3's `verification_status`, marks a dispute
+  - Disputes trigger a fix-verify loop: Phase 3 rechecks → new subagent re-verifies → max 3 rounds
+  - After max rounds, unresolved disputes are preserved with both assessments
+  - Prompt is bounded to ~8KB (role ~200B, claims+evidence ~6KB, instructions ~1KB, output format ~800B)
+  - Generates `verification-report.md` with per-claim judgments + "Reviewer Concerns" section
 
 ---
 
@@ -310,7 +313,7 @@ If validation fails at any phase boundary:
 ### claims.json
 
 **Produced by:** Phase 1 (Source Ingestion)
-**Consumed by:** Phase 3 (Implementation Analysis), Phase 5 (Report Generation)
+**Consumed by:** Phase 3 (Implementation Analysis), Phase 5 (Report Generation), Phase 6 (Verification)
 
 ```json
 {
@@ -442,7 +445,7 @@ If validation fails at any phase boundary:
 ### analysis.json
 
 **Produced by:** Phase 3 (Implementation Analysis)
-**Consumed by:** Phase 4 (Cross-Reference, v2 only), Phase 5 (Report Generation)
+**Consumed by:** Phase 4 (Cross-Reference, v2 only), Phase 5 (Report Generation), Phase 6 (Verification)
 
 ```json
 {
@@ -543,7 +546,7 @@ If validation fails at any phase boundary:
 **Produced by:** Phase 4 (Cross-Reference Agent — v2 only, skipped in M1)
 **Consumed by:** Phase 5 (Report Generation — cross-chain sections)
 
-> **Note:** This schema is defined now for completeness but is only used in M2 when Phase 4 is implemented. In M1, this artifact does not exist and Phase 5 omits cross-chain comparison sections.
+> **Note:** This schema is defined now for completeness but is only used when Phase 4 (cross-chain comparison) is implemented. In M1 and M2, this artifact does not exist and Phase 5 omits cross-chain comparison sections.
 
 ```json
 {
@@ -628,6 +631,116 @@ If validation fails at any phase boundary:
 - `comparisons` array must be non-empty
 - `novel_features`, `borrowed_features`, `divergent_features` must be present (may be empty arrays)
 
+### verification-report.json
+
+**Produced by:** Phase 6 (Verification Agent — M2)
+**Consumed by:** Phase 5 (Report Generation — verification section, when Phase 6 data is available)
+
+Phase 6 outputs a structured JSON artifact containing the independent reviewer's per-claim assessments, dispute tracking, and final verification status. The example below shows 2 reviews for brevity; a real run would have up to 10 (matching `claims_reviewed`). Summary counts must equal `len(reviews)`.
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "2026-04-25T14:00:00Z",
+  "verification_status": "verified",
+  "total_rounds": 1,
+  "claims_reviewed": 2,
+  "claims_total": 24,
+  "selection_criteria": "top 10 by significance (security > consensus > feature > parameter)",
+  "reviews": [
+    {
+      "claim_id": "claim-001",
+      "original_status": "verified",
+      "reviewer_assessment": "confirmed",
+      "reasoning": "The evidence at contracts/L2/OptimismPortal.sol:142-168 directly implements the described withdrawal proof mechanism. The code snippet clearly shows the new function signature and logic.",
+      "agrees_with_original": true,
+      "dispute": false,
+      "rounds": []
+    },
+    {
+      "claim_id": "claim-003",
+      "original_status": "verified",
+      "reviewer_assessment": "partial",
+      "reasoning": "The evidence shows the function exists but the implementation only covers 2 of the 3 cases described in the claim.",
+      "agrees_with_original": false,
+      "dispute": true,
+      "rounds": [
+        {
+          "round": 1,
+          "recheck_notes": "Re-examined with broader file search. Found additional handler in batch.go covering the third case.",
+          "updated_status": "verified",
+          "reviewer_reassessment": "confirmed",
+          "resolved": true
+        }
+      ]
+    }
+  ],
+  "reviewer_concerns": [
+    {
+      "severity": "medium",
+      "description": "claim-007 references a 'governance module' but the evidence points to a config file, not a governance implementation.",
+      "affected_claims": ["claim-007"]
+    }
+  ],
+  "summary": {
+    "confirmed": 1,
+    "partial": 1,
+    "unconfirmed": 0,
+    "contradicted": 0,
+    "disputes_found": 1,
+    "disputes_resolved": 1,
+    "disputes_unresolved": 0
+  }
+}
+```
+
+**Field reference:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `schema_version` | number | ✅ | Always `1` for v1 |
+| `generated_at` | string (ISO 8601) | ✅ | Timestamp when verification completed |
+| `verification_status` | string | ✅ | Final status: `verified` (no unresolved disputes), `partial` (unresolved disputes remain after max rounds) |
+| `total_rounds` | number | ✅ | Total fix-verify rounds executed (0 = no disputes, max 3) |
+| `claims_reviewed` | number | ✅ | Number of claims sent to verification (top 10 or fewer) |
+| `claims_total` | number | ✅ | Total claims in the analysis (for context) |
+| `selection_criteria` | string | ✅ | Description of how claims were selected for verification |
+| `reviews` | array (non-empty) | ✅ | Per-claim verification assessments |
+| `reviews[].claim_id` | string | ✅ | References `claims[].id` from claims.json |
+| `reviews[].original_status` | string | ✅ | The `verification_status` from analysis.json for this claim |
+| `reviews[].reviewer_assessment` | string | ✅ | Independent assessment: `confirmed`, `partial`, `unconfirmed`, `contradicted` |
+| `reviews[].reasoning` | string | ✅ | 1-3 sentence explanation of the reviewer's judgment |
+| `reviews[].agrees_with_original` | boolean | ✅ | Whether the reviewer agrees with Phase 3's assessment |
+| `reviews[].dispute` | boolean | ✅ | Whether this claim triggered a dispute (disagreement with original) |
+| `reviews[].rounds` | array | ✅ | Fix-verify round history (empty array if no dispute) |
+| `reviews[].rounds[].round` | number | ✅ | Round number (1-based) |
+| `reviews[].rounds[].recheck_notes` | string | ✅ | What Phase 3 rechecked and found |
+| `reviews[].rounds[].updated_status` | string | ✅ | Phase 3's updated `verification_status` after recheck |
+| `reviews[].rounds[].reviewer_reassessment` | string | ✅ | Reviewer's new assessment after seeing updated evidence |
+| `reviews[].rounds[].resolved` | boolean | ✅ | Whether this round resolved the dispute |
+| `reviewer_concerns` | array | ✅ | General concerns raised by the reviewer (may be empty) |
+| `reviewer_concerns[].severity` | string | ✅ | One of: `high`, `medium`, `low` |
+| `reviewer_concerns[].description` | string | ✅ | Description of the concern |
+| `reviewer_concerns[].affected_claims` | array | ✅ | Claim IDs related to this concern |
+| `summary` | object | ✅ | Aggregate verification statistics |
+| `summary.confirmed` | number | ✅ | Count of claims where `reviewer_assessment == "confirmed"` (initial assessment, before any round resolution) |
+| `summary.partial` | number | ✅ | Count of claims where `reviewer_assessment == "partial"` (initial assessment) |
+| `summary.unconfirmed` | number | ✅ | Count of claims where `reviewer_assessment == "unconfirmed"` (initial assessment) |
+| `summary.contradicted` | number | ✅ | Count of claims where `reviewer_assessment == "contradicted"` (initial assessment) |
+| `summary.disputes_found` | number | ✅ | Total disputes triggered |
+| `summary.disputes_resolved` | number | ✅ | Disputes resolved during fix-verify loop |
+| `summary.disputes_unresolved` | number | ✅ | Disputes remaining after max rounds |
+
+**Phase boundary validation (before Phase 5, when Phase 6 data exists):**
+- `schema_version` must equal `1`
+- `verification_status` must be one of: `verified`, `partial`
+- `reviews` array must be non-empty
+- Each review must have non-null `claim_id`, `original_status`, `reviewer_assessment`, `reasoning`, `agrees_with_original`, `dispute`
+- `reviewer_assessment` must be one of: `confirmed`, `partial`, `unconfirmed`, `contradicted`
+- `summary` must be present with all required sub-fields
+- `summary.confirmed + summary.partial + summary.unconfirmed + summary.contradicted` must equal `len(reviews)`
+- `summary.disputes_resolved + summary.disputes_unresolved` must equal `summary.disputes_found`
+
 ### Per-Phase Validation Summary
 
 | Phase | Validates Before Processing | Artifacts Checked |
@@ -636,7 +749,8 @@ If validation fails at any phase boundary:
 | Phase 2 | _(none — independent of Phase 1 output)_ | — |
 | Phase 3 | claims.json, diff-map.json | Both must pass all validation rules |
 | Phase 4 (v2) | analysis.json, knowledge index | analysis.json must pass; index must have ≥1 entry for a different chain |
-| Phase 5 | claims.json, diff-map.json, analysis.json (+ comparison.json in v2) | All must pass validation |
+| Phase 5 | claims.json, diff-map.json, analysis.json (+ comparison.json in v2, + verification-report.json in M2) | All must pass validation |
+| Phase 6 (verification) | analysis.json, claims.json | Both must pass all validation rules |
 
 ---
 
@@ -1372,7 +1486,7 @@ If the user provides corrections, update the relevant steps, re-generate diff-ma
 ~/.gstack/tmp/research-<chain>-<upgrade>/
 ```
 
-Cleanup: Clone is kept alive until the pipeline completes (Phase 5 in M1). Cleaned up via bash trap on exit. Stale directories (>24h) are cleaned by the preamble on next invocation.
+Cleanup: Clone is kept alive until the pipeline completes (Phase 5 in M1; Phase 5 in M2 since Phase 6's fix-verify recheck also requires the clone). Cleaned up via bash trap on exit. Stale directories (>24h) are cleaned by the preamble on next invocation.
 
 ---
 
@@ -1828,11 +1942,18 @@ Then ask:
 Use AskUserQuestion:
   question: "Does the analysis look correct? Any claims need re-investigation or manual override?"
   options:
-    - "Looks good — proceed to Phase 5"
+    - "Run verification first (Phase 6 — M2)" (dispatch independent Devil's Advocate verification before report generation)
+    - "Skip verification — proceed to Phase 5" (go directly to report generation without independent verification)
     - "Re-investigate specific claims" (user identifies claims to re-analyze with broader file search)
     - "Override claim statuses" (user manually sets verification_status for specific claims)
     - "Abort pipeline"
 ```
+
+If the user selects "Run verification first (Phase 6 — M2)":
+1. Proceed to Phase 6 (Verification). After Phase 6 completes, the Phase 6 checkpoint will offer "Proceed to Phase 5".
+
+If the user selects "Skip verification — proceed to Phase 5":
+1. Proceed directly to Phase 5. The report will not include Independent Verification data.
 
 If the user requests re-investigation:
 1. For each flagged claim, broaden the file search — include ALL `core` and `new_module` files from `diff-map.json`
@@ -1849,6 +1970,630 @@ If the user overrides claim statuses:
 **Output artifacts:**
 ```
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/analysis.json
+```
+
+---
+
+## Phase 6: Verification
+
+> **Implemented by:** WHI-234
+
+Phase 6 is the pipeline's quality assurance layer: an independent Agent subagent acting as Devil's Advocate re-examines the top 10 claims from Phase 3, challenging whether the evidence actually supports each conclusion. It does NOT trust Phase 3's judgment — it forms its own opinion from the evidence alone. When the reviewer disagrees with Phase 3, a fix-verify loop attempts resolution (max 3 rounds).
+
+**Agent role:** `verification_agent` (see [Agent Roles > verification_agent](#6-verification_agent-phase-6--m2))
+
+### Step 6.0 — Input Validation Gate
+
+Before processing, validate the required input artifacts.
+
+**Recovering `session_dir`:** Phase 6 runs in the same session as Phases 1-5. The `SESSION_DIR` variable should still be available. If not (e.g., re-invocation), recover:
+
+```bash
+SESSION_DIR=$(ls -dt "$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-"* 2>/dev/null | head -1)
+if [ -z "$SESSION_DIR" ]; then
+  echo "❌ No session directory found. Run Phase 1 first."
+  exit 1
+fi
+echo "Session directory: $SESSION_DIR"
+```
+
+**Validate analysis.json:**
+
+```bash
+ANALYSIS_FILE="$SESSION_DIR/analysis.json"
+if [ ! -f "$ANALYSIS_FILE" ]; then
+  echo "❌ Validation failed: analysis.json not found at $ANALYSIS_FILE"
+  echo "   Phase 6 aborted. Run Phase 3 first."
+  exit 1
+fi
+```
+
+Parse and check using the validation rules from [Artifact Schemas > analysis.json](#analysisjson):
+
+1. File must be valid JSON
+2. `schema_version` must equal `1`
+3. `claims_analyzed` array must be non-empty
+4. Each entry must have non-null `claim_id`, `verification_status`, `evidence`
+5. `verification_status` must be one of: `verified`, `unverified`, `partially_verified`
+6. `summary` must be present with all required sub-fields
+
+**Validate claims.json:**
+
+```bash
+CLAIMS_FILE="$SESSION_DIR/claims.json"
+if [ ! -f "$CLAIMS_FILE" ]; then
+  echo "❌ Validation failed: claims.json not found at $CLAIMS_FILE"
+  echo "   Phase 6 aborted. Run Phase 1 first."
+  exit 1
+fi
+```
+
+Parse and check using the validation rules from [Artifact Schemas > claims.json](#claimsjson):
+
+1. File must be valid JSON
+2. `schema_version` must equal `1`
+3. `claims` array must be non-empty
+4. Each claim must have non-null `id`, `text`, `category`
+
+**On any validation failure:**
+
+```
+❌ Validation failed: <artifact>.json
+   Field: <field_name>
+   Error: <missing | null | empty array | wrong type (expected <type>, got <type>)>
+   Phase 6 aborted. Fix the artifact and re-run.
+```
+
+Report ALL failures (not just the first one), then abort.
+
+**Validate diff-map.json** (required for fix-verify loop repository context):
+
+```bash
+DIFFMAP_FILE="$SESSION_DIR/diff-map.json"
+if [ ! -f "$DIFFMAP_FILE" ]; then
+  echo "⚠️  diff-map.json not found at $DIFFMAP_FILE"
+  echo "   Fix-verify loop will be disabled — disputed claims cannot be rechecked without repo context."
+  DIFFMAP_AVAILABLE=false
+else
+  DIFFMAP_AVAILABLE=true
+fi
+```
+
+If `DIFFMAP_AVAILABLE=true`, validate:
+
+1. File must be valid JSON
+2. `clone_path` must be a non-empty string
+3. The directory at `clone_path` must exist and contain a `.git` directory
+4. `base_sha` and `head_sha` must be non-empty strings
+
+```bash
+if [ "$DIFFMAP_AVAILABLE" = true ]; then
+  CLONE_PATH=$(jq -r '.clone_path // empty' "$DIFFMAP_FILE")
+  BASE_SHA=$(jq -r '.base_sha // empty' "$DIFFMAP_FILE")
+  HEAD_SHA=$(jq -r '.head_sha // empty' "$DIFFMAP_FILE")
+
+  DIFFMAP_VALID=true
+  if [ -z "$CLONE_PATH" ]; then
+    echo "⚠️  diff-map.json: clone_path is missing or empty"
+    DIFFMAP_VALID=false
+  elif [ ! -d "$CLONE_PATH/.git" ]; then
+    echo "⚠️  diff-map.json: clone_path ($CLONE_PATH) is not a valid git repository"
+    DIFFMAP_VALID=false
+  fi
+  if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+    echo "⚠️  diff-map.json: base_sha or head_sha is missing"
+    DIFFMAP_VALID=false
+  fi
+
+  if [ "$DIFFMAP_VALID" = false ]; then
+    echo "   Fix-verify loop will be disabled — repo context is incomplete."
+    DIFFMAP_AVAILABLE=false
+  else
+    echo "Repository context: $CLONE_PATH ($BASE_SHA..$HEAD_SHA)"
+  fi
+fi
+```
+
+> **Impact of missing diff-map.json:** Phase 6 claim selection and initial verification proceed normally (they only need analysis.json and claims.json). Only the fix-verify loop in Step 6.3 is affected — if `DIFFMAP_AVAILABLE=false`, disputed claims are marked as unresolved instead of entering the recheck cycle.
+
+**Extract working variables after validation passes:**
+
+```bash
+TOTAL_CLAIMS=$(cat "$CLAIMS_FILE" | jq '.claims | length')
+TOTAL_ANALYZED=$(cat "$ANALYSIS_FILE" | jq '.claims_analyzed | length')
+
+echo "Total claims: $TOTAL_CLAIMS"
+echo "Total analyzed: $TOTAL_ANALYZED"
+echo "Diff-map available: $DIFFMAP_AVAILABLE"
+```
+
+### Step 6.1 — Top 10 Claim Selection (D2)
+
+Select the top 10 claims for verification, sorted by significance. The significance priority order is:
+
+```
+security > consensus > feature > parameter
+```
+
+**Mapping from claim `category` to significance tier:**
+
+| Claim category | Significance tier | Priority |
+|---------------|-------------------|----------|
+| `security` | security | 1 (highest) |
+| `architecture` | consensus | 2 |
+| `governance` | consensus | 2 |
+| `performance` | feature | 3 |
+| `tooling` | feature | 3 |
+| `deprecation` | feature | 3 |
+| `other` | parameter | 4 (lowest) |
+
+**Selection algorithm:**
+
+1. Join `claims.json` claims with `analysis.json` claims_analyzed by `claim_id`
+2. Assign each joined claim a significance tier based on its `category`
+3. Within each tier, sort by `verification_status` priority: `unverified` > `partially_verified` > `verified` (unverified claims are more valuable to verify independently)
+4. Within the same status, sort by evidence count (ascending — fewer evidence items = more scrutiny needed)
+5. Take the top 10 claims from this sorted list
+
+If there are fewer than 10 claims total, use all claims.
+
+**Build the verification payload:**
+
+For each selected claim, assemble:
+
+```json
+{
+  "claim_id": "<claim.id>",
+  "claim_text": "<claim.text>",
+  "category": "<claim.category>",
+  "original_status": "<analysis.verification_status>",
+  "evidence": [<analysis.evidence array>],
+  "code_snippets": [<analysis.code_snippets array, if available>],
+  "analysis_notes": "<analysis.analysis_notes>"
+}
+```
+
+**Prompt budget check (~8KB):**
+
+```
+Role: ~200 bytes
+Instructions: ~1KB
+Output format: ~800 bytes
+Claims + evidence: remaining budget (~6KB)
+```
+
+Estimate the byte size of the claims payload. If the 10 claims exceed ~6KB:
+1. Truncate `code_snippets[].content` to first 20 lines per snippet
+2. If still over budget, truncate `evidence[].description` to 100 characters each
+3. If still over budget, reduce to 8 claims, then 6, then 5 (minimum)
+
+Print: `Selected <N> claims for verification (significance: <tier distribution>)`
+
+### Step 6.2 — Agent Subagent Dispatch (D2)
+
+Dispatch the verification as an independent Agent subagent. The subagent has no access to the current conversation context — it receives only the bounded prompt.
+
+**Verification prompt:**
+
+```
+You are the Devil's Advocate Reviewer. Your job is to independently verify whether
+the evidence actually supports each claim. Be skeptical. Do not defer to the original
+analysis — form your own judgment from the evidence provided.
+
+## Claims to Verify
+
+<JSON array of verification payload from Step 6.1>
+
+## Instructions
+
+For each claim:
+
+1. Read the claim text carefully.
+2. Read ALL evidence items and code snippets provided.
+3. Independently assess whether the evidence supports the claim:
+   - **confirmed**: The evidence clearly and directly supports the claim. The code
+     snippets show the described change was implemented as stated.
+   - **partial**: Some evidence exists but it only partly supports the claim. Key
+     aspects of the claim are unsupported or the evidence is indirect/ambiguous.
+   - **unconfirmed**: The evidence provided does not adequately support this claim.
+     The code snippets don't show what the claim describes, or the connection is
+     too tenuous.
+   - **contradicted**: The evidence actively contradicts the claim. The code shows
+     something different from what was claimed.
+
+4. Provide your reasoning (1-3 sentences). Be specific about what evidence you
+   examined and why you reached your conclusion.
+
+5. State whether you agree with the original assessment.
+
+6. If you have general concerns about the analysis methodology or evidence quality,
+   note them separately.
+
+## Output Format
+
+Return a JSON object with this exact structure:
+
+{
+  "reviews": [
+    {
+      "claim_id": "<claim id>",
+      "reviewer_assessment": "confirmed | partial | unconfirmed | contradicted",
+      "reasoning": "<1-3 sentences>",
+      "agrees_with_original": true | false
+    }
+  ],
+  "reviewer_concerns": [
+    {
+      "severity": "high | medium | low",
+      "description": "<concern description>",
+      "affected_claims": ["<claim_id>", ...]
+    }
+  ]
+}
+
+IMPORTANT:
+- Output ONLY valid JSON. No prose, no markdown, no commentary.
+- You MUST include an entry for EVERY claim provided.
+- Be genuinely skeptical — your value comes from catching mistakes, not confirming them.
+- "confirmed" should mean you would stake your reputation on this claim being true.
+```
+
+**Dispatch via Agent tool:**
+
+```
+Agent({
+  description: "Verification of upgrade analysis claims",
+  prompt: <assembled prompt from above>
+})
+```
+
+**Parse the subagent response:**
+
+1. Extract the JSON from the response (handle cases where the agent wraps JSON in markdown code fences)
+2. Validate the response structure:
+   - `reviews` array must be present and non-empty
+   - Each review must have `claim_id`, `reviewer_assessment`, `reasoning`, `agrees_with_original`
+   - `reviewer_assessment` must be one of: `confirmed`, `partial`, `unconfirmed`, `contradicted`
+3. Verify completeness: every claim_id from the input payload must appear in the response
+4. If any claims are missing from the response, log a warning and mark them as `unconfirmed` with reasoning: "Verification agent did not produce an assessment for this claim."
+
+### Step 6.3 — Dispute Detection and Fix-Verify Loop
+
+**Detect disputes:**
+
+For each reviewed claim, compare the reviewer's assessment with the original `verification_status`:
+
+| Original status | Reviewer assessment | Dispute? |
+|----------------|--------------------|---------:|
+| `verified` | `confirmed` | No |
+| `verified` | `partial` | **Yes** |
+| `verified` | `unconfirmed` | **Yes** |
+| `verified` | `contradicted` | **Yes** |
+| `partially_verified` | `confirmed` | No (upgrade) |
+| `partially_verified` | `partial` | No |
+| `partially_verified` | `unconfirmed` | **Yes** |
+| `partially_verified` | `contradicted` | **Yes** |
+| `unverified` | `confirmed` | **Yes** (Phase 3 may have missed evidence) |
+| `unverified` | `partial` | **Yes** |
+| `unverified` | `unconfirmed` | No |
+| `unverified` | `contradicted` | No |
+
+A dispute occurs when `agrees_with_original == false` AND the status mapping above indicates disagreement. The explicit `agrees_with_original` field takes precedence — if the reviewer says they agree despite a status difference (e.g., they consider "partial" close enough to "verified"), it is NOT a dispute.
+
+**Fix-verify loop:**
+
+> **Pre-condition:** The fix-verify loop requires `DIFFMAP_AVAILABLE=true` (set in Step 6.0). If `DIFFMAP_AVAILABLE=false`, skip the loop entirely — mark all disputed claims as unresolved and set `verification_status = "partial"` with a note: "Fix-verify loop skipped — repository context unavailable (diff-map.json missing or invalid)."
+
+```
+IF DIFFMAP_AVAILABLE == false AND DISPUTES is non-empty:
+  Print: "⚠️  Skipping fix-verify loop — diff-map.json unavailable. <len(DISPUTES)> disputes remain unresolved."
+  Mark verification_status = "partial"
+  SKIP to Step 6.4
+
+DISPUTES = [claims where dispute == true]
+ROUND = 0
+MAX_ROUNDS = 3
+ALL_REVIEWS = <initial reviews from Step 6.2>
+
+LOOP:
+  IF DISPUTES is empty:
+    BREAK — all claims verified or agreed upon
+
+  IF ROUND >= MAX_ROUNDS:
+    Print: "⚠️  Fix-verify loop cap reached (3 rounds). <len(DISPUTES)> unresolved disputes remain."
+    FOR each unresolved dispute:
+      Print: "  - <claim_id>: Phase 3 says <original_status>, reviewer says <reviewer_assessment>"
+    Mark verification_status = "partial"
+    BREAK
+
+  ROUND += 1
+
+  Print: "Fix-verify round <ROUND>/<MAX_ROUNDS>: <len(DISPUTES)> disputes to resolve"
+
+  ## Phase 3 Recheck
+  For each disputed claim:
+    - Re-read the claim and evidence from analysis.json
+    - Fetch broader context from the code at <clone_path> (from diff-map.json):
+      expand the file search to include files in the same directory as existing
+      evidence, and files matching additional keywords from the claim text
+    - Re-assess the verification_status with the new evidence
+
+  Dispatch recheck via Agent tool:
+
+    "You are the Implementation Analyst performing a targeted recheck.
+
+    The following claims had their evidence challenged by an independent reviewer.
+    For each claim, the reviewer's concern is provided. Your job is to search for
+    additional evidence that addresses the reviewer's specific concern.
+
+    ## Context
+    - Session directory: <SESSION_DIR>
+    - Repository clone: <clone_path> (from diff-map.json)
+    - Diff range: <BASE_SHA>..<HEAD_SHA>
+
+    Use Bash and Read to search for additional evidence in the repository clone directory.
+
+    Claims to recheck:
+    <For each disputed claim: claim_id, claim_text, original evidence,
+     reviewer's assessment, reviewer's reasoning>
+
+    For each claim:
+    1. Consider the reviewer's specific objection.
+    2. Search the repository clone at <clone_path> for additional evidence:
+       - Look in the same directories as existing evidence files
+       - Search for files matching keywords from the claim text
+       - Use git diff <BASE_SHA>..<HEAD_SHA> with broader file patterns
+    3. Determine if there is additional evidence that addresses the concern.
+    4. Provide an updated verification_status and explanation.
+
+    Output as JSON array:
+    [{
+      'claim_id': '<id>',
+      'updated_status': 'verified | partially_verified | unverified',
+      'recheck_notes': '<what you found that addresses or fails to address the concern>'
+    }]"
+
+  ## Re-verify with new subagent
+  For each rechecked claim, assemble updated payload containing:
+    - Original claim data (claim_id, claim_text, category)
+    - Original evidence from analysis.json
+    - The recheck subagent's recheck_notes as a "recheck_context" field
+    - The recheck subagent's updated_status
+  Dispatch a NEW Agent subagent with the same verification prompt from Step 6.2,
+  but only for the disputed claims, and with the recheck_context appended to each
+  claim's data so the reviewer can see what Phase 3 found on recheck.
+
+  Parse the new reviewer response.
+
+  ## Check resolution
+  For each dispute:
+    IF new reviewer agrees with updated status:
+      Mark dispute as resolved
+      Record round details in reviews[].rounds[]
+    ELSE:
+      Dispute persists — will be retried in next round (if rounds remain)
+
+  Update DISPUTES = [still-unresolved disputes]
+
+  GOTO LOOP
+```
+
+### Step 6.4 — Build verification-report.json
+
+Assemble the `verification-report.json` artifact following the schema from [Artifact Schemas > verification-report.json](#verification-reportjson):
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "<ISO 8601 timestamp>",
+  "verification_status": "<verified | partial>",
+  "total_rounds": <ROUND>,
+  "claims_reviewed": <number of claims sent to verification>,
+  "claims_total": <TOTAL_CLAIMS>,
+  "selection_criteria": "top <N> by significance (security > consensus > feature > parameter)",
+  "reviews": [
+    <merged review data with round history for each claim>
+  ],
+  "reviewer_concerns": [
+    <concerns from the initial and any subsequent verification rounds>
+  ],
+  "summary": {
+    "confirmed": <count>,
+    "partial": <count>,
+    "unconfirmed": <count>,
+    "contradicted": <count>,
+    "disputes_found": <count>,
+    "disputes_resolved": <count>,
+    "disputes_unresolved": <count>
+  }
+}
+```
+
+**Determine `verification_status`:**
+- `"verified"`: No unresolved disputes remain (all disputes resolved or no disputes were found)
+- `"partial"`: At least one dispute remains unresolved after max rounds
+
+**Compute summary counts:** Count from the **initial** `reviewer_assessment` for each review (before any round resolution). `confirmed` = count where `reviews[].reviewer_assessment == "confirmed"`, `partial` = count where initial assessment == `"partial"`, `unconfirmed` = count where initial assessment == `"unconfirmed"`, `contradicted` = count where initial assessment == `"contradicted"`. Round resolution changes are tracked in `reviews[].rounds[]` only — they do not update summary counts.
+
+**Write to:** `{session_dir}/verification-report.json`
+
+### Step 6.5 — Generate verification-report.md
+
+Generate a human-readable markdown report from the structured JSON data.
+
+**File:** `{session_dir}/verification-report.md`
+
+**Template:**
+
+```markdown
+# Verification Report
+
+**Generated:** <ISO 8601 timestamp>
+**Status:** <verification_status> (<"All reviewed claims verified" | "N unresolved disputes">)
+**Claims reviewed:** <N> / <total> (selection: top by significance)
+**Fix-verify rounds:** <total_rounds>
+
+## Summary
+
+| Metric | Count |
+|--------|-------|
+| Confirmed | <N> |
+| Partial | <N> |
+| Unconfirmed | <N> |
+| Contradicted | <N> |
+| Disputes found | <N> |
+| Disputes resolved | <N> |
+| Disputes unresolved | <N> |
+
+## Per-Claim Verification
+
+### <claim_id>: <claim_text (truncated to 80 chars)>
+
+- **Category:** <category>
+- **Original assessment:** <original_status>
+- **Reviewer assessment:** <reviewer_assessment_emoji> <reviewer_assessment>
+- **Agreement:** <✅ Agrees | ❌ Disagrees>
+- **Reasoning:** <reasoning>
+
+<if dispute:>
+#### Dispute Resolution
+
+<for each round:>
+**Round <N>:**
+- Recheck: <recheck_notes>
+- Updated status: <updated_status>
+- Reviewer reassessment: <reviewer_reassessment>
+- Resolved: <✅ Yes | ❌ No>
+
+<end for>
+<end if>
+
+---
+
+<repeat for each claim>
+
+## Reviewer Concerns
+
+<if reviewer_concerns is non-empty:>
+<for each concern:>
+- **[<severity>]** <description>
+  - Affected claims: <affected_claims as comma-separated list>
+<end for>
+<else:>
+No additional concerns raised.
+<end if>
+```
+
+**Write to:** `{session_dir}/verification-report.md`
+
+### Step 6.6 — Self-Validation Gate
+
+Before presenting to the user, validate `verification-report.json` against the schema.
+
+Validation checks:
+
+1. `schema_version` equals `1`
+2. `generated_at` is a valid ISO 8601 timestamp
+3. `verification_status` is one of: `verified`, `partial`
+4. `total_rounds` is a number between 0 and 3
+5. `reviews` array is non-empty
+6. Each review has non-null `claim_id`, `original_status`, `reviewer_assessment`, `reasoning`, `agrees_with_original`, `dispute`
+7. `reviewer_assessment` must be one of: `confirmed`, `partial`, `unconfirmed`, `contradicted`
+8. Each review's `rounds` is an array (may be empty)
+9. Each round (if present) has non-null `round`, `recheck_notes`, `updated_status`, `reviewer_reassessment`, `resolved`
+10. `reviewer_concerns` must be present (may be empty array)
+11. Each concern (if present) has non-null `severity`, `description`, `affected_claims`
+12. `summary` must be present with all required sub-fields
+13. `summary.confirmed + summary.partial + summary.unconfirmed + summary.contradicted` must equal `len(reviews)`
+14. `summary.disputes_resolved + summary.disputes_unresolved` must equal `summary.disputes_found`
+
+**On validation failure:**
+
+```
+❌ Validation failed: verification-report.json
+   Field: <field_name>
+   Error: <missing | null | empty array | wrong type | invalid enum value>
+   Phase 6 self-validation failed. Attempting auto-fix...
+```
+
+Auto-fix attempt: Recalculate summary statistics from the reviews data. If structural issues exist (missing fields in reviews), re-dispatch the verification agent for the affected claims. If the second attempt also fails validation, abort Phase 6 with the error.
+
+### Step 6.7 — User Checkpoint 🧑
+
+Present the verification results to the user for confirmation. This is a mandatory checkpoint.
+
+**Display format:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔎 Phase 6 Complete — Independent Verification
+
+Status:     <verification_status> (<"All reviewed claims verified" | "N unresolved disputes">)
+Claims reviewed:  <N> / <total>
+Fix-verify rounds: <total_rounds>
+
+Verification Summary:
+  Confirmed:      <N> ✅
+  Partial:        <N> ⚠️
+  Unconfirmed:    <N> ❌
+  Contradicted:   <N> 🔴
+
+Disputes:
+  Found:          <N>
+  Resolved:       <N> ✅
+  Unresolved:     <N> ❌
+
+Per-Claim Results:
+| # | Claim (truncated) | Original | Reviewer | Agreement |
+|---|-------------------|----------|----------|-----------|
+| 1 | <claim text, 50 chars> | ✅ verified | ✅ confirmed | ✅ |
+| 2 | <claim text, 50 chars> | ✅ verified | ⚠️ partial | ❌ dispute |
+| ... | ... | ... | ... | ... |
+
+<if reviewer_concerns is non-empty:>
+Reviewer Concerns:
+  <for each: [severity] description>
+<end if>
+
+<if unresolved disputes exist:>
+⚠️  Unresolved disputes — both Phase 3 and reviewer assessments are preserved.
+    The report will present both perspectives for human judgment.
+<end if>
+
+Artifacts saved:
+  • {session_dir}/verification-report.json
+  • {session_dir}/verification-report.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Then ask:
+
+```
+Use AskUserQuestion:
+  question: "Does the verification look correct? Ready to proceed to report generation?"
+  options:
+    - "Looks good — proceed to Phase 5"
+    - "Re-verify specific claims" (user identifies claims to re-run through verification)
+    - "Override verification results" (user manually sets reviewer_assessment for specific claims)
+    - "Abort pipeline"
+```
+
+If the user requests re-verification:
+1. For each flagged claim, re-dispatch the verification agent with broader context
+2. Merge updated results into `verification-report.json`
+3. Re-validate and re-display
+
+If the user overrides verification results:
+1. Update the specified claims' `reviewer_assessment` in `verification-report.json`
+2. Set `agrees_with_original` accordingly
+3. Re-evaluate `dispute` status and `verification_status`
+4. Recalculate summary statistics
+5. Re-validate and save
+
+**Output artifacts:**
+```
+~/.gstack/research/sessions/<chain>-<upgrade>-<date>/verification-report.json
+~/.gstack/research/sessions/<chain>-<upgrade>-<date>/verification-report.md
 ```
 
 ---
@@ -1883,9 +2628,9 @@ For each upstream artifact, attempt to load and validate. Track availability sta
 ```
 ARTIFACTS_STATUS = {}
 
-For each artifact in [claims.json, diff-map.json, analysis.json]:
+For each artifact in [claims.json, diff-map.json, analysis.json, verification-report.json]:
   1. Check file exists: {session_dir}/<artifact>
-  2. If exists: parse JSON, run schema validation (same rules as Phase 3 Step 3.0)
+  2. If exists: parse JSON, run schema validation (same rules as Phase 3 Step 3.0 / Phase 6 Step 6.6)
   3. Record status:
      - "available": file exists AND passes validation
      - "partial": file exists but fails some validation checks (use what's valid)
@@ -1906,8 +2651,11 @@ For each artifact in [claims.json, diff-map.json, analysis.json]:
 | `analysis.json` | partial — `claims_analyzed` valid, `unreported_changes` missing | Claims Analysis section uses available verification data normally. Unclaimed Changes section shows `[DATA UNAVAILABLE — unreported_changes field missing from analysis.json]`. |
 | `analysis.json` | partial — `claims_analyzed` missing, `unreported_changes` valid | Claims listed without verification status (`[ANALYSIS UNAVAILABLE]`). Unclaimed Changes section uses available data normally. |
 | `analysis.json` | partial — other validation failures | Use all parseable fields; mark each invalid/missing sub-section with `[DATA UNAVAILABLE]` and note the specific validation failure. |
+| `verification-report.json` | available | Add "Independent Verification" section to report with per-claim reviewer assessments, disputes, and concerns |
+| `verification-report.json` | missing | Omit "Independent Verification" section entirely (Phase 6 is optional — M1 pipelines won't have this artifact) |
+| `verification-report.json` | corrupt/partial | Add "Independent Verification" section with `[DATA PARTIALLY AVAILABLE]` markers for corrupt fields; use whatever is parseable |
 
-**If ALL three artifacts are missing or corrupt (no artifact has status "available" or "partial"):** abort Phase 5 with:
+**If ALL three required artifacts** (`claims.json`, `diff-map.json`, `analysis.json`) **are missing or corrupt (no required artifact has status "available" or "partial"):** abort Phase 5 with:
 ```
 ❌ Phase 5 aborted: No usable upstream artifacts found in {session_dir}.
    Expected: claims.json, diff-map.json, analysis.json
@@ -1956,7 +2704,16 @@ unreported_changes = analysis.unreported_changes  // array of code-first delta f
 analysis_summary = analysis.summary  // aggregate stats
 ```
 
-**Cross-reference claims with analysis:** If both `claims.json` and `analysis.json` are available, join claims with their analysis results by `claim_id`:
+**From `verification-report.json` (if available — Phase 6 M2 only):**
+```
+verification_status = verification.verification_status  // "verified" or "partial"
+verification_reviews = verification.reviews  // per-claim reviewer assessments
+reviewer_concerns = verification.reviewer_concerns  // general concerns
+verification_summary = verification.summary  // aggregate verification stats
+total_rounds = verification.total_rounds  // fix-verify rounds executed
+```
+
+**Cross-reference claims with analysis and verification:** If `claims.json`, `analysis.json`, and optionally `verification-report.json` are available, join claims with their analysis and verification results by `claim_id`:
 
 ```
 For each claim in claims_list:
@@ -1964,6 +2721,10 @@ For each claim in claims_list:
   IF match found:
     Merge: claim text + category + confidence FROM claims.json
            verification_status + evidence + code_snippets + analysis_notes FROM analysis.json
+    IF verification_reviews is available:
+      Find matching review in verification_reviews where claim_id == claim.id
+      IF match found:
+        Add: reviewer_assessment, reasoning, agrees_with_original, dispute, rounds FROM verification-report.json
   IF no match found (claim exists in claims.json but not in analysis.json):
     Set verification_status = "not_analyzed"
     Set analysis_notes = "This claim has no corresponding entry in analysis.json. Phase 3 may not have processed it."
@@ -2002,6 +2763,9 @@ blockchain researcher can act on.
 ### Unreported Changes (<N total> or "[DATA UNAVAILABLE]")
 <JSON array of unreported_changes, or "[DATA UNAVAILABLE]">
 
+### Verification Data (if Phase 6 was executed, otherwise "[NOT AVAILABLE]")
+<verification_status, verification_reviews, reviewer_concerns, verification_summary, or "[NOT AVAILABLE]">
+
 ### Diff Summary
 <diff-map summary stats, or "[DATA UNAVAILABLE]">
 
@@ -2019,7 +2783,7 @@ replace the content with "[DATA UNAVAILABLE — <reason>]".
 **Commits:** <base_sha>..<head_sha>
 **Source:** <source_url>
 **Generated:** <ISO 8601 timestamp>
-**Pipeline:** harness-research-engineering v1 (M1)
+**Pipeline:** harness-research-engineering v1 (<"M2" if verification-report.json available, else "M1">)
 **Artifacts:** <list which artifacts were available vs missing>
 
 ## Executive Summary
@@ -2047,6 +2811,7 @@ For each claim, output a subsection:
 - **Code:**
   <If code_snippets exist, include the most relevant snippet (fenced code block with file path and line range)>
 - **Notes:** <analysis_notes>
+- **Verification:** <if claim was in top-10 and reviewed: reviewer_assessment_emoji reviewer_assessment — reasoning (truncated to 80 chars) [✅ Agrees | ❌ Disputes]> <if claim was not in top-10: "(not reviewed — outside top 10 by significance)"> <if Phase 6 was not executed: omit this field entirely>
 
 If claims data is unavailable: "[DATA UNAVAILABLE — claims.json was not found or could not be parsed. Phase 1 (Source Ingestion) may not have completed.]"
 
@@ -2066,10 +2831,37 @@ For each change:
 
 If unreported_changes data is unavailable: "[DATA UNAVAILABLE — analysis.json was not found or the code-first delta pass did not complete.]"
 
+## Independent Verification
+
+<if verification-report.json is available:>
+
+**Status:** <verification_status> (<"All reviewed claims verified" | "N unresolved disputes">)
+**Claims reviewed:** <claims_reviewed> / <claims_total>
+**Fix-verify rounds:** <total_rounds>
+
+For each reviewed claim, add a verification note to the claim's section in Claims Analysis above,
+AND list a summary here:
+
+| Claim | Original | Reviewer | Agreement | Notes |
+|-------|----------|----------|-----------|-------|
+| <claim_id> | <original_status> | <reviewer_assessment> | <✅/❌> | <reasoning, truncated> |
+
+### Reviewer Concerns
+
+<for each concern: severity, description, affected claims>
+
+### Unresolved Disputes
+
+<for each unresolved dispute: claim_id, both assessments, round history summary>
+
+<else:>
+[Phase 6 (Independent Verification) was not executed for this analysis. Claims Analysis reflects Phase 3 assessments only.]
+<end if>
+
 ## Methodology
 
 Document the pipeline execution:
-- Pipeline version: harness-research-engineering v1 (M1)
+- Pipeline version: harness-research-engineering v1 (<"M2" if Phase 6 was executed, else "M1">)
 - Phases executed: <list which phases ran successfully>
 - Artifacts status: <for each artifact, state available/partial/missing>
 - Errors or skipped steps: <document any degradation>
@@ -2082,6 +2874,7 @@ Document the pipeline execution:
 - Claims: <session_dir>/claims.json
 - Diff map: <session_dir>/diff-map.json
 - Analysis: <session_dir>/analysis.json
+- Verification: <session_dir>/verification-report.json (if Phase 6 was executed)
 - Source snapshot: <session_dir>/source-snapshot.md
 
 ---
@@ -2113,17 +2906,19 @@ Validate the draft report at `{session_dir}/internal-report.draft.md` before pre
 **Validation checks:**
 
 1. **Metadata header present:** The first non-empty line of the report must be `# Protocol Upgrade Analysis:` (prefix match). If the agent prepended commentary or a code fence, this check catches it.
-2. **Required sections present:** All five sections exist as level-2 headings (exact string match at start of line):
+2. **Required sections present:** All required sections exist as level-2 headings (exact string match at start of line) — 5 sections when Phase 6 was not executed, 6 sections when Phase 6 data is available:
    - `## Executive Summary`
    - `## Claims Analysis`
    - `## Unclaimed Changes`
    - `## Methodology`
    - `## Raw Data References`
+   - `## Independent Verification` — check this heading ONLY if `verification-report.json` was available. Omit this check entirely if Phase 6 was not executed.
 3. **No duplicate sections:** Each required level-2 heading appears exactly once. Duplicate headings indicate a splicing error.
 4. **Metadata fields present:** Report contains `**Repo:**`, `**Commits:**`, `**Source:**`, `**Generated:**`
 5. **Claims completeness:** If `claims.json` was available, count the number of `### Claim ` sub-headings (note trailing space — match `### Claim \d+:` pattern to avoid false positives from claim text). The count must equal the number of input claims. If any claims are missing from the report, list the missing claim IDs.
-6. **No empty sections:** Each section has at least 20 characters of non-whitespace content below its heading. `[DATA UNAVAILABLE ...]` markers count as valid content (they are the expected output for degraded sections).
+6. **No empty sections:** Each section has at least 20 characters of non-whitespace content below its heading. `[DATA UNAVAILABLE ...]` and `[Phase 6 ... was not executed ...]` markers count as valid content (they are the expected output for degraded/skipped sections).
 7. **Unreported changes completeness:** If `analysis.json` was available and had `unreported_changes`, verify they appear in the report
+8. **Verification completeness:** If `verification-report.json` was available, verify that the `## Independent Verification` section contains the verification summary table and reviewer concerns
 
 **On validation failure:**
 
@@ -2175,6 +2970,14 @@ Claims Breakdown:
   Unavailable:  <N> 🔲
 
 Unreported Changes: <N total> (<N high> 🔴, <N medium> 🟡, <N low> 🟢)
+
+<if verification-report.json was available:>
+Independent Verification:
+  Status:     <verification_status>
+  Reviewed:   <N> / <total> claims
+  Disputes:   <N found> → <N resolved> ✅ / <N unresolved> ❌
+  Rounds:     <total_rounds>
+<end if>
 ```
 
 **Claims Breakdown computation:**
@@ -2248,6 +3051,11 @@ The following error handling framework applies across all pipeline phases. Phase
 | Phase 5 | Upstream artifact missing | Generate partial report, mark missing sections `[DATA UNAVAILABLE]` |
 | Phase 5 | Upstream artifact corrupt (invalid JSON) | Treat as missing; note corruption in Methodology section |
 | Phase 5 | Report generation agent produces incomplete output | Auto-fix: regenerate failed sections (max 1 retry) |
+| Phase 6 | Verification subagent returns invalid JSON | Parse recovery: strip markdown fences, re-parse. If still invalid, re-dispatch once. If second attempt fails, abort Phase 6 with warning — pipeline continues without verification. |
+| Phase 6 | Verification subagent drops claims from response | Mark missing claims as `unconfirmed` with reasoning noting agent failure |
+| Phase 6 | Fix-verify loop cap reached (3 rounds) | Preserve both assessments, mark `verification_status: "partial"`, proceed to report |
+| Phase 6 | analysis.json or claims.json missing/corrupt | Abort Phase 6 — verification cannot proceed without upstream analysis. Pipeline continues to Phase 5 without verification data. |
+| Phase 6 | diff-map.json missing/corrupt or clone_path invalid | Skip fix-verify loop only — initial verification (Steps 6.1-6.2) proceeds normally. Disputed claims remain unresolved, `verification_status: "partial"`. |
 
 **Error handling philosophy:** Phase 5 always attempts to produce output. The only condition that aborts Phase 5 is ALL upstream artifacts being missing. Any other combination of missing/partial/corrupt artifacts results in a degraded but functional report.
 
@@ -2257,7 +3065,7 @@ The following error handling framework applies across all pipeline phases. Phase
 
 If the skill is interrupted, errors out, or the user aborts mid-pipeline:
 
-- **Phases 1-5:** Partial artifacts are saved to disk. No knowledge index entry is created. v1 does NOT support resume-from-phase. If interrupted, re-run from scratch. Partial artifacts remain on disk for manual reference.
+- **Phases 1-6:** Partial artifacts are saved to disk. No knowledge index entry is created. v1 does NOT support resume-from-phase. If interrupted, re-run from scratch. Partial artifacts remain on disk for manual reference.
 - **Temp repo clone:** Always clean up on exit (success, error, or abort). Stale directories (>24h in `~/.gstack/tmp/research-*`) are cleaned on next invocation by the preamble.
 - **Linear issues:** Sub-issues remain in their current state (In Progress, not Done). The user must manually resolve or re-run.
 
