@@ -4273,12 +4273,34 @@ FILTER RULES (applied to all extracted content):
 ```
 IF INDEX_AVAILABLE == "yes":
   Read research-index.jsonl
-  Find the entry matching the current analysis (by chain + upgrade_name)
-  Extract public fields:
-    - public.executive_summary (may supplement the Overview)
-    - public.claims_summary (total, confirmed, partial, unconfirmed, contradicted)
-    - public.source_url
-    - public.generated_at
+  
+  # Use the same dedup_key as Phase 7 for robust matching:
+  DEDUP_KEY = "{CHAIN_SLUG}:{UPGRADE_SLUG_LOWER}:{REPO_SHORT}"
+  # Where REPO_SHORT is extracted from the internal report metadata header (repo field)
+  # and UPGRADE_SLUG_LOWER is the lowercased, hyphenated upgrade name.
+  
+  Find the entry where dedup_key == DEDUP_KEY
+  
+  IF no exact match found:
+    # Fallback: try chain + upgrade_name (case-insensitive) but warn about ambiguity
+    MATCHES = entries where chain matches AND upgrade_name matches (case-insensitive)
+    IF len(MATCHES) == 0:
+      Print: "ℹ️ No matching knowledge index entry found. Proceeding with internal report only."
+      INDEX_ENTRY = null
+    ELIF len(MATCHES) == 1:
+      INDEX_ENTRY = MATCHES[0]
+    ELSE:
+      Print: "⚠️ Multiple knowledge index entries match (chain + upgrade_name). Using the most recent."
+      INDEX_ENTRY = entry with latest public.generated_at
+  ELSE:
+    INDEX_ENTRY = matched entry
+  
+  IF INDEX_ENTRY != null:
+    Extract public fields:
+      - public.executive_summary (may supplement the Overview)
+      - public.claims_summary (total, confirmed, partial, unconfirmed, contradicted)
+      - public.source_url
+      - public.generated_at
 ```
 
 ### Step 8.2 — Generate Public Summary
@@ -4444,7 +4466,18 @@ Validate the draft summary at `{session_dir}/public-summary.draft.md` before pre
 - **Missing section:** Re-dispatch with the section-specific prompt.
 - **Missing disclaimer:** Append the disclaimer to the end of the file.
 
-If auto-fix also fails validation, proceed with the summary and note validation issues in the approval step.
+If auto-fix also fails validation after **2 attempts**, STOP and print:
+
+```
+🛑 Code-leak validation failed after auto-fix. Cannot proceed with public summary.
+   Remaining issues:
+   <list of unresolved validation failures>
+
+   Manual intervention required. Review the draft at {session_dir}/public-summary.draft.md
+   and re-invoke Phase 8 after correcting the source data.
+```
+
+Do NOT proceed to Step 8.5 while any code-leak check (check 3) fails. Non-leak validation failures (checks 1, 2, 4, 5, 6) may proceed with a warning note in the approval step.
 
 ### Step 8.5 — User Checkpoint 🧑 (Section-by-Section Approval)
 
@@ -4494,6 +4527,8 @@ For each SECTION in SECTIONS:
      IF "Edit":
        Ask user for their edits (free-text input via AskUserQuestion)
        Apply edits to the section content
+       ⚠️ RE-VALIDATE: Run Step 8.4 checks 3 (code leaks) on the edited section content only.
+         If code leak detected → display warning and re-ask for edits (do NOT approve a section with leaks)
        Re-display the modified section
        Loop back to step 3 for this section (re-ask approval)
      
@@ -4503,6 +4538,9 @@ For each SECTION in SECTIONS:
           Previous version was rejected by the reviewer. Write a new version.
           Output ONLY the section content, starting with '## <SECTION>'."
        Replace section in the draft
+       ⚠️ RE-VALIDATE: Run Step 8.4 checks 3 (code leaks) on the regenerated section content.
+         If code leak detected → auto-fix once (re-dispatch with leak emphasis), then display result.
+         If still leaking after auto-fix → display warning and ask user to Edit manually or Abort.
        Re-display the regenerated section
        Loop back to step 3 for this section (re-ask approval)
      
@@ -4544,20 +4582,32 @@ FINAL_CONTENT = """
 """
 ```
 
-2. **Write the final file:**
+2. **Final validation pass:** Before writing, run Step 8.4 check 3 (code leak detection) on the entire assembled `FINAL_CONTENT`. This is a safety net — individual sections were validated during approval, but the assembly step (metadata header, section concatenation) could introduce new leak vectors.
+
+   If any code leak is found in the assembled content:
+   ```
+   🛑 Final assembly validation FAILED — code leak detected in assembled content:
+      <offending patterns>
+   
+   The public summary will NOT be written. Review the flagged content and re-run Phase 8.
+   Draft preserved at {session_dir}/public-summary.draft.md
+   ```
+   Do NOT write `public-summary.md`. STOP Phase 8.
+
+3. **Write the final file:**
 
 ```bash
 # Write to final path
 Write {session_dir}/public-summary.md with FINAL_CONTENT
 ```
 
-3. **Delete the draft:**
+4. **Delete the draft:**
 
 ```bash
 rm -f {session_dir}/public-summary.draft.md
 ```
 
-4. **Output confirmation:**
+5. **Output confirmation:**
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
