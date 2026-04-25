@@ -1,80 +1,43 @@
-# Review Context — WHI-235: Phase 7 Knowledge Index Management
+# Review Context — WHI-237: Linear 集成（opt-in + lazy issue 创建 + graceful degradation）
 
 ## Implementation Summary
 
-Added the complete Phase 7 (Knowledge Index Management) section to `harness-research-engineering/SKILL.md`. Phase 7 persists analysis results to `~/.gstack/research/research-index.jsonl` as append-only JSONL entries with public/internal field separation. Implementation includes dedup check with composite key, malformed JSON resilience, atomic overwrite operations, and comprehensive error handling.
-
-Key decisions:
-- Dedup key uses all-lowercase fields for case-insensitive matching (addresses D4)
-- Repo URL normalization is explicit with 5-step rules (strip protocol, hostname, .git, trailing slash)
-- Overwrite operation is atomic: filter + append + mv in single pass with cleanup trap
-- Write verification failure blocks the success checkpoint (no false success)
-- Claims summary field names are explicitly cross-referenced with analysis.json schema
+Added opt-in Linear progress tracking to the harness-research-engineering pipeline. The integration creates a parent Linear issue and lazy sub-issues per phase, with graceful degradation on all API failures. Key design decisions: `--linear` flag is the only activation path (D14), sub-issues are created lazily as each phase starts (D5), and all Linear API calls are wrapped with warning logs that never block the pipeline.
 
 ## Files Changed
 
-- `skills/harness-research-engineering/SKILL.md` — Added Phase 7 section (Steps 7.0-7.6), knowledge_index_agent role, research-index.jsonl schema, updated ToC, validation summary table, D9 error handling table, and Failure/Abort section
+- `skills/harness-research-engineering/SKILL.md` — Added new `## Linear Integration` section with 4 lifecycle steps (L.1–L.4), added `linear_project` to Input Resolution table, inserted `linear_phase_start/complete/failed` hooks at all 7 phase boundaries, updated Methodology section to include Linear status, updated Failure and Abort section with Linear cleanup behavior.
 
 ## Adversarial Review Findings
 
 ### Addressed (Critical/High)
 
-| ID | Severity | Description | Fix |
-|----|----------|-------------|-----|
-| C1 | CRITICAL | Non-atomic overwrite creates corruption window | Made overwrite atomic: filter + append in temp file, then single mv |
-| C2 | CRITICAL | mktemp temp file leaks on failure | Added trap for cleanup, temp file in same directory as index |
-| H1 | HIGH | Dedup key case-sensitive on upgrade_name | Lowercase all components in dedup_key |
-| H2 | HIGH | No repo URL normalization algorithm | Added explicit 5-step normalization rules with examples |
-| H3 | HIGH | Write verification non-fatal, shows success after corruption | Verification failure now blocks Step 7.6 success banner |
-| H4 | HIGH | claims_summary field name mismatch not cross-validated | Added explicit mapping table and missing-field warnings |
-| H5 | HIGH | full_claims join key unspecified | Specified join on claim.id == claims_analyzed[].claim_id |
-| H6 | HIGH | trap cleared before confirming mv success | Added mv failure guard with abort and recovery info |
+1. **Finding 1 — Parent issue marked Done before Phase 7 (Critical)**: Fixed by deferring Step L.4 from Phase 5 to Phase 7 completion in M2 pipelines. Phase 5 now only triggers L.4 when Phase 7 won't run.
+
+2. **Finding 2 — Unreachable enabling condition 2 (Major)**: Fixed by removing condition 2 entirely. `--linear` flag is now documented as the single activation path.
+
+3. **Finding 3 — Phase 7 missing failure hook (Major)**: Fixed by adding `linear_phase_failed` calls + `linear_final_report_comment()` to Phase 7's two abort paths in the error handling table.
+
+4. **Finding 4 — Ambiguous Step L.4 error message (Minor)**: Fixed by splitting into separate messages for comment failure vs state-change failure.
+
+5. **Finding 5 — `linear_final_report_comment()` not formally defined (Minor)**: Fixed by adding formal function name in Step L.4 header.
+
+6. **Finding 6 — `\n` escape sequences violating MCP contract (Minor)**: Fixed by replacing with block scalar (`|`) style.
 
 ### Remaining (Medium/Low — not auto-fixed)
 
-| ID | Severity | Description | Recommendation |
-|----|----------|-------------|----------------|
-| M1 | MEDIUM | Phase numbering gap in ToC (1,2,3,5,7) | Cosmetic — matches the actual phase numbers used in the project |
-| M2 | MEDIUM | Session dir recovery glob injection | Mitigated by Phase 1 slugification which strips special chars |
-| M3 | MEDIUM | Executive summary truncation at non-sentence boundary | Consider adding sentence-boundary detection in future |
-| M4 | MEDIUM | contradicted field forward-compatibility hazard | Document in schema when Phase 6 verification is implemented |
-| M5 | MEDIUM | Informational checkpoint can't rollback | By design — append-only. Dedup handles re-runs. |
-| M6 | MEDIUM | ARTIFACTS_STATUS variable defined but unused | Remove or reference in Step 7.2; low impact |
-| M7 | MEDIUM | executive_summary truncation byte-unsafe for UTF-8 | Specify "500 Unicode characters" in future |
-| M8 | MEDIUM | evidence_map_path base not guaranteed consistent | RESEARCH_DIR is hardcoded; document if made configurable |
-| L1 | LOW | schema_version has no migration path | Document when schema v2 is needed |
-| L2 | LOW | Total entry count includes malformed lines | Fixed — now counts parseable entries only |
-| L3 | LOW | generated_at semantics inconsistent | The "current time at Phase 7" interpretation is simpler and documented |
-| L4 | LOW | Overwrite bash snippet used placeholder notation | Fixed — uses bash variables |
-| L5 | LOW | total_claims may under-count if Phase 3 truncated | Pre-existing limitation from Phase 3 spec |
-| L6 | LOW | Step 7.6 had no explicit skip guard | Fixed — added explicit guard |
+1. **Finding 7 — Three unused tools in allowed-tools (Minor)**: `get_issue`, `list_issues`, `save_project` were present before this PR (from WHI-227). Out of scope for WHI-237.
 
 ## PR
 
-https://github.com/Whisker17/my-harness/pull/25
-
-## V2 Convergence Review (Codex↔Opus)
-
-**Rounds:** 3 | **Final verdict:** ✅ PASS — converged
-
-| ID | Sev | Finding | Status | Round |
-|----|-----|---------|--------|-------|
-| F-001 | HIGH | Setup silently weakens Codex plugin invocation guard (setup.sh — not in PR diff) | Rebutted | R1 |
-| F-002 | HIGH | Append verification reports false success after failed write | Confirmed fixed | R2→R3 |
-| F-003 | MEDIUM | Overwrite recovery temp file deleted by trap on mv failure | Confirmed fixed | R2 |
-
-Fix commits: `86ffab7`, `0afa7b7`
-
-Full report: `.reviews/feat-WHI-235-knowledge-index/convergence-report.md`
+https://github.com/Whisker17/my-harness/pull/28
 
 ## Acceptance Criteria Status
 
-- [x] 索引文件位于 `~/.gstack/research/research-index.jsonl` — Step 7.1 defines this path
-- [x] 每次分析完成后 append 一条 JSONL 记录 — Step 7.5 appends single-line JSON
-- [x] dedup 检查：写入前查找 chain+upgrade_name+repo — Step 7.4 with composite key
-- [x] 发现重复时提供三选一：overwrite/keep-both/skip — Step 7.4 AskUserQuestion
-- [x] 索引条目包含 public 字段集和 internal 字段集 — Schema + Step 7.3
-- [x] public 字段：chain, upgrade_name, source_url, executive_summary, claims_summary, generated_at — Schema field reference table
-- [x] internal 字段：repo, base_sha, head_sha, base_ref, head_ref, full_claims, evidence_map_path, verification_status, unclaimed_changes_count — Schema field reference table
-- [x] 读取时能处理 malformed JSON 行（跳过 + 警告） — Step 7.4 malformed JSON handling
-- [x] 目录不存在时自动创建 `~/.gstack/research/` — Step 7.1 mkdir -p
+- [x] 默认关闭 — only enabled with `--linear` flag; `LINEAR_ENABLED = false` by default
+- [x] 不传 Linear 参数时管线正常运行 — all hooks check `LINEAR_ENABLED == false` → no-op
+- [x] 启用时创建父 issue — Step L.2 creates "Protocol Analysis: {chain} {upgrade_name}"
+- [x] 每个 Phase 开始时 lazy 创建 sub-issue — Step L.3 `linear_phase_start()` at all 7 phases
+- [x] sub-issue 状态跟踪 — `linear_phase_complete()` → Done, `linear_phase_failed()` → In Progress + comment
+- [x] 最终报告完成后在父 issue 添加评论 — Step L.4 at M1 Phase 5 / M2 Phase 7 terminal
+- [x] Linear API 调用失败时不阻断管线 — every call has try-catch, logs `[LINEAR WARNING]`, continues
