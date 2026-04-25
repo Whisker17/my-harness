@@ -483,6 +483,7 @@ If validation fails at any phase boundary:
   "summary": {
     "total_claims": 12,
     "verified": 10,
+    "partially_verified": 0,
     "unverified": 2,
     "unreported_change_count": 3
   }
@@ -510,6 +511,7 @@ If validation fails at any phase boundary:
 | `claims_analyzed[].code_snippets[].content` | string | ✅ | The code content |
 | `claims_analyzed[].code_snippets[].annotation` | string | ✅ | Explanation of what the snippet demonstrates |
 | `claims_analyzed[].analysis_notes` | string | ❌ | Free-form notes from the analysis agent |
+| `claims_analyzed[].manual_override` | boolean | ❌ | Set to `true` when the user manually overrode this claim's `verification_status` at the Phase 3 checkpoint |
 | `unreported_changes` | array | ✅ | Code changes NOT tied to any claim — discovered via code-first delta pass (per D12) |
 | `unreported_changes[].file` | string | ✅ | File path |
 | `unreported_changes[].status` | string | ✅ | One of: `added`, `modified`, `deleted`, `renamed` |
@@ -520,6 +522,7 @@ If validation fails at any phase boundary:
 | `summary` | object | ✅ | Aggregate statistics |
 | `summary.total_claims` | number | ✅ | Total claims analyzed |
 | `summary.verified` | number | ✅ | Claims with code evidence |
+| `summary.partially_verified` | number | ✅ | Claims with partial code evidence |
 | `summary.unverified` | number | ✅ | Claims without code evidence |
 | `summary.unreported_change_count` | number | ✅ | Number of code-first delta findings |
 
@@ -531,6 +534,7 @@ If validation fails at any phase boundary:
 - `unreported_changes` must be present (may be empty array — empty is valid, missing is not)
 - `summary` must be present with all required sub-fields
 - `summary.total_claims` must equal `len(claims_analyzed)`
+- `summary.verified + summary.partially_verified + summary.unverified` must equal `summary.total_claims`
 
 ### comparison.json
 
@@ -1484,7 +1488,7 @@ Group claims into batches of 5-8 for processing. Prioritize grouping by `categor
 3. For each category group:
    - If the group has ≤8 claims → it becomes one batch
    - If the group has >8 claims → split into sub-batches of 5-8
-4. If any category group has <5 claims, merge it with the next smallest group (up to 8 total)
+4. If any category group has <5 claims, attempt to merge it with the next-smallest group. If the merged result is ≤8 claims, merge them into one batch. If the merged result would exceed 8, keep the small group as its own batch (batches with <5 claims are allowed when no valid merge target exists). Never create a batch exceeding 8 claims.
 5. Assign batch IDs: `batch-001`, `batch-002`, ...
 
 **Batch context preparation:**
@@ -1586,6 +1590,8 @@ Batch <N>/<total> complete, <claims_processed>/<total_claims> claims processed
 
 **Accumulate results:** After each batch, merge the results into a running `claims_analyzed` array.
 
+**Batch completeness check:** After all batches are processed, verify `len(claims_analyzed) == TOTAL_CLAIMS`. If any claims are missing (batch agent truncated output or dropped claims), identify which `claim_id`s from `claims.json` are absent and re-dispatch those specific claims as a recovery batch. If the recovery batch also fails to produce results for the missing claims, mark them as `unverified` with `analysis_notes: "Claim could not be analyzed — batch processing failed to produce a result for this claim."` to ensure `claims_analyzed` always has exactly one entry per input claim.
+
 ### Step 3.3 — Code-First Delta Pass (D12)
 
 After all claim batches are processed, run an independent scan of the entire diff to find changes NOT covered by claims.
@@ -1671,6 +1677,7 @@ Assemble the `analysis.json` artifact following the schema from [Artifact Schema
   "summary": {
     "total_claims": <total claims analyzed>,
     "verified": <count of verified>,
+    "partially_verified": <count of partially_verified>,
     "unverified": <count of unverified>,
     "unreported_change_count": <count of unreported changes>
   }
@@ -1713,7 +1720,7 @@ If `coverage_ratio < 0.30` (less than 30% of claims have any evidence):
 
 **Gate 2 — Majority unverified warning:**
 
-If more than 50% of claims are `unverified`:
+If `unverified / total_claims > 0.50` (more than 50% of all claims are `unverified`):
 ```
 ⚠️  Machine gate WARNING: >50% of claims are unverified (<unverified>/<total_claims>).
     The analysis may be unreliable. Review the claims and diff range carefully.
@@ -1750,10 +1757,11 @@ Validation checks:
 8. `relevance` must be one of: `high`, `medium`, `low`
 9. `unreported_changes` must be present (may be empty array — empty is valid, missing is not)
 10. Each unreported change (if present) must have non-null `file`, `status`, `lines_changed`, `description`, `significance`
-11. `significance` must be one of: `high`, `medium`, `low`
-12. `summary` must be present with all required sub-fields
-13. `summary.total_claims` must equal `len(claims_analyzed)`
-14. `summary.verified + summary.unverified` plus count of `partially_verified` must equal `summary.total_claims`
+11. `status` must be one of: `added`, `modified`, `deleted`, `renamed`
+12. `significance` must be one of: `high`, `medium`, `low`
+13. `summary` must be present with all required sub-fields
+14. `summary.total_claims` must equal `len(claims_analyzed)`
+15. `summary.verified + summary.partially_verified + summary.unverified` must equal `summary.total_claims`
 
 **On validation failure:**
 
@@ -1783,7 +1791,7 @@ Claims analyzed:    <total_claims>
 
 Evidence coverage:  <coverage_ratio as percentage>%
 <if coverage_ratio < 0.30: show Gate 1 warning>
-<if unverified > 50%: show Gate 2 warning>
+<if (unverified / total_claims) > 0.50: show Gate 2 warning>
 
 Unreported changes: <unreported_change_count>
   High significance:   <high_sig_count>
