@@ -74,7 +74,7 @@ header "Step 2: Installing harness skills"
 
 mkdir -p "$SKILLS_DST"
 
-HARNESS_SKILLS=("harness-dev" "harness-review" "harness-design" "harness-bootstrap")
+HARNESS_SKILLS=("harness-dev" "harness-review" "harness-design" "harness-bootstrap" "harness-review-v2" "harness-design-v2" "harness-triage")
 
 for skill in "${HARNESS_SKILLS[@]}"; do
   src="$SKILLS_SRC/$skill"
@@ -181,6 +181,46 @@ else
   echo "         Without it:  /harness-design will not work; other skills are unaffected"
 fi
 
+# ── Step 5: V2 pipeline prerequisites (optional) ──────
+
+header "Step 5: Checking v2 pipeline prerequisites (optional)"
+
+# Codex CLI
+if command -v codex &>/dev/null; then
+  CODEX_VERSION=$(codex --version 2>/dev/null || echo "unknown")
+  check_pass "Codex CLI found ($CODEX_VERSION)"
+
+  # Check Codex authentication
+  if codex auth status &>/dev/null 2>&1; then
+    check_pass "Codex CLI authenticated"
+  else
+    check_warn "Codex CLI installed but may not be authenticated — run: codex login"
+  fi
+else
+  check_warn "Codex CLI not found (optional, required for v2 pipeline)"
+  echo "         Install: npm install -g @openai/codex"
+  echo "         Auth:    codex login"
+fi
+
+# codex-plugin-cc
+CODEX_PLUGIN_FOUND=false
+if npm list -g codex-plugin-cc &>/dev/null 2>&1; then
+  CODEX_PLUGIN_FOUND=true
+fi
+if $CODEX_PLUGIN_FOUND; then
+  check_pass "codex-plugin-cc installed"
+else
+  check_warn "codex-plugin-cc not found (optional, required for v2 pipeline)"
+  echo "         Install: npm install -g codex-plugin-cc"
+fi
+
+# gstack (also used by v1 design, but required for v2 codex invocation)
+if command -v gstack &>/dev/null || [ -d "$GSTACK_DIR" ]; then
+  check_pass "gstack directory found"
+else
+  check_warn "gstack not found (optional, required for v2 pipeline)"
+fi
+
 # ── Summary ─────────────────────────────────────────────
 
 header "Summary"
@@ -207,6 +247,10 @@ elif [ $WARN -gt 0 ]; then
   echo "    /harness-review WHI-123    — final review + merge"
   echo "    /harness-bootstrap <proj>  — bootstrap a new project"
   echo ""
+  echo "  V2 pipeline (if prerequisites installed):"
+  echo "    /harness-design-v2         — Codex-powered design"
+  echo "    /harness-review-v2         — Codex↔Opus convergence review"
+  echo ""
   exit 0
 else
   green "  All checks passed. You're ready to go!"
@@ -216,6 +260,10 @@ else
   echo "    /harness-bootstrap <proj>  — bootstrap a project repo"
   echo "    /harness-dev WHI-123       — implement a Linear issue"
   echo "    /harness-review WHI-123    — final review + merge"
+  echo ""
+  echo "  V2 pipeline:"
+  echo "    /harness-design-v2         — Codex-powered design"
+  echo "    /harness-review-v2         — Codex↔Opus convergence review"
   echo ""
   exit 0
 fi
