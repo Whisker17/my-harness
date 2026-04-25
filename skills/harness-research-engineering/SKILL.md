@@ -43,7 +43,8 @@ You are a protocol analysis engine for blockchain engineering research. The user
 10. [Phase 4: Cross-Reference Analysis](#phase-4-cross-reference-analysis) — knowledge index query, chain association mapping, cross-version comparison
 11. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
 12. [Phase 7: Knowledge Index Management](#phase-7-knowledge-index-management) — dedup check, public/internal separation, append-only JSONL, malformed line handling
-13. [Failure and Abort](#failure-and-abort) — error handling and cleanup
+13. [Phase 8: Public Summary Output](#phase-8-public-summary-output) — public field filtering, language config (en/zh), section-by-section approval gating
+14. [Failure and Abort](#failure-and-abort) — error handling and cleanup
 
 ---
 
@@ -297,6 +298,22 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
   - Handle malformed JSON lines gracefully: skip the line, log a warning with the line number, continue reading
   - Auto-create `~/.gstack/research/` directory if it does not exist
   - Append the entry as a single-line JSON record to the JSONL file
+
+### 8. public_communications_writer (Phase 8)
+
+- **Mission:** Distill the internal technical analysis into a clear, professional public summary suitable for external stakeholders
+- **Inputs:** `internal-report.md`, knowledge index `public` fields, language configuration
+- **Tools:** Read, Write
+- **Outputs:** `public-summary.md` — public-safe summary with no code, file paths, or internal analysis details
+- **Behavior:**
+  - Reads `internal-report.md` and extracts only public-safe content (no code snippets, file paths, line numbers, internal analysis notes)
+  - Optionally reads knowledge index `public` field set for supplementary data (executive_summary, claims_summary)
+  - Transforms code references into natural language descriptions (e.g., "withdrawal proof mechanism" not "contracts/src/L2/OptimismPortal2.sol:L345")
+  - Transforms file paths into component names (e.g., "L2 bridge contracts" not "contracts/src/L2/")
+  - Summary structure: Overview → Key Changes → Impact Assessment → Verification Status
+  - Language is configurable: English (default) or Chinese (`--lang zh`)
+  - Appends a disclaimer at the end of every summary
+  - Section-by-section user approval: each section is presented individually for confirmation before the full summary is finalized
 
 ---
 
@@ -4142,12 +4159,427 @@ Session:     <session_dir>
 
 ---
 
+## Phase 8: Public Summary Output
+
+> **Implemented by:** WHI-236
+
+Phase 8 generates a public-facing summary from the internal report and knowledge index public fields. The public summary is designed for external stakeholders — team members, partners, community — and explicitly excludes all code snippets, file paths, line numbers, and internal analysis notes.
+
+Phase 8 runs after Phase 7 (knowledge index management) or after Phase 5 (report generation) if the knowledge index phase was skipped. It is an M3 feature.
+
+**Agent role:** `public_communications_writer` (see [Agent Roles > public_communications_writer](#8-public_communications_writer-phase-8))
+
+### Step 8.0 — Input Validation
+
+Phase 8 requires the approved internal report. The knowledge index is optional but used for supplementary public field data.
+
+**Recovering `session_dir`:** Phase 8 runs in the same session as earlier phases. The `SESSION_DIR` variable should still be available. If not (e.g., re-invocation), recover:
+
+```bash
+SESSION_DIR=$(ls -dt "$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-"* 2>/dev/null | head -1)
+if [ -z "$SESSION_DIR" ]; then
+  echo "❌ No session directory found. Run Phase 1 first."
+  exit 1
+fi
+echo "Session directory: $SESSION_DIR"
+```
+
+**Required artifact: internal-report.md**
+
+```bash
+REPORT_FILE="$SESSION_DIR/internal-report.md"
+if [ ! -f "$REPORT_FILE" ]; then
+  echo "❌ Phase 8 aborted: internal-report.md not found at $REPORT_FILE"
+  echo "   Phase 5 must complete and the user must approve the report before Phase 8 can run."
+  exit 1
+fi
+```
+
+**Optional artifact: knowledge index**
+
+```bash
+INDEX_FILE="$HOME/.gstack/research/research-index.jsonl"
+INDEX_AVAILABLE="no"
+if [ -f "$INDEX_FILE" ]; then
+  INDEX_AVAILABLE="yes"
+fi
+echo "Knowledge index: $INDEX_AVAILABLE"
+```
+
+**Detect language configuration:**
+
+Check if the user specified a language flag during pipeline invocation:
+
+```
+IF user input contains "--lang zh" or "--lang chinese":
+  LANG = "zh"
+ELSE:
+  LANG = "en"  // default
+```
+
+### Step 8.1 — Extract Public-Safe Content
+
+Extract content from available sources, filtering out all internal/sensitive details.
+
+**From `internal-report.md`:**
+
+Read the internal report and extract content section by section. For each section, apply the public field filter:
+
+```
+FILTER RULES (applied to all extracted content):
+  1. Code snippets (fenced code blocks with file paths) → natural language description
+     Example: "```solidity\nfunction verifyWithdrawal(...)\n```" → "The withdrawal proof verification mechanism"
+  2. File paths → component names
+     Example: "contracts/src/L2/OptimismPortal2.sol:L345" → "L2 portal contract"
+     Example: "op-node/rollup/derive/pipeline.go" → "derivation pipeline"
+  3. Line numbers → remove entirely
+  4. Internal analysis notes (text containing "analysis_notes", debug references) → remove
+  5. SHA references → remove or generalize ("commit abc123" → "the relevant commit")
+  6. Raw Data References section → do NOT include in public summary
+  7. Methodology section → extract only "Phases executed" and "Pipeline version", omit technical details
+```
+
+**Sections to extract from internal report:**
+
+```
+1. Executive Summary → becomes "Overview" (rewrite for non-technical audience)
+2. Claims Analysis → becomes "Key Changes" (high-level descriptions only, no code)
+3. Unclaimed Changes → contributes to "Impact Assessment" (summarize significance, no file details)
+4. Independent Verification (if present) → contributes to "Verification Status"
+5. Cross-Chain Comparison (if present) → contributes to "Impact Assessment"
+6. Metadata header → extract chain, upgrade name, source URL, timestamp
+```
+
+**From knowledge index (if available):**
+
+```
+IF INDEX_AVAILABLE == "yes":
+  Read research-index.jsonl
+  Find the entry matching the current analysis (by chain + upgrade_name)
+  Extract public fields:
+    - public.executive_summary (may supplement the Overview)
+    - public.claims_summary (total, confirmed, partial, unconfirmed, contradicted)
+    - public.source_url
+    - public.generated_at
+```
+
+### Step 8.2 — Generate Public Summary
+
+Dispatch the `public_communications_writer` via the Agent tool to synthesize the summary.
+
+**Language-specific prompt prefix:**
+
+```
+IF LANG == "zh":
+  LANG_INSTRUCTION = "Write the entire summary in Chinese (简体中文). Use professional, clear language suitable for Chinese-speaking stakeholders. Technical terms may remain in English where conventional (e.g., L2, rollup, EIP)."
+  DISCLAIMER = "⚠️ 免责声明：本摘要由自动化协议分析管线生成。关键决策建议进行人工验证。"
+ELSE:
+  LANG_INSTRUCTION = "Write the entire summary in English. Use clear, professional language suitable for non-technical stakeholders."
+  DISCLAIMER = "⚠️ Disclaimer: Generated by automated protocol analysis pipeline. Manual verification recommended for critical decisions."
+```
+
+**Summary generation prompt:**
+
+```
+You are the Public Communications Writer. Your job is to distill the internal
+technical analysis into a clear, professional summary suitable for external
+stakeholders. You must NOT include any code, file paths, or internal analysis details.
+
+<LANG_INSTRUCTION>
+
+## Input Data
+
+### Metadata
+- Chain: <chain>
+- Upgrade: <upgrade_name>
+- Source: <source_url>
+- Analysis date: <generated_at>
+
+### Executive Summary (from internal report)
+<executive_summary_text>
+
+### Claims Summary
+- Total claims analyzed: <total>
+- Confirmed: <confirmed>
+- Partially confirmed: <partial>
+- Unconfirmed: <unconfirmed>
+
+### Key Changes (extracted from Claims Analysis, filtered)
+<For each claim: claim text and verification status only — NO code, NO file paths>
+
+### Unreported Changes Summary
+<Count and significance distribution only — NO file paths, NO code>
+
+### Verification Data (if available)
+<verification_status, claims_reviewed count, disputes count>
+
+### Cross-Chain Comparison (if available)
+<novel_features count, borrowed_features count, divergent_features count — high-level only>
+
+## Output Template
+
+Generate the public summary using this exact structure:
+
+---
+
+# <upgrade_name> Upgrade Analysis — Public Summary
+
+**Chain:** <chain>
+**Source:** <source_url>
+**Analysis Date:** <generated_at>
+
+## Overview
+
+Write 2-3 paragraphs for a non-technical audience:
+- What is this upgrade about? (plain language, no jargon)
+- Why does it matter? (impact on users, ecosystem)
+- What is the overall assessment?
+
+## Key Changes
+
+For each significant change, write a bullet point:
+- **<Change name>** — <1-2 sentence plain-language description>
+  Status: <✅ Confirmed | ⚠️ Partially confirmed | ❌ Unconfirmed>
+
+Do NOT include:
+- Code snippets or code references
+- File paths or directory structures
+- Line numbers
+- Technical implementation details (function names, variable names, etc.)
+
+DO include:
+- What the change does from a user/ecosystem perspective
+- Why it matters
+- Whether it was verified in the code
+
+## Impact Assessment
+
+Summarize the overall impact:
+- Number of announced changes and their verification status
+- Unreported changes found (count and significance — e.g., "3 unreported changes were found, including 1 of high significance")
+- Cross-chain context (if Phase 4 data available): how this upgrade compares to similar upgrades on other chains
+- Risk areas or concerns (if any unverified claims or high-significance unreported changes)
+
+## Verification Status
+
+Summary of the verification results:
+- Overall confidence level (verified / partial / low_confidence)
+- Claims breakdown: N confirmed, N partial, N unconfirmed out of N total
+- Independent verification results (if Phase 6 was executed)
+- Any unresolved disputes or reviewer concerns (high-level only)
+
+<DISCLAIMER>
+
+---
+
+## Output Rules
+
+- Begin your output IMMEDIATELY with the line: # <upgrade_name> Upgrade Analysis — Public Summary
+- Do NOT wrap the output in a code fence
+- Do NOT add any preamble or commentary before the heading
+- Output the FULL markdown summary — nothing else
+- NEVER include code snippets, file paths, line numbers, or function/variable names
+- Transform all technical references into plain language
+- Keep the tone professional and accessible
+```
+
+### Step 8.3 — Write Draft Summary to Disk
+
+**File:** `{session_dir}/public-summary.draft.md`
+
+Write the generated summary to the **draft** path using the Write tool. The draft is NOT the final deliverable — it is promoted to `public-summary.md` only after the section-by-section user approval in Step 8.5.
+
+### Step 8.4 — Self-Validation Gate
+
+Validate the draft summary at `{session_dir}/public-summary.draft.md` before presenting to the user.
+
+**Validation checks:**
+
+1. **Header present:** The first non-empty line must start with `# ` and contain "Public Summary" (or the Chinese equivalent "公开摘要").
+2. **Required sections present:** All four required sections exist as level-2 headings:
+   - `## Overview` (or `## 概览` if `LANG == "zh"`)
+   - `## Key Changes` (or `## 关键变更`)
+   - `## Impact Assessment` (or `## 影响评估`)
+   - `## Verification Status` (or `## 验证状态`)
+3. **No code leaks:** Scan the entire summary for patterns that indicate leaked internal details:
+   - Fenced code blocks (` ``` `) — FAIL if found
+   - File path patterns (`/`, `.sol`, `.go`, `.ts`, `.js`, `.py` preceded by directory-like text) — FAIL if found
+   - Line number references (`:L\d+`, `line \d+`) — FAIL if found
+   - SHA hashes (40-character hex strings) — FAIL if found
+   - `analysis_notes`, `code_snippets`, `evidence_map_path` — FAIL if found
+4. **Disclaimer present:** The summary ends with the appropriate disclaimer text (last non-empty paragraph).
+5. **No empty sections:** Each section has at least 20 characters of non-whitespace content.
+6. **No duplicate sections:** Each required heading appears exactly once.
+
+**On validation failure:**
+
+```
+❌ Public summary validation failed:
+   <list of failures>
+   Attempting auto-fix...
+```
+
+**Auto-fix strategy:**
+
+- **Code leak detected:** Re-dispatch the agent with a section-specific prompt emphasizing the "no code" constraint. Include the offending text and instruct: "Rewrite this section. The following text was flagged as containing internal details: <offending text>. Replace all code references with natural language descriptions."
+- **Missing section:** Re-dispatch with the section-specific prompt.
+- **Missing disclaimer:** Append the disclaimer to the end of the file.
+
+If auto-fix also fails validation, proceed with the summary and note validation issues in the approval step.
+
+### Step 8.5 — User Checkpoint 🧑 (Section-by-Section Approval)
+
+This is the key differentiator from Phase 5's checkpoint. Instead of approving the entire summary at once, the user reviews and approves each section individually.
+
+**Approval flow:**
+
+```
+SECTIONS = ["Overview", "Key Changes", "Impact Assessment", "Verification Status"]
+// For Chinese: ["概览", "关键变更", "影响评估", "验证状态"]
+
+APPROVED_SECTIONS = {}
+
+For each SECTION in SECTIONS:
+  1. Extract the section content from the draft summary
+     (text between "## <SECTION>" heading and the next "## " heading or disclaimer)
+  
+  2. Display the section to the user:
+     ```
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     📝 Section Review: <SECTION> (<current>/<total>)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     
+     <section content>
+     
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+     ```
+  
+  3. Ask for approval:
+     ```
+     Use AskUserQuestion:
+       question: "Approve this section for the public summary?"
+       options:
+         - "Approve ✅"
+         - "Edit — I want to modify this section"
+         - "Regenerate — rewrite this section"
+         - "Abort — stop the public summary process"
+     ```
+  
+  4. Handle response:
+     IF "Approve ✅":
+       APPROVED_SECTIONS[SECTION] = current content
+       Continue to next section
+     
+     IF "Edit":
+       Ask user for their edits (free-text input via AskUserQuestion)
+       Apply edits to the section content
+       Re-display the modified section
+       Loop back to step 3 for this section (re-ask approval)
+     
+     IF "Regenerate":
+       Re-dispatch the agent with a section-specific prompt:
+         "Regenerate ONLY the '<SECTION>' section. Context: <provide relevant input data for this section>.
+          Previous version was rejected by the reviewer. Write a new version.
+          Output ONLY the section content, starting with '## <SECTION>'."
+       Replace section in the draft
+       Re-display the regenerated section
+       Loop back to step 3 for this section (re-ask approval)
+     
+     IF "Abort":
+       Print: "Public summary aborted. Draft preserved at {session_dir}/public-summary.draft.md"
+       Do NOT create public-summary.md
+       STOP Phase 8
+
+After ALL sections approved:
+  APPROVED_SECTIONS contains the final content for each section
+```
+
+### Step 8.6 — Assemble and Finalize
+
+After all sections are approved:
+
+1. **Assemble the final summary:** Combine the metadata header, all approved sections, and the disclaimer:
+
+```
+FINAL_CONTENT = """
+# <upgrade_name> Upgrade Analysis — Public Summary
+
+**Chain:** <chain>
+**Source:** <source_url>
+**Analysis Date:** <generated_at>
+**Publication Status:** approved
+
+<APPROVED_SECTIONS["Overview"]>
+
+<APPROVED_SECTIONS["Key Changes"]>
+
+<APPROVED_SECTIONS["Impact Assessment"]>
+
+<APPROVED_SECTIONS["Verification Status"]>
+
+---
+
+<DISCLAIMER>
+"""
+```
+
+2. **Write the final file:**
+
+```bash
+# Write to final path
+Write {session_dir}/public-summary.md with FINAL_CONTENT
+```
+
+3. **Delete the draft:**
+
+```bash
+rm -f {session_dir}/public-summary.draft.md
+```
+
+4. **Output confirmation:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Phase 8 Complete — Public Summary Approved
+
+File:    {session_dir}/public-summary.md
+Status:  publication_status: approved
+Language: <en or zh>
+Sections: <N>/<N> approved
+
+Summary Stats:
+  Overview:              <word count> words
+  Key Changes:           <N> items
+  Impact Assessment:     <word count> words
+  Verification Status:   <word count> words
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**Output artifacts:**
+```
+~/.gstack/research/sessions/<chain>-<upgrade>-<date>/public-summary.md
+```
+
+### Per-Phase Error Handling (Phase 8)
+
+| Failure | Recovery |
+|---------|----------|
+| `internal-report.md` missing | Abort Phase 8 with clear message; Phase 5 must run first |
+| Knowledge index missing | Proceed without supplementary data; use internal report only |
+| Agent fails to generate summary | Retry once with simplified prompt (fewer input sections); if still fails, abort |
+| Code leak detected in validation | Auto-fix by re-dispatching agent for offending section with stricter prompt |
+| User aborts mid-approval | Preserve draft at `public-summary.draft.md`; do not create final `public-summary.md` |
+| Language flag unrecognized | Default to English; warn: "Unrecognized language flag — defaulting to English" |
+
+---
+
 ## Failure and Abort
 
 If the skill is interrupted, errors out, or the user aborts mid-pipeline:
 
 - **Phases 1-4, 6:** Partial artifacts are saved to disk. No knowledge index entry is created. v1 does NOT support resume-from-phase. If interrupted, re-run from scratch. Partial artifacts remain on disk for manual reference.
 - **Phase 7:** If interrupted after the append but before confirmation, the index entry is already written (append-only). On re-invocation, the dedup check (Step 7.4) will detect the existing entry and offer overwrite/keep-both/skip. If interrupted before the append, no index entry exists — re-run Phase 7 after ensuring the report is approved.
+- **Phase 8:** If interrupted mid-approval, the draft is preserved at `{session_dir}/public-summary.draft.md`. The final `public-summary.md` is NOT created until all sections are approved. On re-invocation, Phase 8 starts fresh (reads internal-report.md again). The draft file can be manually reviewed or deleted.
 - **Temp repo clone:** Always clean up on exit (success, error, or abort). Stale directories (>24h in `~/.gstack/tmp/research-*`) are cleaned on next invocation by the preamble.
 - **Linear issues:** Sub-issues remain in their current state (In Progress, not Done). The user must manually resolve or re-run.
 
