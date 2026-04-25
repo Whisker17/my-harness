@@ -2704,7 +2704,12 @@ done < "$INDEX_FILE" > "$TEMP_FILE"
 echo "$NEW_ENTRY_JSON" >> "$TEMP_FILE"
 
 # Atomically replace the index file
-mv "$TEMP_FILE" "$INDEX_FILE"
+mv "$TEMP_FILE" "$INDEX_FILE" || {
+  echo "❌ Atomic replace failed: $INDEX_FILE not updated."
+  echo "   Temp file preserved at $TEMP_FILE for manual recovery."
+  echo "   Phase 7 aborted."
+  exit 1
+}
 trap - EXIT  # Clear the cleanup trap on success
 ```
 
@@ -2759,6 +2764,8 @@ fi
 **Note on entry counting:** The "total entries" count should reflect the number of *parseable* JSON lines, not the raw line count. Count lines where `jq -e '.' >/dev/null 2>&1` succeeds.
 
 ### Step 7.6 — User Checkpoint 🧑
+
+**Only execute if write verification succeeded in Step 7.5.** If write verification failed, the error message from Step 7.5 is the terminal output — do NOT display the success banner below.
 
 Present the index entry summary to the user for confirmation. This checkpoint is informational — the entry has already been written (it's append-only, and the user already approved the report in Phase 5).
 
