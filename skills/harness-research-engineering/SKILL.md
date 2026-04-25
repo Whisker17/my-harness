@@ -39,8 +39,8 @@ You are a protocol analysis engine for blockchain engineering research. The user
 6. [Phase 1: Source Ingestion](#phase-1-source-ingestion) — fallback chain fetch, claims extraction, source snapshot, user checkpoint
 7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — treeless clone, fuzzy tag matching, SHA resolution, diff-map generation
 8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — claim batching, evidence mapping, code-first delta pass, quality gates
-9. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
-10. [Phase 6: Verification](#phase-6-verification) — independent claim verification via Agent subagent, dispute detection, fix-verify loop
+9. [Phase 6: Verification](#phase-6-verification) — independent claim verification via Agent subagent, dispute detection, fix-verify loop
+10. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
 11. [Failure and Abort](#failure-and-abort) — error handling and cleanup
 
 ---
@@ -254,7 +254,7 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
 - **Tools:** Write, Read
 - **Outputs:** `internal-report.draft.md` → promoted to `internal-report.md` after user approval (M1 only generates internal report; public summary is M3 scope per D15)
 - **Behavior:**
-  - Report sections: Executive Summary, Claims Analysis (per-claim with evidence), Unclaimed Changes, Methodology, Raw Data References
+  - Report sections: Executive Summary, Claims Analysis (per-claim with evidence), Unclaimed Changes, Independent Verification (if verification-report.json available), Methodology, Raw Data References
   - Every claim references its verification status from `analysis.json` (or marked `[DATA UNAVAILABLE]` if analysis is missing)
   - Internal report uses full code snippets (20-30 lines) from `analysis.json` code_snippets
   - Unclaimed Changes section lists all code-first delta findings from `analysis.json` unreported_changes
@@ -269,6 +269,7 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
 - **Tools:** Dispatched as independent Agent subagent (not same context)
 - **Outputs:** `verification-report.json` — structured per-claim assessment with disputes; `verification-report.md` — human-readable summary
 - **Behavior:**
+  - D2: Significance-based top-N selection and bounded-prompt subagent dispatch — select claims by significance tier, enforce ~8KB prompt budget, dispatch as independent Agent subagent
   - Receives ONLY the top 10 claims (selected by significance priority: security > consensus > feature > parameter) and their evidence from `analysis.json`
   - Does NOT access the original codebase — judges solely from the evidence snippets provided
   - For each claim, independently assesses whether the evidence actually supports the claim
@@ -312,7 +313,7 @@ If validation fails at any phase boundary:
 ### claims.json
 
 **Produced by:** Phase 1 (Source Ingestion)
-**Consumed by:** Phase 3 (Implementation Analysis), Phase 5 (Report Generation)
+**Consumed by:** Phase 3 (Implementation Analysis), Phase 5 (Report Generation), Phase 6 (Verification)
 
 ```json
 {
@@ -444,7 +445,7 @@ If validation fails at any phase boundary:
 ### analysis.json
 
 **Produced by:** Phase 3 (Implementation Analysis)
-**Consumed by:** Phase 4 (Cross-Reference, v2 only), Phase 5 (Report Generation)
+**Consumed by:** Phase 4 (Cross-Reference, v2 only), Phase 5 (Report Generation), Phase 6 (Verification)
 
 ```json
 {
@@ -545,7 +546,7 @@ If validation fails at any phase boundary:
 **Produced by:** Phase 4 (Cross-Reference Agent — v2 only, skipped in M1)
 **Consumed by:** Phase 5 (Report Generation — cross-chain sections)
 
-> **Note:** This schema is defined now for completeness but is only used in M2 when Phase 4 is implemented. In M1, this artifact does not exist and Phase 5 omits cross-chain comparison sections.
+> **Note:** This schema is defined now for completeness but is only used when Phase 4 (cross-chain comparison) is implemented. In M1 and M2, this artifact does not exist and Phase 5 omits cross-chain comparison sections.
 
 ```json
 {
@@ -722,10 +723,10 @@ Phase 6 outputs a structured JSON artifact containing the independent reviewer's
 | `reviewer_concerns[].description` | string | ✅ | Description of the concern |
 | `reviewer_concerns[].affected_claims` | array | ✅ | Claim IDs related to this concern |
 | `summary` | object | ✅ | Aggregate verification statistics |
-| `summary.confirmed` | number | ✅ | Claims where reviewer confirms original assessment |
-| `summary.partial` | number | ✅ | Claims with partial agreement |
-| `summary.unconfirmed` | number | ✅ | Claims reviewer could not confirm |
-| `summary.contradicted` | number | ✅ | Claims where evidence contradicts the claim |
+| `summary.confirmed` | number | ✅ | Count of claims where `reviewer_assessment == "confirmed"` (initial assessment, before any round resolution) |
+| `summary.partial` | number | ✅ | Count of claims where `reviewer_assessment == "partial"` (initial assessment) |
+| `summary.unconfirmed` | number | ✅ | Count of claims where `reviewer_assessment == "unconfirmed"` (initial assessment) |
+| `summary.contradicted` | number | ✅ | Count of claims where `reviewer_assessment == "contradicted"` (initial assessment) |
 | `summary.disputes_found` | number | ✅ | Total disputes triggered |
 | `summary.disputes_resolved` | number | ✅ | Disputes resolved during fix-verify loop |
 | `summary.disputes_unresolved` | number | ✅ | Disputes remaining after max rounds |
@@ -749,7 +750,7 @@ Phase 6 outputs a structured JSON artifact containing the independent reviewer's
 | Phase 3 | claims.json, diff-map.json | Both must pass all validation rules |
 | Phase 4 (v2) | analysis.json, knowledge index | analysis.json must pass; index must have ≥1 entry for a different chain |
 | Phase 5 | claims.json, diff-map.json, analysis.json (+ comparison.json in v2, + verification-report.json in M2) | All must pass validation |
-| Phase 6 (M2) | analysis.json, claims.json | Both must pass all validation rules |
+| Phase 6 (verification) | analysis.json, claims.json | Both must pass all validation rules |
 
 ---
 
@@ -1485,7 +1486,7 @@ If the user provides corrections, update the relevant steps, re-generate diff-ma
 ~/.gstack/tmp/research-<chain>-<upgrade>/
 ```
 
-Cleanup: Clone is kept alive until the pipeline completes (Phase 5 in M1). Cleaned up via bash trap on exit. Stale directories (>24h) are cleaned by the preamble on next invocation.
+Cleanup: Clone is kept alive until the pipeline completes (Phase 5 in M1; Phase 5 in M2 since Phase 6's fix-verify recheck also requires the clone). Cleaned up via bash trap on exit. Stale directories (>24h) are cleaned by the preamble on next invocation.
 
 ---
 
@@ -1941,11 +1942,18 @@ Then ask:
 Use AskUserQuestion:
   question: "Does the analysis look correct? Any claims need re-investigation or manual override?"
   options:
-    - "Looks good — proceed to Phase 5"
+    - "Run verification first (Phase 6 — M2)" (dispatch independent Devil's Advocate verification before report generation)
+    - "Skip verification — proceed to Phase 5" (go directly to report generation without independent verification)
     - "Re-investigate specific claims" (user identifies claims to re-analyze with broader file search)
     - "Override claim statuses" (user manually sets verification_status for specific claims)
     - "Abort pipeline"
 ```
+
+If the user selects "Run verification first (Phase 6 — M2)":
+1. Proceed to Phase 6 (Verification). After Phase 6 completes, the Phase 6 checkpoint will offer "Proceed to Phase 5".
+
+If the user selects "Skip verification — proceed to Phase 5":
+1. Proceed directly to Phase 5. The report will not include Independent Verification data.
 
 If the user requests re-investigation:
 1. For each flagged claim, broaden the file search — include ALL `core` and `new_module` files from `diff-map.json`
@@ -1963,469 +1971,6 @@ If the user overrides claim statuses:
 ```
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/analysis.json
 ```
-
----
-
-## Phase 5: Report Generation
-
-> **Implemented by:** WHI-232
-
-Phase 5 synthesizes all upstream artifacts into a structured internal technical report. This is the M1 terminal phase — the report is the primary deliverable that answers "is this tool useful for researchers?"
-
-**Agent role:** `report_generation_agent` (see [Agent Roles > report_generation_agent](#5-report_generation_agent-phase-5))
-
-### Step 5.0 — Input Validation and Graceful Degradation (D9)
-
-Phase 5 is the pipeline's endpoint and must handle partial upstream failures. Unlike Phases 2-3 which abort on invalid input, Phase 5 generates a **partial report** when artifacts are missing or malformed, annotating each missing section with `[DATA UNAVAILABLE]`.
-
-**Recovering `session_dir`:** Phase 5 runs in the same session as Phases 1-3. The `SESSION_DIR` variable should still be available. If not (e.g., re-invocation), recover:
-
-```bash
-SESSION_DIR=$(ls -dt "$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-"* 2>/dev/null | head -1)
-if [ -z "$SESSION_DIR" ]; then
-  echo "❌ No session directory found. Run Phase 1 first."
-  exit 1
-fi
-echo "Session directory: $SESSION_DIR"
-```
-
-**Artifact availability check:**
-
-For each upstream artifact, attempt to load and validate. Track availability status:
-
-```
-ARTIFACTS_STATUS = {}
-
-For each artifact in [claims.json, diff-map.json, analysis.json, verification-report.json]:
-  1. Check file exists: {session_dir}/<artifact>
-  2. If exists: parse JSON, run schema validation (same rules as Phase 3 Step 3.0 / Phase 6 Step 6.6)
-  3. Record status:
-     - "available": file exists AND passes validation
-     - "partial": file exists but fails some validation checks (use what's valid)
-     - "missing": file does not exist
-     - "corrupt": file exists but is not valid JSON
-```
-
-**Per-artifact degradation behavior:**
-
-| Artifact | Status | Report Behavior |
-|----------|--------|-----------------|
-| `claims.json` | available | Full Claims Analysis section |
-| `claims.json` | missing/corrupt | Claims Analysis section shows `[DATA UNAVAILABLE — claims.json not found or corrupt. Phase 1 may not have run.]` |
-| `diff-map.json` | available | Full metadata header (repo, SHAs), Unclaimed Changes section uses file data |
-| `diff-map.json` | missing/corrupt | Metadata header shows `[DATA UNAVAILABLE]` for repo/SHA fields. Unclaimed Changes section degraded. |
-| `analysis.json` | available | Full Claims Analysis with verification status, evidence, code snippets. Full Unclaimed Changes. |
-| `analysis.json` | missing/corrupt | Claims listed without verification status (`[ANALYSIS UNAVAILABLE]`). Unclaimed Changes section shows `[DATA UNAVAILABLE]`. |
-| `analysis.json` | partial — `claims_analyzed` valid, `unreported_changes` missing | Claims Analysis section uses available verification data normally. Unclaimed Changes section shows `[DATA UNAVAILABLE — unreported_changes field missing from analysis.json]`. |
-| `analysis.json` | partial — `claims_analyzed` missing, `unreported_changes` valid | Claims listed without verification status (`[ANALYSIS UNAVAILABLE]`). Unclaimed Changes section uses available data normally. |
-| `analysis.json` | partial — other validation failures | Use all parseable fields; mark each invalid/missing sub-section with `[DATA UNAVAILABLE]` and note the specific validation failure. |
-| `verification-report.json` | available | Add "Independent Verification" section to report with per-claim reviewer assessments, disputes, and concerns |
-| `verification-report.json` | missing | Omit "Independent Verification" section entirely (Phase 6 is optional — M1 pipelines won't have this artifact) |
-| `verification-report.json` | corrupt/partial | Add "Independent Verification" section with `[DATA PARTIALLY AVAILABLE]` markers for corrupt fields; use whatever is parseable |
-
-**If ALL three artifacts are missing or corrupt (no artifact has status "available" or "partial"):** abort Phase 5 with:
-```
-❌ Phase 5 aborted: No usable upstream artifacts found in {session_dir}.
-   Expected: claims.json, diff-map.json, analysis.json
-   Status: claims.json=<status>, diff-map.json=<status>, analysis.json=<status>
-   At least one artifact must be loadable to generate a report.
-   Run Phases 1-3 first.
-```
-
-**If at least one artifact has status "available" or "partial":** proceed with partial report generation. Print a warning:
-```
-⚠️  Partial artifacts detected:
-   claims.json:   <status>
-   diff-map.json: <status>
-   analysis.json: <status>
-   
-   Report will be generated with available data. Missing sections will be marked [DATA UNAVAILABLE].
-```
-
-### Step 5.1 — Extract Report Data
-
-Load validated data from available artifacts into working variables.
-
-**From `claims.json` (if available):**
-```
-source_url = claims.source_url
-fetched_at = claims.fetched_at
-claims_list = claims.claims  // array of claim objects
-```
-
-**From `diff-map.json` (if available):**
-```
-repo_url = diff_map.repo
-base_sha = diff_map.base_sha
-head_sha = diff_map.head_sha
-base_ref = diff_map.base_ref
-head_ref = diff_map.head_ref
-clone_path = diff_map.clone_path
-total_files = diff_map.summary.total_files
-total_lines_changed = diff_map.summary.total_lines_changed
-```
-
-**From `analysis.json` (if available):**
-```
-claims_analyzed = analysis.claims_analyzed  // array with verification results
-unreported_changes = analysis.unreported_changes  // array of code-first delta findings
-analysis_summary = analysis.summary  // aggregate stats
-```
-
-**From `verification-report.json` (if available — Phase 6 M2 only):**
-```
-verification_status = verification.verification_status  // "verified" or "partial"
-verification_reviews = verification.reviews  // per-claim reviewer assessments
-reviewer_concerns = verification.reviewer_concerns  // general concerns
-verification_summary = verification.summary  // aggregate verification stats
-total_rounds = verification.total_rounds  // fix-verify rounds executed
-```
-
-**Cross-reference claims with analysis and verification:** If `claims.json`, `analysis.json`, and optionally `verification-report.json` are available, join claims with their analysis and verification results by `claim_id`:
-
-```
-For each claim in claims_list:
-  Find matching entry in claims_analyzed where claim_id == claim.id
-  IF match found:
-    Merge: claim text + category + confidence FROM claims.json
-           verification_status + evidence + code_snippets + analysis_notes FROM analysis.json
-    IF verification_reviews is available:
-      Find matching review in verification_reviews where claim_id == claim.id
-      IF match found:
-        Add: reviewer_assessment, reasoning, agrees_with_original, dispute, rounds FROM verification-report.json
-  IF no match found (claim exists in claims.json but not in analysis.json):
-    Set verification_status = "not_analyzed"
-    Set analysis_notes = "This claim has no corresponding entry in analysis.json. Phase 3 may not have processed it."
-    Log warning: "⚠️  Claim <claim.id> has no analysis entry — marking as not_analyzed"
-
-After join, check for orphaned analysis entries:
-  For each entry in claims_analyzed:
-    IF entry.claim_id does NOT match any claim.id in claims_list:
-      Log warning: "⚠️  analysis.json contains entry for <claim_id> which does not exist in claims.json — skipping (stale analysis)"
-      Do NOT include orphaned entries in the report
-```
-
-### Step 5.2 — Generate Internal Report (D15)
-
-Dispatch the `report_generation_agent` via the Agent tool to synthesize the report content.
-
-**Report generation prompt:**
-
-```
-You are the Research Report Compiler. Your job is to synthesize all analysis
-artifacts into a clear, well-structured internal technical report that a
-blockchain researcher can act on.
-
-## Input Data
-
-### Metadata
-- Repo URL: <repo_url or "[DATA UNAVAILABLE]">
-- Base ref: <base_ref> (<base_sha or "[DATA UNAVAILABLE]">)
-- Head ref: <head_ref> (<head_sha or "[DATA UNAVAILABLE]">)
-- Source URL: <source_url or "[DATA UNAVAILABLE]">
-- Analysis timestamp: <current ISO 8601 timestamp>
-
-### Claims (<N total> or "[DATA UNAVAILABLE]")
-<JSON array of merged claim+analysis objects, or "[DATA UNAVAILABLE]">
-
-### Unreported Changes (<N total> or "[DATA UNAVAILABLE]")
-<JSON array of unreported_changes, or "[DATA UNAVAILABLE]">
-
-### Verification Data (if Phase 6 was executed, otherwise "[NOT AVAILABLE]")
-<verification_status, verification_reviews, reviewer_concerns, verification_summary, or "[NOT AVAILABLE]">
-
-### Diff Summary
-<diff-map summary stats, or "[DATA UNAVAILABLE]">
-
-## Report Template
-
-Generate the report in the following structure. For any section where the
-input data is marked [DATA UNAVAILABLE], include the section heading but
-replace the content with "[DATA UNAVAILABLE — <reason>]".
-
----
-
-# Protocol Upgrade Analysis: <upgrade_name>
-
-**Repo:** <repo_url>
-**Commits:** <base_sha>..<head_sha>
-**Source:** <source_url>
-**Generated:** <ISO 8601 timestamp>
-**Pipeline:** harness-research-engineering v1 (<"M2" if verification-report.json available, else "M1">)
-**Artifacts:** <list which artifacts were available vs missing>
-
-## Executive Summary
-
-Write 2-3 paragraphs covering:
-- What the upgrade does (high-level, based on claims)
-- Key findings: how many claims were verified vs unverified
-- Notable unreported changes (if any high-significance ones exist)
-- Overall assessment: how well does the announcement match the code?
-
-## Claims Analysis
-
-For each claim, output a subsection:
-
-### Claim <N>: <claim_text>
-- **Category:** <category>
-- **Source confidence:** <confidence>
-- **Status:** <status_emoji> <verification_status>
-  - ✅ Confirmed = verified
-  - ⚠️ Partial = partially_verified
-  - ❌ Unconfirmed = unverified
-  - 🔴 Contradicted = (if analysis_notes indicate contradiction)
-- **Evidence:**
-  <For each evidence item: file:lines — description>
-- **Code:**
-  <If code_snippets exist, include the most relevant snippet (fenced code block with file path and line range)>
-- **Notes:** <analysis_notes>
-
-If claims data is unavailable: "[DATA UNAVAILABLE — claims.json was not found or could not be parsed. Phase 1 (Source Ingestion) may not have completed.]"
-
-## Unclaimed Changes
-
-List all unreported changes from the code-first delta pass, ordered by
-significance (high → medium → low):
-
-For each change:
-- **File:** <file path>
-- **Change:** <description>
-- **Significance:** <emoji> <level>
-  - 🔴 High
-  - 🟡 Medium  
-  - 🟢 Low
-- **Suggested category:** <potential_category>
-
-If unreported_changes data is unavailable: "[DATA UNAVAILABLE — analysis.json was not found or the code-first delta pass did not complete.]"
-
-## Independent Verification
-
-<if verification-report.json is available:>
-
-**Status:** <verification_status> (<"All reviewed claims verified" | "N unresolved disputes">)
-**Claims reviewed:** <claims_reviewed> / <claims_total>
-**Fix-verify rounds:** <total_rounds>
-
-For each reviewed claim, add a verification note to the claim's section in Claims Analysis above,
-AND list a summary here:
-
-| Claim | Original | Reviewer | Agreement | Notes |
-|-------|----------|----------|-----------|-------|
-| <claim_id> | <original_status> | <reviewer_assessment> | <✅/❌> | <reasoning, truncated> |
-
-### Reviewer Concerns
-
-<for each concern: severity, description, affected claims>
-
-### Unresolved Disputes
-
-<for each unresolved dispute: claim_id, both assessments, round history summary>
-
-<else:>
-[Phase 6 (Independent Verification) was not executed for this analysis. Claims Analysis reflects Phase 3 assessments only.]
-<end if>
-
-## Methodology
-
-Document the pipeline execution:
-- Pipeline version: harness-research-engineering v1 (<"M2" if Phase 6 was executed, else "M1">)
-- Phases executed: <list which phases ran successfully>
-- Artifacts status: <for each artifact, state available/partial/missing>
-- Errors or skipped steps: <document any degradation>
-- Source fetch method: <webfetch/websearch/user_paste or unknown>
-- Clone method: <treeless/shallow/reused/local or unknown>
-
-## Raw Data References
-
-- Session directory: <session_dir>
-- Claims: <session_dir>/claims.json
-- Diff map: <session_dir>/diff-map.json
-- Analysis: <session_dir>/analysis.json
-- Verification: <session_dir>/verification-report.json (if Phase 6 was executed)
-- Source snapshot: <session_dir>/source-snapshot.md
-
----
-
-## Output Rules
-
-- Begin your output IMMEDIATELY with the line: # Protocol Upgrade Analysis: <upgrade_name>
-- Do NOT wrap the output in a code fence (no ``` before or after)
-- Do NOT add any preamble, commentary, or explanation before the heading
-- Output the FULL markdown report content — nothing else
-- Use the exact section structure above
-- Every claim from the input must appear in the Claims Analysis section
-- Every unreported change must appear in the Unclaimed Changes section
-- For [DATA UNAVAILABLE] sections, always include a brief explanation of WHY the data is missing
-- Code snippets within the report should use fenced code blocks with appropriate language hints
-- Keep the Executive Summary concise but substantive (not generic platitudes)
-```
-
-### Step 5.3 — Write Draft Report to Disk
-
-**File:** `{session_dir}/internal-report.draft.md`
-
-Write the generated report content to the **draft** path using the Write tool. The draft file is NOT the final deliverable — it is promoted to `internal-report.md` only after user approval in Step 5.5. This ensures the mandatory user checkpoint cannot be bypassed by a premature write.
-
-### Step 5.4 — Self-Validation Gate
-
-Validate the draft report at `{session_dir}/internal-report.draft.md` before presenting to the user.
-
-**Validation checks:**
-
-1. **Metadata header present:** The first non-empty line of the report must be `# Protocol Upgrade Analysis:` (prefix match). If the agent prepended commentary or a code fence, this check catches it.
-2. **Required sections present:** All five base sections exist as level-2 headings (exact string match at start of line):
-   - `## Executive Summary`
-   - `## Claims Analysis`
-   - `## Unclaimed Changes`
-   - `## Independent Verification` (required only if `verification-report.json` was available; omit check if Phase 6 was not executed)
-   - `## Methodology`
-   - `## Raw Data References`
-3. **No duplicate sections:** Each required level-2 heading appears exactly once. Duplicate headings indicate a splicing error.
-4. **Metadata fields present:** Report contains `**Repo:**`, `**Commits:**`, `**Source:**`, `**Generated:**`
-5. **Claims completeness:** If `claims.json` was available, count the number of `### Claim ` sub-headings (note trailing space — match `### Claim \d+:` pattern to avoid false positives from claim text). The count must equal the number of input claims. If any claims are missing from the report, list the missing claim IDs.
-6. **No empty sections:** Each section has at least 20 characters of non-whitespace content below its heading. `[DATA UNAVAILABLE ...]` and `[Phase 6 ... was not executed ...]` markers count as valid content (they are the expected output for degraded/skipped sections).
-7. **Unreported changes completeness:** If `analysis.json` was available and had `unreported_changes`, verify they appear in the report
-8. **Verification completeness:** If `verification-report.json` was available, verify that the `## Independent Verification` section contains the verification summary table and reviewer concerns
-
-**On validation failure:**
-
-```
-❌ Report validation failed:
-   <list of failures>
-   Attempting regeneration of failed sections...
-```
-
-**Auto-fix strategy:** Re-dispatch the agent with a section-specific prompt that includes:
-- The section heading to generate
-- The relevant input data for that section only
-- Instruction: "Output ONLY the content for this section, starting with the `## <heading>` line."
-
-Then replace the content between the failed section's heading and the next `## ` heading (or end of file) with the regenerated content. If the section heading itself is missing, insert it at the correct position (maintaining the section order from the template).
-
-If the second attempt also fails validation, proceed with the report as-is and append a validation failure note to the Methodology section:
-```
-### Validation Notes
-The following validation checks failed and could not be auto-fixed:
-- <check>: <failure description>
-```
-
-### Step 5.5 — User Checkpoint 🧑
-
-Present the report summary to the user for confirmation. This is a mandatory checkpoint — the draft report at `{session_dir}/internal-report.draft.md` is NOT promoted to the final path until the user approves.
-
-**Display format:**
-
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📄 Phase 5 Complete — Internal Report Generated
-
-Report:     {session_dir}/internal-report.draft.md (pending approval)
-Artifacts:  <N available> / 3 total
-<if any missing: list missing artifacts>
-
-Report Structure:
-  ✅ Executive Summary (<word count> words)
-  <✅ or ⚠️> Claims Analysis (<N claims> / <N expected>)
-  <✅ or ⚠️> Unclaimed Changes (<N changes>)
-  ✅ Methodology
-  ✅ Raw Data References
-
-Claims Breakdown:
-  Confirmed:    <N> ✅
-  Partial:      <N> ⚠️
-  Unconfirmed:  <N> ❌
-  Unavailable:  <N> 🔲
-
-Unreported Changes: <N total> (<N high> 🔴, <N medium> 🟡, <N low> 🟢)
-
-<if verification-report.json was available:>
-Independent Verification:
-  Status:     <verification_status>
-  Reviewed:   <N> / <total> claims
-  Disputes:   <N found> → <N resolved> ✅ / <N unresolved> ❌
-  Rounds:     <total_rounds>
-<end if>
-```
-
-**Claims Breakdown computation:**
-- **Confirmed** = claims with `verification_status == "verified"`
-- **Partial** = claims with `verification_status == "partially_verified"`
-- **Unconfirmed** = claims with `verification_status == "unverified"` AND analysis.json was available (i.e., the claim was analyzed but not confirmed)
-- **Unavailable** = claims with `verification_status == "not_analyzed"` (set during Step 5.1 when analysis.json was missing or when the claim had no matching entry in `claims_analyzed`)
-
-```
-
-<if any degradation occurred:>
-⚠️  Degradation Notes:
-  <list which artifacts were missing/partial and how the report adapted>
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-Then ask:
-
-```
-Use AskUserQuestion:
-  question: "Review the internal report. Should I save it as the final version?"
-  options:
-    - "Looks good — save and finish"
-    - "I have edits" (user provides specific corrections → apply edits, re-save, re-display)
-    - "Regenerate specific sections" (user identifies sections to redo → re-dispatch agent for those sections only)
-    - "Abort — discard report"
-```
-
-If the user provides edits:
-1. Apply the requested changes to the report content
-2. Re-write `{session_dir}/internal-report.draft.md`
-3. Re-validate (Step 5.4)
-4. Re-display the summary
-
-If the user requests section regeneration:
-1. Ask which sections to regenerate
-2. For each section, use the same auto-fix strategy as Step 5.4: dispatch the agent with a section-specific prompt containing the relevant input data and the instruction to output only that section
-3. Replace the section content in the report (between heading and next `## ` heading)
-4. Re-write `{session_dir}/internal-report.draft.md`
-5. Re-validate (Step 5.4)
-6. Re-display the summary
-
-If the user approves:
-1. Rename the draft to the final path: move `{session_dir}/internal-report.draft.md` → `{session_dir}/internal-report.md`
-2. Delete the draft file if it still exists (the rename should have removed it)
-3. The report at `{session_dir}/internal-report.md` is the final deliverable
-4. Print confirmation and proceed to pipeline completion
-
-If the user aborts:
-1. Delete `{session_dir}/internal-report.draft.md`
-2. Print: "Draft report discarded. No final report was saved."
-3. The session directory retains upstream artifacts but has no `internal-report.md`
-
-**Output artifacts:**
-```
-~/.gstack/research/sessions/<chain>-<upgrade>-<date>/internal-report.md
-```
-
-### Per-Phase Error Handling Reference (D9)
-
-The following error handling framework applies across all pipeline phases. Phase 5 is responsible for incorporating any upstream error states into the report's Methodology section.
-
-| Phase | Failure Scenario | Recovery Action |
-|-------|-----------------|-----------------|
-| Phase 1 | WebFetch + WebSearch both fail | AskUserQuestion; record `fetch_method: user_paste` |
-| Phase 1 | Claims extraction yields 0 claims | Warn user, ask whether to continue |
-| Phase 2 | Clone timeout | Fall back to shallow clone; if still fails, request local path |
-| Phase 2 | Fuzzy match returns 0 results | Show all tags, user selects manually |
-| Phase 3 | A batch of claims fails processing | Skip batch, mark claims as `unverified` with `analysis_notes` indicating batch failure, continue remaining |
-| Phase 5 | Upstream artifact missing | Generate partial report, mark missing sections `[DATA UNAVAILABLE]` |
-| Phase 5 | Upstream artifact corrupt (invalid JSON) | Treat as missing; note corruption in Methodology section |
-| Phase 5 | Report generation agent produces incomplete output | Auto-fix: regenerate failed sections (max 1 retry) |
-| Phase 6 | Verification subagent returns invalid JSON | Parse recovery: strip markdown fences, re-parse. If still invalid, re-dispatch once. If second attempt fails, abort Phase 6 with warning — pipeline continues without verification. |
-| Phase 6 | Verification subagent drops claims from response | Mark missing claims as `unconfirmed` with reasoning noting agent failure |
-| Phase 6 | Fix-verify loop cap reached (3 rounds) | Preserve both assessments, mark `verification_status: "partial"`, proceed to report |
-| Phase 6 | analysis.json or claims.json missing/corrupt | Abort Phase 6 — verification cannot proceed without upstream analysis. Pipeline continues to Phase 5 without verification data. |
-
-**Error handling philosophy:** Phase 5 always attempts to produce output. The only condition that aborts Phase 5 is ALL upstream artifacts being missing. Any other combination of missing/partial/corrupt artifacts results in a degraded but functional report.
-
-**Error handling philosophy:** Phase 5 always attempts to produce output. The only condition that aborts Phase 5 is ALL upstream artifacts being missing. Any other combination of missing/partial/corrupt artifacts results in a degraded but functional report.
 
 ---
 
@@ -2696,23 +2241,23 @@ LOOP:
   IF DISPUTES is empty:
     BREAK — all claims verified or agreed upon
 
-  ROUND += 1
-
-  IF ROUND > MAX_ROUNDS:
+  IF ROUND >= MAX_ROUNDS:
     Print: "⚠️  Fix-verify loop cap reached (3 rounds). <len(DISPUTES)> unresolved disputes remain."
     FOR each unresolved dispute:
       Print: "  - <claim_id>: Phase 3 says <original_status>, reviewer says <reviewer_assessment>"
     Mark verification_status = "partial"
     BREAK
 
+  ROUND += 1
+
   Print: "Fix-verify round <ROUND>/<MAX_ROUNDS>: <len(DISPUTES)> disputes to resolve"
 
   ## Phase 3 Recheck
   For each disputed claim:
     - Re-read the claim and evidence from analysis.json
-    - Fetch broader context from the code: expand the file search to include
-      files in the same directory as existing evidence, and files matching
-      additional keywords from the claim text
+    - Fetch broader context from the code at <clone_path> (from diff-map.json):
+      expand the file search to include files in the same directory as existing
+      evidence, and files matching additional keywords from the claim text
     - Re-assess the verification_status with the new evidence
 
   Dispatch recheck via Agent tool:
@@ -2723,13 +2268,23 @@ LOOP:
     For each claim, the reviewer's concern is provided. Your job is to search for
     additional evidence that addresses the reviewer's specific concern.
 
+    ## Context
+    - Session directory: <SESSION_DIR>
+    - Repository clone: <clone_path> (from diff-map.json)
+    - Diff range: <BASE_SHA>..<HEAD_SHA>
+
+    Use Bash and Read to search for additional evidence in the repository clone directory.
+
     Claims to recheck:
     <For each disputed claim: claim_id, claim_text, original evidence,
      reviewer's assessment, reviewer's reasoning>
 
     For each claim:
     1. Consider the reviewer's specific objection.
-    2. Look at the additional diff context provided.
+    2. Search the repository clone at <clone_path> for additional evidence:
+       - Look in the same directories as existing evidence files
+       - Search for files matching keywords from the claim text
+       - Use git diff <BASE_SHA>..<HEAD_SHA> with broader file patterns
     3. Determine if there is additional evidence that addresses the concern.
     4. Provide an updated verification_status and explanation.
 
@@ -2741,9 +2296,14 @@ LOOP:
     }]"
 
   ## Re-verify with new subagent
-  For each rechecked claim, assemble updated payload (original claim + updated evidence)
-  and dispatch a NEW Agent subagent with the same verification prompt from Step 6.2,
-  but only for the disputed claims.
+  For each rechecked claim, assemble updated payload containing:
+    - Original claim data (claim_id, claim_text, category)
+    - Original evidence from analysis.json
+    - The recheck subagent's recheck_notes as a "recheck_context" field
+    - The recheck subagent's updated_status
+  Dispatch a NEW Agent subagent with the same verification prompt from Step 6.2,
+  but only for the disputed claims, and with the recheck_context appended to each
+  claim's data so the reviewer can see what Phase 3 found on recheck.
 
   Parse the new reviewer response.
 
@@ -2795,6 +2355,8 @@ Assemble the `verification-report.json` artifact following the schema from [Arti
 - `"verified"`: No unresolved disputes remain (all disputes resolved or no disputes were found)
 - `"partial"`: At least one dispute remains unresolved after max rounds
 
+**Compute summary counts:** Count from the **initial** `reviewer_assessment` for each review (before any round resolution). `confirmed` = count where `reviews[].reviewer_assessment == "confirmed"`, `partial` = count where initial assessment == `"partial"`, `unconfirmed` = count where initial assessment == `"unconfirmed"`, `contradicted` = count where initial assessment == `"contradicted"`. Round resolution changes are tracked in `reviews[].rounds[]` only — they do not update summary counts.
+
 **Write to:** `{session_dir}/verification-report.json`
 
 ### Step 6.5 — Generate verification-report.md
@@ -2809,7 +2371,7 @@ Generate a human-readable markdown report from the structured JSON data.
 # Verification Report
 
 **Generated:** <ISO 8601 timestamp>
-**Status:** <verification_status> (<"All claims verified" | "N unresolved disputes">)
+**Status:** <verification_status> (<"All reviewed claims verified" | "N unresolved disputes">)
 **Claims reviewed:** <N> / <total> (selection: top by significance)
 **Fix-verify rounds:** <total_rounds>
 
@@ -2908,7 +2470,7 @@ Present the verification results to the user for confirmation. This is a mandato
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔎 Phase 6 Complete — Independent Verification
 
-Status:     <verification_status> (<"All claims verified" | "N unresolved disputes">)
+Status:     <verification_status> (<"All reviewed claims verified" | "N unresolved disputes">)
 Claims reviewed:  <N> / <total>
 Fix-verify rounds: <total_rounds>
 
@@ -2975,6 +2537,468 @@ If the user overrides verification results:
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/verification-report.json
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/verification-report.md
 ```
+
+---
+
+## Phase 5: Report Generation
+
+> **Implemented by:** WHI-232
+
+Phase 5 synthesizes all upstream artifacts into a structured internal technical report. This is the M1 terminal phase — the report is the primary deliverable that answers "is this tool useful for researchers?"
+
+**Agent role:** `report_generation_agent` (see [Agent Roles > report_generation_agent](#5-report_generation_agent-phase-5))
+
+### Step 5.0 — Input Validation and Graceful Degradation (D9)
+
+Phase 5 is the pipeline's endpoint and must handle partial upstream failures. Unlike Phases 2-3 which abort on invalid input, Phase 5 generates a **partial report** when artifacts are missing or malformed, annotating each missing section with `[DATA UNAVAILABLE]`.
+
+**Recovering `session_dir`:** Phase 5 runs in the same session as Phases 1-3. The `SESSION_DIR` variable should still be available. If not (e.g., re-invocation), recover:
+
+```bash
+SESSION_DIR=$(ls -dt "$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-"* 2>/dev/null | head -1)
+if [ -z "$SESSION_DIR" ]; then
+  echo "❌ No session directory found. Run Phase 1 first."
+  exit 1
+fi
+echo "Session directory: $SESSION_DIR"
+```
+
+**Artifact availability check:**
+
+For each upstream artifact, attempt to load and validate. Track availability status:
+
+```
+ARTIFACTS_STATUS = {}
+
+For each artifact in [claims.json, diff-map.json, analysis.json, verification-report.json]:
+  1. Check file exists: {session_dir}/<artifact>
+  2. If exists: parse JSON, run schema validation (same rules as Phase 3 Step 3.0 / Phase 6 Step 6.6)
+  3. Record status:
+     - "available": file exists AND passes validation
+     - "partial": file exists but fails some validation checks (use what's valid)
+     - "missing": file does not exist
+     - "corrupt": file exists but is not valid JSON
+```
+
+**Per-artifact degradation behavior:**
+
+| Artifact | Status | Report Behavior |
+|----------|--------|-----------------|
+| `claims.json` | available | Full Claims Analysis section |
+| `claims.json` | missing/corrupt | Claims Analysis section shows `[DATA UNAVAILABLE — claims.json not found or corrupt. Phase 1 may not have run.]` |
+| `diff-map.json` | available | Full metadata header (repo, SHAs), Unclaimed Changes section uses file data |
+| `diff-map.json` | missing/corrupt | Metadata header shows `[DATA UNAVAILABLE]` for repo/SHA fields. Unclaimed Changes section degraded. |
+| `analysis.json` | available | Full Claims Analysis with verification status, evidence, code snippets. Full Unclaimed Changes. |
+| `analysis.json` | missing/corrupt | Claims listed without verification status (`[ANALYSIS UNAVAILABLE]`). Unclaimed Changes section shows `[DATA UNAVAILABLE]`. |
+| `analysis.json` | partial — `claims_analyzed` valid, `unreported_changes` missing | Claims Analysis section uses available verification data normally. Unclaimed Changes section shows `[DATA UNAVAILABLE — unreported_changes field missing from analysis.json]`. |
+| `analysis.json` | partial — `claims_analyzed` missing, `unreported_changes` valid | Claims listed without verification status (`[ANALYSIS UNAVAILABLE]`). Unclaimed Changes section uses available data normally. |
+| `analysis.json` | partial — other validation failures | Use all parseable fields; mark each invalid/missing sub-section with `[DATA UNAVAILABLE]` and note the specific validation failure. |
+| `verification-report.json` | available | Add "Independent Verification" section to report with per-claim reviewer assessments, disputes, and concerns |
+| `verification-report.json` | missing | Omit "Independent Verification" section entirely (Phase 6 is optional — M1 pipelines won't have this artifact) |
+| `verification-report.json` | corrupt/partial | Add "Independent Verification" section with `[DATA PARTIALLY AVAILABLE]` markers for corrupt fields; use whatever is parseable |
+
+**If ALL three required artifacts** (`claims.json`, `diff-map.json`, `analysis.json`) **are missing or corrupt (no required artifact has status "available" or "partial"):** abort Phase 5 with:
+```
+❌ Phase 5 aborted: No usable upstream artifacts found in {session_dir}.
+   Expected: claims.json, diff-map.json, analysis.json
+   Status: claims.json=<status>, diff-map.json=<status>, analysis.json=<status>
+   At least one artifact must be loadable to generate a report.
+   Run Phases 1-3 first.
+```
+
+**If at least one artifact has status "available" or "partial":** proceed with partial report generation. Print a warning:
+```
+⚠️  Partial artifacts detected:
+   claims.json:   <status>
+   diff-map.json: <status>
+   analysis.json: <status>
+   
+   Report will be generated with available data. Missing sections will be marked [DATA UNAVAILABLE].
+```
+
+### Step 5.1 — Extract Report Data
+
+Load validated data from available artifacts into working variables.
+
+**From `claims.json` (if available):**
+```
+source_url = claims.source_url
+fetched_at = claims.fetched_at
+claims_list = claims.claims  // array of claim objects
+```
+
+**From `diff-map.json` (if available):**
+```
+repo_url = diff_map.repo
+base_sha = diff_map.base_sha
+head_sha = diff_map.head_sha
+base_ref = diff_map.base_ref
+head_ref = diff_map.head_ref
+clone_path = diff_map.clone_path
+total_files = diff_map.summary.total_files
+total_lines_changed = diff_map.summary.total_lines_changed
+```
+
+**From `analysis.json` (if available):**
+```
+claims_analyzed = analysis.claims_analyzed  // array with verification results
+unreported_changes = analysis.unreported_changes  // array of code-first delta findings
+analysis_summary = analysis.summary  // aggregate stats
+```
+
+**From `verification-report.json` (if available — Phase 6 M2 only):**
+```
+verification_status = verification.verification_status  // "verified" or "partial"
+verification_reviews = verification.reviews  // per-claim reviewer assessments
+reviewer_concerns = verification.reviewer_concerns  // general concerns
+verification_summary = verification.summary  // aggregate verification stats
+total_rounds = verification.total_rounds  // fix-verify rounds executed
+```
+
+**Cross-reference claims with analysis and verification:** If `claims.json`, `analysis.json`, and optionally `verification-report.json` are available, join claims with their analysis and verification results by `claim_id`:
+
+```
+For each claim in claims_list:
+  Find matching entry in claims_analyzed where claim_id == claim.id
+  IF match found:
+    Merge: claim text + category + confidence FROM claims.json
+           verification_status + evidence + code_snippets + analysis_notes FROM analysis.json
+    IF verification_reviews is available:
+      Find matching review in verification_reviews where claim_id == claim.id
+      IF match found:
+        Add: reviewer_assessment, reasoning, agrees_with_original, dispute, rounds FROM verification-report.json
+  IF no match found (claim exists in claims.json but not in analysis.json):
+    Set verification_status = "not_analyzed"
+    Set analysis_notes = "This claim has no corresponding entry in analysis.json. Phase 3 may not have processed it."
+    Log warning: "⚠️  Claim <claim.id> has no analysis entry — marking as not_analyzed"
+
+After join, check for orphaned analysis entries:
+  For each entry in claims_analyzed:
+    IF entry.claim_id does NOT match any claim.id in claims_list:
+      Log warning: "⚠️  analysis.json contains entry for <claim_id> which does not exist in claims.json — skipping (stale analysis)"
+      Do NOT include orphaned entries in the report
+```
+
+### Step 5.2 — Generate Internal Report (D15)
+
+Dispatch the `report_generation_agent` via the Agent tool to synthesize the report content.
+
+**Report generation prompt:**
+
+```
+You are the Research Report Compiler. Your job is to synthesize all analysis
+artifacts into a clear, well-structured internal technical report that a
+blockchain researcher can act on.
+
+## Input Data
+
+### Metadata
+- Repo URL: <repo_url or "[DATA UNAVAILABLE]">
+- Base ref: <base_ref> (<base_sha or "[DATA UNAVAILABLE]">)
+- Head ref: <head_ref> (<head_sha or "[DATA UNAVAILABLE]">)
+- Source URL: <source_url or "[DATA UNAVAILABLE]">
+- Analysis timestamp: <current ISO 8601 timestamp>
+
+### Claims (<N total> or "[DATA UNAVAILABLE]")
+<JSON array of merged claim+analysis objects, or "[DATA UNAVAILABLE]">
+
+### Unreported Changes (<N total> or "[DATA UNAVAILABLE]")
+<JSON array of unreported_changes, or "[DATA UNAVAILABLE]">
+
+### Verification Data (if Phase 6 was executed, otherwise "[NOT AVAILABLE]")
+<verification_status, verification_reviews, reviewer_concerns, verification_summary, or "[NOT AVAILABLE]">
+
+### Diff Summary
+<diff-map summary stats, or "[DATA UNAVAILABLE]">
+
+## Report Template
+
+Generate the report in the following structure. For any section where the
+input data is marked [DATA UNAVAILABLE], include the section heading but
+replace the content with "[DATA UNAVAILABLE — <reason>]".
+
+---
+
+# Protocol Upgrade Analysis: <upgrade_name>
+
+**Repo:** <repo_url>
+**Commits:** <base_sha>..<head_sha>
+**Source:** <source_url>
+**Generated:** <ISO 8601 timestamp>
+**Pipeline:** harness-research-engineering v1 (<"M2" if verification-report.json available, else "M1">)
+**Artifacts:** <list which artifacts were available vs missing>
+
+## Executive Summary
+
+Write 2-3 paragraphs covering:
+- What the upgrade does (high-level, based on claims)
+- Key findings: how many claims were verified vs unverified
+- Notable unreported changes (if any high-significance ones exist)
+- Overall assessment: how well does the announcement match the code?
+
+## Claims Analysis
+
+For each claim, output a subsection:
+
+### Claim <N>: <claim_text>
+- **Category:** <category>
+- **Source confidence:** <confidence>
+- **Status:** <status_emoji> <verification_status>
+  - ✅ Confirmed = verified
+  - ⚠️ Partial = partially_verified
+  - ❌ Unconfirmed = unverified
+  - 🔴 Contradicted = (if analysis_notes indicate contradiction)
+- **Evidence:**
+  <For each evidence item: file:lines — description>
+- **Code:**
+  <If code_snippets exist, include the most relevant snippet (fenced code block with file path and line range)>
+- **Notes:** <analysis_notes>
+- **Verification:** <if claim was in top-10 and reviewed: reviewer_assessment_emoji reviewer_assessment — reasoning (truncated to 80 chars) [✅ Agrees | ❌ Disputes]> <if claim was not in top-10: "(not reviewed — outside top 10 by significance)"> <if Phase 6 was not executed: omit this field entirely>
+
+If claims data is unavailable: "[DATA UNAVAILABLE — claims.json was not found or could not be parsed. Phase 1 (Source Ingestion) may not have completed.]"
+
+## Unclaimed Changes
+
+List all unreported changes from the code-first delta pass, ordered by
+significance (high → medium → low):
+
+For each change:
+- **File:** <file path>
+- **Change:** <description>
+- **Significance:** <emoji> <level>
+  - 🔴 High
+  - 🟡 Medium  
+  - 🟢 Low
+- **Suggested category:** <potential_category>
+
+If unreported_changes data is unavailable: "[DATA UNAVAILABLE — analysis.json was not found or the code-first delta pass did not complete.]"
+
+## Independent Verification
+
+<if verification-report.json is available:>
+
+**Status:** <verification_status> (<"All reviewed claims verified" | "N unresolved disputes">)
+**Claims reviewed:** <claims_reviewed> / <claims_total>
+**Fix-verify rounds:** <total_rounds>
+
+For each reviewed claim, add a verification note to the claim's section in Claims Analysis above,
+AND list a summary here:
+
+| Claim | Original | Reviewer | Agreement | Notes |
+|-------|----------|----------|-----------|-------|
+| <claim_id> | <original_status> | <reviewer_assessment> | <✅/❌> | <reasoning, truncated> |
+
+### Reviewer Concerns
+
+<for each concern: severity, description, affected claims>
+
+### Unresolved Disputes
+
+<for each unresolved dispute: claim_id, both assessments, round history summary>
+
+<else:>
+[Phase 6 (Independent Verification) was not executed for this analysis. Claims Analysis reflects Phase 3 assessments only.]
+<end if>
+
+## Methodology
+
+Document the pipeline execution:
+- Pipeline version: harness-research-engineering v1 (<"M2" if Phase 6 was executed, else "M1">)
+- Phases executed: <list which phases ran successfully>
+- Artifacts status: <for each artifact, state available/partial/missing>
+- Errors or skipped steps: <document any degradation>
+- Source fetch method: <webfetch/websearch/user_paste or unknown>
+- Clone method: <treeless/shallow/reused/local or unknown>
+
+## Raw Data References
+
+- Session directory: <session_dir>
+- Claims: <session_dir>/claims.json
+- Diff map: <session_dir>/diff-map.json
+- Analysis: <session_dir>/analysis.json
+- Verification: <session_dir>/verification-report.json (if Phase 6 was executed)
+- Source snapshot: <session_dir>/source-snapshot.md
+
+---
+
+## Output Rules
+
+- Begin your output IMMEDIATELY with the line: # Protocol Upgrade Analysis: <upgrade_name>
+- Do NOT wrap the output in a code fence (no ``` before or after)
+- Do NOT add any preamble, commentary, or explanation before the heading
+- Output the FULL markdown report content — nothing else
+- Use the exact section structure above
+- Every claim from the input must appear in the Claims Analysis section
+- Every unreported change must appear in the Unclaimed Changes section
+- For [DATA UNAVAILABLE] sections, always include a brief explanation of WHY the data is missing
+- Code snippets within the report should use fenced code blocks with appropriate language hints
+- Keep the Executive Summary concise but substantive (not generic platitudes)
+```
+
+### Step 5.3 — Write Draft Report to Disk
+
+**File:** `{session_dir}/internal-report.draft.md`
+
+Write the generated report content to the **draft** path using the Write tool. The draft file is NOT the final deliverable — it is promoted to `internal-report.md` only after user approval in Step 5.5. This ensures the mandatory user checkpoint cannot be bypassed by a premature write.
+
+### Step 5.4 — Self-Validation Gate
+
+Validate the draft report at `{session_dir}/internal-report.draft.md` before presenting to the user.
+
+**Validation checks:**
+
+1. **Metadata header present:** The first non-empty line of the report must be `# Protocol Upgrade Analysis:` (prefix match). If the agent prepended commentary or a code fence, this check catches it.
+2. **Required sections present:** All required sections exist as level-2 headings (exact string match at start of line) — 5 sections when Phase 6 was not executed, 6 sections when Phase 6 data is available:
+   - `## Executive Summary`
+   - `## Claims Analysis`
+   - `## Unclaimed Changes`
+   - `## Methodology`
+   - `## Raw Data References`
+   - `## Independent Verification` — check this heading ONLY if `verification-report.json` was available. Omit this check entirely if Phase 6 was not executed.
+3. **No duplicate sections:** Each required level-2 heading appears exactly once. Duplicate headings indicate a splicing error.
+4. **Metadata fields present:** Report contains `**Repo:**`, `**Commits:**`, `**Source:**`, `**Generated:**`
+5. **Claims completeness:** If `claims.json` was available, count the number of `### Claim ` sub-headings (note trailing space — match `### Claim \d+:` pattern to avoid false positives from claim text). The count must equal the number of input claims. If any claims are missing from the report, list the missing claim IDs.
+6. **No empty sections:** Each section has at least 20 characters of non-whitespace content below its heading. `[DATA UNAVAILABLE ...]` and `[Phase 6 ... was not executed ...]` markers count as valid content (they are the expected output for degraded/skipped sections).
+7. **Unreported changes completeness:** If `analysis.json` was available and had `unreported_changes`, verify they appear in the report
+8. **Verification completeness:** If `verification-report.json` was available, verify that the `## Independent Verification` section contains the verification summary table and reviewer concerns
+
+**On validation failure:**
+
+```
+❌ Report validation failed:
+   <list of failures>
+   Attempting regeneration of failed sections...
+```
+
+**Auto-fix strategy:** Re-dispatch the agent with a section-specific prompt that includes:
+- The section heading to generate
+- The relevant input data for that section only
+- Instruction: "Output ONLY the content for this section, starting with the `## <heading>` line."
+
+Then replace the content between the failed section's heading and the next `## ` heading (or end of file) with the regenerated content. If the section heading itself is missing, insert it at the correct position (maintaining the section order from the template).
+
+If the second attempt also fails validation, proceed with the report as-is and append a validation failure note to the Methodology section:
+```
+### Validation Notes
+The following validation checks failed and could not be auto-fixed:
+- <check>: <failure description>
+```
+
+### Step 5.5 — User Checkpoint 🧑
+
+Present the report summary to the user for confirmation. This is a mandatory checkpoint — the draft report at `{session_dir}/internal-report.draft.md` is NOT promoted to the final path until the user approves.
+
+**Display format:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📄 Phase 5 Complete — Internal Report Generated
+
+Report:     {session_dir}/internal-report.draft.md (pending approval)
+Artifacts:  <N available> / 3 total
+<if any missing: list missing artifacts>
+
+Report Structure:
+  ✅ Executive Summary (<word count> words)
+  <✅ or ⚠️> Claims Analysis (<N claims> / <N expected>)
+  <✅ or ⚠️> Unclaimed Changes (<N changes>)
+  ✅ Methodology
+  ✅ Raw Data References
+
+Claims Breakdown:
+  Confirmed:    <N> ✅
+  Partial:      <N> ⚠️
+  Unconfirmed:  <N> ❌
+  Unavailable:  <N> 🔲
+
+Unreported Changes: <N total> (<N high> 🔴, <N medium> 🟡, <N low> 🟢)
+
+<if verification-report.json was available:>
+Independent Verification:
+  Status:     <verification_status>
+  Reviewed:   <N> / <total> claims
+  Disputes:   <N found> → <N resolved> ✅ / <N unresolved> ❌
+  Rounds:     <total_rounds>
+<end if>
+```
+
+**Claims Breakdown computation:**
+- **Confirmed** = claims with `verification_status == "verified"`
+- **Partial** = claims with `verification_status == "partially_verified"`
+- **Unconfirmed** = claims with `verification_status == "unverified"` AND analysis.json was available (i.e., the claim was analyzed but not confirmed)
+- **Unavailable** = claims with `verification_status == "not_analyzed"` (set during Step 5.1 when analysis.json was missing or when the claim had no matching entry in `claims_analyzed`)
+
+```
+
+<if any degradation occurred:>
+⚠️  Degradation Notes:
+  <list which artifacts were missing/partial and how the report adapted>
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Then ask:
+
+```
+Use AskUserQuestion:
+  question: "Review the internal report. Should I save it as the final version?"
+  options:
+    - "Looks good — save and finish"
+    - "I have edits" (user provides specific corrections → apply edits, re-save, re-display)
+    - "Regenerate specific sections" (user identifies sections to redo → re-dispatch agent for those sections only)
+    - "Abort — discard report"
+```
+
+If the user provides edits:
+1. Apply the requested changes to the report content
+2. Re-write `{session_dir}/internal-report.draft.md`
+3. Re-validate (Step 5.4)
+4. Re-display the summary
+
+If the user requests section regeneration:
+1. Ask which sections to regenerate
+2. For each section, use the same auto-fix strategy as Step 5.4: dispatch the agent with a section-specific prompt containing the relevant input data and the instruction to output only that section
+3. Replace the section content in the report (between heading and next `## ` heading)
+4. Re-write `{session_dir}/internal-report.draft.md`
+5. Re-validate (Step 5.4)
+6. Re-display the summary
+
+If the user approves:
+1. Rename the draft to the final path: move `{session_dir}/internal-report.draft.md` → `{session_dir}/internal-report.md`
+2. Delete the draft file if it still exists (the rename should have removed it)
+3. The report at `{session_dir}/internal-report.md` is the final deliverable
+4. Print confirmation and proceed to pipeline completion
+
+If the user aborts:
+1. Delete `{session_dir}/internal-report.draft.md`
+2. Print: "Draft report discarded. No final report was saved."
+3. The session directory retains upstream artifacts but has no `internal-report.md`
+
+**Output artifacts:**
+```
+~/.gstack/research/sessions/<chain>-<upgrade>-<date>/internal-report.md
+```
+
+### Per-Phase Error Handling Reference (D9)
+
+The following error handling framework applies across all pipeline phases. Phase 5 is responsible for incorporating any upstream error states into the report's Methodology section.
+
+| Phase | Failure Scenario | Recovery Action |
+|-------|-----------------|-----------------|
+| Phase 1 | WebFetch + WebSearch both fail | AskUserQuestion; record `fetch_method: user_paste` |
+| Phase 1 | Claims extraction yields 0 claims | Warn user, ask whether to continue |
+| Phase 2 | Clone timeout | Fall back to shallow clone; if still fails, request local path |
+| Phase 2 | Fuzzy match returns 0 results | Show all tags, user selects manually |
+| Phase 3 | A batch of claims fails processing | Skip batch, mark claims as `unverified` with `analysis_notes` indicating batch failure, continue remaining |
+| Phase 5 | Upstream artifact missing | Generate partial report, mark missing sections `[DATA UNAVAILABLE]` |
+| Phase 5 | Upstream artifact corrupt (invalid JSON) | Treat as missing; note corruption in Methodology section |
+| Phase 5 | Report generation agent produces incomplete output | Auto-fix: regenerate failed sections (max 1 retry) |
+| Phase 6 | Verification subagent returns invalid JSON | Parse recovery: strip markdown fences, re-parse. If still invalid, re-dispatch once. If second attempt fails, abort Phase 6 with warning — pipeline continues without verification. |
+| Phase 6 | Verification subagent drops claims from response | Mark missing claims as `unconfirmed` with reasoning noting agent failure |
+| Phase 6 | Fix-verify loop cap reached (3 rounds) | Preserve both assessments, mark `verification_status: "partial"`, proceed to report |
+| Phase 6 | analysis.json or claims.json missing/corrupt | Abort Phase 6 — verification cannot proceed without upstream analysis. Pipeline continues to Phase 5 without verification data. |
+
+**Error handling philosophy:** Phase 5 always attempts to produce output. The only condition that aborts Phase 5 is ALL upstream artifacts being missing. Any other combination of missing/partial/corrupt artifacts results in a degraded but functional report.
 
 ---
 
