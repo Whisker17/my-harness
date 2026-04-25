@@ -7,6 +7,7 @@ Replaced the Phase 5 placeholder in `skills/harness-research-engineering/SKILL.m
 - **Graceful degradation (D9):** Phase 5 validates all three upstream artifacts (claims.json, diff-map.json, analysis.json) and generates partial reports when any are missing/corrupt, marking unavailable sections with `[DATA UNAVAILABLE]` markers.
 - **Report template:** Structured internal report with Executive Summary, Claims Analysis (per-claim with evidence), Unclaimed Changes, Methodology, and Raw Data References sections.
 - **User checkpoint:** Mandatory approval step before finalizing the report, with options to edit, regenerate sections, or abort.
+- **Draft/promote pattern:** Step 5.3 writes to `internal-report.draft.md`; the draft is promoted to `internal-report.md` only after user approval in Step 5.5. Abort deletes the draft.
 - **Agent role update:** Updated `report_generation_agent` definition to M1 scope (internal report only, no public summary per D15).
 - **Error handling reference table (D9):** Comprehensive table documenting failure scenarios and recovery actions across all pipeline phases.
 
@@ -20,7 +21,7 @@ Key design decisions:
 
 - `skills/harness-research-engineering/SKILL.md` — Major update: replaced Phase 5 placeholder with ~350 lines of implementation; updated agent role definition; updated ToC entry
 
-## Adversarial Review Findings
+## Adversarial Review Findings (v1 — Agent subagent)
 
 ### Addressed (Critical/High)
 
@@ -43,6 +44,28 @@ Key design decisions:
 7. **LOW — ToC anchor for Failure and Abort:** Anchor is unchanged and remains valid.
 8. **LOW — D15 not cross-referenced:** D15 refers to the engineering review decision documented in the Linear issue description. Adding a formal anchor would be a nice-to-have.
 
+## Convergence Review (v2 — Codex↔Opus)
+
+### Round 1 (Codex adversarial)
+- **Verdict:** fail
+- **Findings:** 2 HIGH (setup.sh — out of scope), 1 MEDIUM (SKILL.md draft path)
+
+### Opus Fix Loop
+- F-001 [HIGH] setup.sh:91-96 — **REBUTTED** (setup.sh not in PR diff)
+- F-002 [HIGH] setup.sh:261-265 — **REBUTTED** (setup.sh not in PR diff)
+- F-003 [MEDIUM] SKILL.md:2105-2107 — **RESOLVED** (commit 9972ff1: draft/promote pattern)
+
+### Round 2 (Codex re-verify)
+- **Verdict:** pass
+- **Rebuttals:** F-001 accepted, F-002 accepted
+- **Fix verification:** F-003 verified
+- **New findings:** 3 LOW (documentation-only)
+  - F-004: Error table `analysis_error` status inconsistency
+  - F-005: Step 5.5 `Unavailable` counter derivation missing
+  - F-006: Agent role output still says `internal-report.md`
+
+### Convergence Result: ✅ PASS (2 rounds)
+
 ## PR
 
 https://github.com/Whisker17/my-harness/pull/23
@@ -53,7 +76,7 @@ https://github.com/Whisker17/my-harness/pull/23
 - [x] Report structure: Executive Summary -> Claims Analysis -> Unclaimed Changes -> Methodology -> Raw Data References — Step 5.2 template
 - [x] Per-claim display: text, status (confirmed/partial/unconfirmed/contradicted), evidence, code location — Step 5.2 template Claims Analysis section
 - [x] Unclaimed Changes section lists code-first delta findings — Step 5.2 template
-- [x] Report writes to `{workdir}/internal-report.md` — Step 5.3
+- [x] Report writes to `{workdir}/internal-report.md` (via draft/promote: writes draft first, promotes after approval) — Step 5.3 + 5.5
 - [x] Graceful degradation for partial upstream failures with [DATA UNAVAILABLE] markers — Step 5.0 degradation table
 - [x] User checkpoint with approval before save — Step 5.5
 - [x] Metadata header: repo URL, base/head SHA, source URL, generation time — Step 5.2 template header
