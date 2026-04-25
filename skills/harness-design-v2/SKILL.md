@@ -613,18 +613,23 @@ Brief "## Risk Assessment"               → Informs "## Dependencies" (risks th
 Brief "## Suggested Sub-task Breakdown"  → Sub-issues (see Step 5d)
 ```
 
-**Heading detection — fuzzy matching:** Codex may use slightly different heading names than instructed (e.g., "## Architecture" instead of "## Proposed Architecture"). Use **keyword-based matching** rather than exact string match:
+**Heading detection — fuzzy matching with priority:** Codex may use slightly different heading names than instructed (e.g., "## Architecture" instead of "## Proposed Architecture"). Use **keyword-based matching** with explicit priority ordering. **Process headings in the order listed below** — the first matching row wins. This prevents ambiguity when a heading matches multiple rows.
 
-| Target section | Match if heading contains (case-insensitive) |
-|----------------|----------------------------------------------|
-| Problem Statement | "problem" OR "statement" OR "context" OR "overview" |
-| Proposed Architecture | "architecture" OR "technical design" OR "design" (but NOT "design brief") |
-| Key Decisions | "decision" OR "tradeoff" OR "trade-off" |
-| Acceptance Criteria | "acceptance" OR "criteria" OR "requirements" |
-| Risk Assessment | "risk" OR "assessment" OR "concern" |
-| Sub-task Breakdown | "sub-task" OR "breakdown" OR "subtask" OR "implementation steps" |
+| Priority | Target section | Match if heading contains (case-insensitive) | Excludes |
+|----------|----------------|----------------------------------------------|----------|
+| 1 | Acceptance Criteria | "acceptance criteria" OR ("criteria" AND NOT "design") | — |
+| 2 | Key Decisions | "decision" OR "tradeoff" OR "trade-off" | — |
+| 3 | Risk Assessment | "risk" OR "assessment" | — |
+| 4 | Sub-task Breakdown | "sub-task" OR "breakdown" OR "subtask" OR "implementation steps" | — |
+| 5 | Problem Statement | "problem" OR "statement" OR "context" OR "overview" | "architectural overview" |
+| 6 | Proposed Architecture | "architecture" OR "technical design" | — |
+| 7 (catch-all) | — | Any remaining unmatched `##` heading | — |
 
-If a brief section does not match any target, log it: `Unmatched brief section: "## {heading}" — content will be appended to Architecture Notes.` Append unmatched sections to Architecture Notes rather than silently discarding them.
+**Priority rules:**
+- More specific matches (e.g., "acceptance criteria") are tested before generic keywords (e.g., "design")
+- "Key Decisions" is matched before "Proposed Architecture" to prevent "Design Decisions" from being captured by an "architecture" or "design" keyword
+- The `Excludes` column prevents false positives (e.g., "Non-functional Requirements" → does NOT match Acceptance Criteria)
+- **Catch-all (priority 7):** Unmatched sections are logged and appended to Architecture Notes: `Unmatched brief section: "## {heading}" — content appended to Architecture Notes.`
 
 **Construct the parent issue:**
 
@@ -840,16 +845,23 @@ C) Reject — exit without creating any issues
 - Proceed to Step 7 (Linear issue creation)
 
 **Revise:**
-- The user selects "Revise" which indicates they want changes. AskUserQuestion provides an "Other" option where the user can type free-form feedback.
-- If the user selected "Revise" without providing notes in the "Other" field, use a **follow-up AskUserQuestion** to collect specific feedback:
+- The user selects "Revise" which indicates they want changes. Check if the user provided notes in the AskUserQuestion response first.
+- **If the user provided notes** (non-empty text in the response): use those notes directly as the revision instructions. Do NOT ask a follow-up question.
+- **If the user selected "Revise" without providing notes:** Use a **follow-up AskUserQuestion** to collect specific feedback:
 
   ```
   What changes would you like to the proposal? Select the areas to revise:
   A) Parent issue title or description
   B) Sub-issue structure (add, remove, or rename sub-issues)
   C) Dependencies between sub-issues
-  D) Other (describe in text)
+  D) Other (describe in the text field below)
   ```
+
+  After the user selects a category, interpret the response and apply changes:
+  - **A (Parent issue):** Re-read the brief and regenerate the parent issue description. If the user provided specific notes with the category selection, incorporate those notes.
+  - **B (Sub-issue structure):** Re-read the brief's Sub-task Breakdown and regenerate sub-issues. If notes say "add X" or "remove Y", apply those specific edits.
+  - **C (Dependencies):** Adjust the `@@DEP:` graph based on the user's input. If no specific input, show the current dependency list and ask which to change.
+  - **D (Other):** Apply the user's free-text instructions directly to the schema proposal.
 
 - Apply the requested changes to the schema proposal
 - Re-validate affected descriptions (Step 5f)
@@ -948,7 +960,24 @@ mcp__linear-server__list_issues(
 )
 ```
 
-Compare returned issue titles against the parent title using **case-insensitive, whitespace-normalized** comparison (see 7d for details). If an exact match exists, record its ID as `PARENT_ISSUE_ID` and skip creation. Print: `Existing parent issue found: WHI-{id}. Skipping creation.`
+Compare returned issue titles against the parent title using **case-insensitive, whitespace-normalized** comparison (see 7d for details). If an exact match exists:
+
+1. Record its ID as `PARENT_ISSUE_ID`
+2. **Compare descriptions:** Read the existing issue's full description via `get_issue`. If the existing description differs from the newly generated description (beyond whitespace differences), warn the user:
+
+   ```
+   ⚠️  Existing parent issue WHI-{id} found with a different description than the current proposal.
+   ```
+
+   Use `AskUserQuestion`:
+   ```
+   A) Update the existing issue's description to match the current proposal
+   B) Keep the existing description as-is
+   ```
+
+   If the user picks A, call `save_issue(id: ..., description: "<new description>")` to update.
+
+3. Print: `Existing parent issue found: WHI-{id}. Skipping creation.`
 
 **If no match — create:**
 
@@ -997,7 +1026,12 @@ mcp__linear-server__list_issues(
 )
 ```
 
-Compare returned issue titles using **case-insensitive, whitespace-normalized** comparison: lowercase both, collapse whitespace to single spaces, trim. If a normalized match exists, skip creation — record the existing ID. If multiple partial matches are returned but none is an exact normalized match, proceed with creation (do not skip on fuzzy matches).
+Compare returned issue titles using **case-insensitive, whitespace-normalized** comparison: lowercase both, collapse whitespace to single spaces, trim. If a normalized match exists:
+- Record the existing ID in the title → ID map
+- **Compare descriptions:** If the existing description differs from the newly generated one, print `NOTE: Sub-issue "{title}" already exists (WHI-{id}) with a different description. Keeping existing description.` (Sub-issue descriptions are not auto-updated to avoid disrupting in-progress work; the user can manually update via Linear if needed.)
+- Skip creation
+
+If multiple partial matches are returned but none is an exact normalized match, proceed with creation (do not skip on fuzzy matches).
 
 **For each sub-issue:**
 
@@ -1030,10 +1064,13 @@ After ALL issues are created, rewrite descriptions to replace `@@DEP:<title>@@` 
 1. For every issue in the title → ID map whose description contains `@@DEP:...@@` tags:
    - Read the current description from Linear (not from the in-memory version) to catch any manual edits: `mcp__linear-server__get_issue(id: "<issue-id>")`
    - Build the final Dependencies section: replace each `@@DEP:<title>@@` with the resolved `WHI-<N>` from the title → ID map. Use **case-insensitive, whitespace-normalized** matching for the title lookup.
-   - Call `mcp__linear-server__save_issue(id: "<issue-id>", description: "<rewritten description>", blockedBy: ["<blocking-issue-id>"])` in a single call to update description AND set the blocking relation atomically
-   - **If this call fails:** Print `WARNING: Failed to resolve dependencies for "<title>": <error>`. Do NOT silently continue — the user must know which issues have unresolved dependency text.
+   - **Two-step update (description first, then relation):**
+     1. Call `mcp__linear-server__save_issue(id: "<issue-id>", description: "<rewritten description>")` to update the description text
+     2. Call `mcp__linear-server__save_issue(id: "<issue-id>", blockedBy: ["<blocking-issue-id>"])` to set the blocking relation
+   - **If the description update fails:** Print `WARNING: Failed to update description for "<title>": <error>`. The `@@DEP:` tags remain in the live description — on re-entry, this issue will be retried (tags still present → eligible for resolution).
+   - **If the `blockedBy` relation fails:** Print `WARNING: Description updated for "<title>" but blocking relation to WHI-{N} was NOT set. You must add this relation manually in Linear.` This ensures the user knows the relation is missing even though the description text looks correct.
 2. If a referenced title was not created (failed or skipped), replace the tag with `(dependency "<title>" — not created; see schema-proposal.md)` and print `WARNING: Unresolvable dependency "<title>" in issue "<issue title>".`
-3. Validate no `@@DEP:...@@` tags remain in any live description. If any remain after the pass, print a final warning listing them.
+3. **Final validation:** After the pass, re-read all issue descriptions from Linear (not in-memory) and check for any remaining `@@DEP:...@@` tags. If any remain, print a final warning listing the issue IDs and the unresolved tags. Also verify that every resolved `blockedBy` relation is actually set by checking `get_issue(includeRelations: true)` for each issue that should have a blocking relation.
 
 ### 7f. All issues in Backlog state
 
