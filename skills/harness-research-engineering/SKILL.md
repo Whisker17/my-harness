@@ -934,6 +934,7 @@ CLONE_DIR="$HOME/.gstack/tmp/research-${CHAIN_SLUG}-${UPGRADE_SLUG}"
 
 If `CLONE_DIR` already exists from a previous run, verify it's the correct repo and reuse it:
 ```bash
+clone_method=""
 if [ -d "$CLONE_DIR/.git" ]; then
   EXISTING_URL=$(git -C "$CLONE_DIR" remote get-url origin 2>/dev/null)
   if [ "$EXISTING_URL" = "$REPO_URL" ]; then
@@ -947,10 +948,10 @@ if [ -d "$CLONE_DIR/.git" ]; then
     rm -rf "$CLONE_DIR"
     # Fall through to fresh clone below
   fi
-else
-  # Fresh clone below
 fi
 ```
+
+**If `clone_method` is already `"reused"`, skip the clone steps below and proceed to Step 2.2.**
 
 **Primary clone strategy: treeless clone**
 
@@ -978,6 +979,9 @@ clone_method="treeless"
 Detection: match the repo URL against these patterns before cloning. If matched:
 ```bash
 timeout 300 git clone --filter=blob:none --no-checkout --depth=1000 "$REPO_URL" "$CLONE_DIR" 2>&1
+cd "$CLONE_DIR"
+git checkout HEAD
+clone_method="treeless"
 ```
 
 **Fallback: shallow clone**
@@ -1136,8 +1140,15 @@ HEAD_SHA=$(git rev-parse "$HEAD_REF" 2>/dev/null)
 - If `git rev-parse` fails for either ref → attempt to deepen:
   ```bash
   # For shallow/depth-limited clones, the tag's commit may be outside the boundary
-  git fetch origin "$BASE_REF" --depth=500 2>/dev/null || true
-  BASE_SHA=$(git rev-parse "$BASE_REF" 2>/dev/null)
+  # Deepen for whichever ref(s) failed
+  if [ -z "$BASE_SHA" ]; then
+    git fetch origin "$BASE_REF" --depth=500 2>/dev/null || true
+    BASE_SHA=$(git rev-parse "$BASE_REF" 2>/dev/null)
+  fi
+  if [ -z "$HEAD_SHA" ]; then
+    git fetch origin "$HEAD_REF" --depth=500 2>/dev/null || true
+    HEAD_SHA=$(git rev-parse "$HEAD_REF" 2>/dev/null)
+  fi
   ```
   If still fails after deepening → error:
   ```
@@ -1191,7 +1202,11 @@ For each changed file, extract:
   ```
   For added files (entire file is one hunk), set `num_hunks = 1`. For deleted files, set `num_hunks = 1`. For large diffs (>500 files), batch the hunk counting:
   ```bash
-  git diff -U0 "$BASE_SHA..$HEAD_SHA" | grep -E "^diff --git|^@@" | awk '/^diff/{file=$0; count=0} /^@@/{count++} /^diff/{if(NR>1)print prev_file, prev_count; prev_file=file; prev_count=count} END{print prev_file, prev_count}'
+  git diff -U0 "$BASE_SHA..$HEAD_SHA" | grep -E "^diff --git|^@@" | awk '
+    /^diff/{if(NR>1) print prev_file, count; prev_file=$0; count=0}
+    /^@@/{count++}
+    END{if(prev_file) print prev_file, count}
+  '
   ```
 
 **Step 2.4c — Categorize files**
@@ -1267,7 +1282,7 @@ Validation checks:
 8. Each file has non-null `path`, `status`, `category`, `lines_changed`, `lines_added`, `lines_deleted`, `num_hunks`
 9. Each `status` is one of: `added`, `modified`, `deleted`, `renamed`
 10. Each `category` is one of: `core`, `new_module`, `config`, `test`, `docs`, `dependency`, `other`
-11. `summary` is present with all required sub-fields (`total_files`, `added`, `modified`, `deleted`, `total_lines_changed`)
+11. `summary` is present with all required sub-fields (`total_files`, `added`, `modified`, `deleted`, `renamed`, `total_lines_changed`)
 12. `summary.total_files` equals `len(files)`
 13. `summary.added + summary.modified + summary.deleted + summary.renamed` equals `summary.total_files`
 
