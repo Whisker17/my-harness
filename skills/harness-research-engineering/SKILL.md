@@ -199,12 +199,9 @@ Linear integration is **opt-in** (D14). It tracks pipeline progress by creating 
 
 ### Enabling Linear Integration
 
-Linear integration is enabled when **either** of these conditions is true:
+Linear integration is enabled when the user passes `--linear <project>` in the invocation arguments. This is the only activation path — Input Resolution Step 2 (Linear project description lookup) resolves URLs from a project description but does NOT enable Linear progress tracking on its own.
 
-1. The user passes `--linear <project>` in the invocation arguments
-2. The `linear_project` input was resolved during Input Resolution (e.g., from a Linear project reference)
-
-If neither condition is met, set `LINEAR_ENABLED = false` and skip all Linear integration steps throughout the pipeline.
+If `--linear` is not present, set `LINEAR_ENABLED = false` and skip all Linear integration steps throughout the pipeline.
 
 ### State Variables
 
@@ -248,7 +245,15 @@ Use mcp__linear-server__save_issue with:
   team: "<LINEAR_TEAM>"
   project: "<LINEAR_PROJECT>"
   state: "In Progress"
-  description: "Automated protocol analysis run.\n\nChain: <chain>\nUpgrade: <upgrade_name>\nSource: <announcement_url>\nRepo: <repo>\n\nCreated by harness-research-engineering v1."
+  description: |
+    Automated protocol analysis run.
+
+    Chain: <chain>
+    Upgrade: <upgrade_name>
+    Source: <announcement_url>
+    Repo: <repo>
+
+    Created by harness-research-engineering v1.
 ```
 
 Store the returned issue ID as `LINEAR_PARENT_ISSUE_ID`.
@@ -318,7 +323,9 @@ On failure:
 
 ### Step L.4 — Final Report Comment
 
-After the final report is approved in Phase 5 (Step 5.5), post a summary comment on the parent issue:
+**On report approved (success)**, call `linear_final_report_comment()`:
+
+After the final report is approved in Phase 5 (Step 5.5) — or after Phase 7 completes in M2 pipelines — post a summary comment on the parent issue:
 
 ```
 If LINEAR_ENABLED == false: return (no-op)
@@ -354,8 +361,13 @@ Use mcp__linear-server__save_issue with:
   id: "<LINEAR_PARENT_ISSUE_ID>"
   state: "Done"
 
-On failure for either call:
-  Append to LINEAR_ERRORS: "[LINEAR WARNING] Failed to post final report comment: <error>"
+On failure for the comment call:
+  Append to LINEAR_ERRORS: "[LINEAR WARNING] Failed to post final report comment on parent issue <LINEAR_PARENT_ISSUE_ID>: <error>"
+  Print the warning.
+  Continue — the report is already saved to disk.
+
+On failure for the state-change call:
+  Append to LINEAR_ERRORS: "[LINEAR WARNING] Failed to mark parent issue <LINEAR_PARENT_ISSUE_ID> as Done: <error>. Issue remains In Progress — manual update required."
   Print the warning.
   Continue — the report is already saved to disk.
 ```
@@ -3888,7 +3900,7 @@ If the user approves:
 1. Rename the draft to the final path: move `{session_dir}/internal-report.draft.md` → `{session_dir}/internal-report.md`
 2. Delete the draft file if it still exists (the rename should have removed it)
 3. The report at `{session_dir}/internal-report.md` is the final deliverable
-4. **Linear hook (on completion):** Call `linear_phase_complete(5)`, then call `linear_final_report_comment()` (Step L.4 from the [Linear Integration](#linear-integration) section) to post the summary comment and mark the parent issue Done.
+4. **Linear hook (on completion):** Call `linear_phase_complete(5)`. If Phase 7 will NOT run (M1 pipeline or user declines knowledge indexing), also call `linear_final_report_comment()` (Step L.4) to post the summary comment and mark the parent issue Done. If Phase 7 will run, defer Step L.4 — it will be triggered by Phase 7's completion hook instead.
 5. Print confirmation and proceed to pipeline completion
 
 If the user aborts:
@@ -4357,15 +4369,15 @@ Session:     <session_dir>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-**Linear hook (on completion):** After the success banner is displayed, call `linear_phase_complete(7)`.
+**Linear hook (on completion):** After the success banner is displayed, call `linear_phase_complete(7)`, then call `linear_final_report_comment()` (Step L.4 from the [Linear Integration](#linear-integration) section) to post the summary comment and mark the parent issue Done. This is the M2 terminal hook — Step L.4 is deferred from Phase 5 to here when Phase 7 executes.
 
 ### Per-Phase Error Handling (Phase 7)
 
 | Phase 7 Scenario | Recovery Action |
 |-------------------|-----------------|
-| `internal-report.md` missing | Abort — report must be approved first |
+| `internal-report.md` missing | Abort — report must be approved first. **Linear hook:** call `linear_phase_failed(7, "Phase 7 aborted: internal-report.md not found — Phase 5 must be completed first")`, then call `linear_final_report_comment()` (Step L.4) to finalize the parent issue. |
 | Other artifacts missing | Extract fields from available artifacts; use `"[UNAVAILABLE]"` for missing fields |
-| Index directory cannot be created | Abort with clear error message |
+| Index directory cannot be created | Abort with clear error message. **Linear hook:** call `linear_phase_failed(7, "Phase 7 aborted: index directory creation failed — <error>")`, then call `linear_final_report_comment()` (Step L.4) to finalize the parent issue. |
 | Malformed JSON lines in existing index | Skip the line, log warning with line number, continue reading |
 | Dedup found + user chooses "skip" | Do not write; Phase 7 completes without index mutation |
 | Dedup found + user chooses "overwrite" | Remove old entry, append new entry |
