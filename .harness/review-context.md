@@ -53,6 +53,20 @@ Key decisions:
 
 https://github.com/Whisker17/my-harness/pull/25
 
+## V2 Convergence Review (Codex↔Opus)
+
+**Rounds:** 3 | **Final verdict:** ✅ PASS — converged
+
+| ID | Sev | Finding | Status | Round |
+|----|-----|---------|--------|-------|
+| F-001 | HIGH | Setup silently weakens Codex plugin invocation guard (setup.sh — not in PR diff) | Rebutted | R1 |
+| F-002 | HIGH | Append verification reports false success after failed write | Confirmed fixed | R2→R3 |
+| F-003 | MEDIUM | Overwrite recovery temp file deleted by trap on mv failure | Confirmed fixed | R2 |
+
+Fix commits: `86ffab7`, `0afa7b7`
+
+Full report: `.reviews/feat-WHI-235-knowledge-index/convergence-report.md`
+
 ## Acceptance Criteria Status
 
 - [x] 索引文件位于 `~/.gstack/research/research-index.jsonl` — Step 7.1 defines this path

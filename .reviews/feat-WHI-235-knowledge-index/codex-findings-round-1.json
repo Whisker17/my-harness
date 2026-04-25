@@ -1,0 +1,18 @@
+{
+  "verdict": "needs-attention",
+  "summary": "Setup performs a persistent, silent trust-boundary change in a third-party plugin cache to enable model invocation.",
+  "findings": [
+    {
+      "severity": "HIGH",
+      "title": "Setup silently weakens Codex plugin invocation guard",
+      "description": "`setup.sh` now mutates the installed `codex-plugin-cc` command file under `~/.claude/plugins/cache` by flipping `disable-model-invocation` to `false` during a general setup run. That flag is a trust-boundary guard on model-triggered plugin invocation; changing third-party plugin metadata in-place broadens what can invoke `codex:adversarial-review` without any user confirmation, provenance check, backup, or rollback. The likely impact is a persistent local security-policy change outside this repository, affecting future Claude Code sessions and surviving until the plugin cache is reinstalled or manually repaired.",
+      "file": "setup.sh",
+      "line_start": 258,
+      "line_end": 265,
+      "recommendation": "Remove the automatic `sed` mutation from `setup.sh`; if v2 truly requires this policy change, gate it behind explicit user consent with backup/restore and exact plugin file verification."
+    }
+  ],
+  "next_steps": [
+    "Make v2 setup report the blocked plugin setting as an actionable warning instead of mutating plugin cache state automatically."
+  ]
+}

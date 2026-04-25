@@ -1,0 +1,19 @@
+[codex] Starting Codex task thread.
+[codex] Thread ready (019dc519-f11f-74b3-a271-a8cf7a17dced).
+[codex] Turn started (019dc519-f1ca-7a20-9cb7-37bbb22bd871).
+[codex] Running command: bash -lc "nl -ba skills/harness-research-engineering/SKILL.md | sed -n '2388,2735p'"
+[codex] Running command: bash -lc "nl -ba skills/harness-research-engineering/SKILL.md | sed -n '2725,2785p'"
+# Codex Adversarial Review
+
+Target: branch diff against dev
+Verdict: needs-attention
+
+No-ship: Phase 7 can falsely report successful persistence and its advertised overwrite recovery path deletes the recovery artifact.
+
+Findings:
+- [high] Append verification can report success after a failed write (skills/harness-research-engineering/SKILL.md:2729-2745)
+- [medium] Overwrite recovery file is deleted on mv failure (skills/harness-research-engineering/SKILL.md:2692-2713)
+
+Next steps:
+- Fix the write verification to prove the new entry persisted, not just that the file remains parseable.
+- Correct the overwrite failure trap/message so manual recovery is possible and truthful.

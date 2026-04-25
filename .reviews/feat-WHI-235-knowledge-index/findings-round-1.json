@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "round": 1,
+  "status": "FAIL",
+  "verdict": "needs-attention",
+  "summary": "Setup performs a persistent, silent trust-boundary change in a third-party plugin cache to enable model invocation.",
+  "findings": [
+    {
+      "id": "F-001",
+      "severity": "HIGH",
+      "claim_title": "Setup silently weakens Codex plugin invocation guard",
+      "claim": "Setup silently weakens Codex plugin invocation guard: `setup.sh` now mutates the installed `codex-plugin-cc` command file under `~/.claude/plugins/cache` by flipping `disable-model-invocation` to `false` during a general setup run. That flag is a trust-boundary guard on model-triggered plugin invocation; changing third-party plugin metadata in-place broadens what can invoke `codex:adversarial-review` without any user confirmation, provenance check, backup, or rollback. The likely impact is a persistent local security-policy change outside this repository, affecting future Claude Code sessions and surviving until the plugin cache is reinstalled or manually repaired.",
+      "file": "setup.sh",
+      "line_start": 258,
+      "line_end": 265,
+      "suggested_fix": "Remove the automatic `sed` mutation from `setup.sh`; if v2 truly requires this policy change, gate it behind explicit user consent with backup/restore and exact plugin file verification.",
+      "status": "rebutted",
+      "resolution": "REBUT: setup.sh is not modified in this PR. The only files changed are skills/harness-research-engineering/SKILL.md and .harness/review-context.md. Codex reviewed the diff against main instead of dev, catching pre-existing code outside this PR's scope. This is a valid concern for the setup.sh author but is not attributable to WHI-235.",
+      "round_opened": 1,
+      "round_closed": 1
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "round": 2,
+  "status": "FAIL",
+  "verdict": "needs-attention",
+  "summary": "Phase 7 can falsely report successful persistence and its advertised overwrite recovery path deletes the recovery artifact.",
+  "findings": [
+    {
+      "id": "F-001",
+      "severity": "HIGH",
+      "claim_title": "Setup silently weakens Codex plugin invocation guard",
+      "claim": "Setup silently weakens Codex plugin invocation guard: `setup.sh` now mutates the installed `codex-plugin-cc` command file under `~/.claude/plugins/cache` by flipping `disable-model-invocation` to `false` during a general setup run.",
+      "file": "setup.sh",
+      "line_start": 258,
+      "line_end": 265,
+      "suggested_fix": "Remove the automatic `sed` mutation from `setup.sh`; if v2 truly requires this policy change, gate it behind explicit user consent with backup/restore and exact plugin file verification.",
+      "status": "rebutted",
+      "resolution": "REBUT: setup.sh is not modified in this PR. The only files changed are skills/harness-research-engineering/SKILL.md and .harness/review-context.md. Codex reviewed the diff against main instead of dev, catching pre-existing code outside this PR's scope. Not re-raised in round 2 (which used correct --base dev).",
+      "round_opened": 1,
+      "round_closed": 1
+    },
+    {
+      "id": "F-002",
+      "severity": "HIGH",
+      "claim_title": "Append verification can report success after a failed write",
+      "claim": "Append verification can report success after a failed write: The append path never checks whether the append command actually succeeded, and the read-back only proves that the current last line has a `schema_version`. If `echo ... >> \"$INDEX_FILE\"` fails on an existing index because of quota, permissions changes, NFS/transient I/O, or shell redirection failure, `tail -1` can still read the previous valid entry and the flow will print success even though the new entry was never persisted.",
+      "file": "skills/harness-research-engineering/SKILL.md",
+      "line_start": 2729,
+      "line_end": 2745,
+      "suggested_fix": "Check the append command exit status before validation, then validate that the last parsed line matches the new entry's exact dedup_key rather than only checking .schema_version.",
+      "status": "resolved",
+      "resolution": "RESOLVE: Append verification now captures echo exit status ($APPEND_STATUS) and checks it before proceeding. Read-back validates last line's dedup_key matches the expected value, not just schema_version. Commit 86ffab7.",
+      "round_opened": 2,
+      "round_closed": 2
+    },
+    {
+      "id": "F-003",
+      "severity": "MEDIUM",
+      "claim_title": "Overwrite recovery file is deleted on mv failure",
+      "claim": "Overwrite recovery file is deleted on mv failure: The overwrite failure branch promises that the temp file is preserved for manual recovery, but the cleanup trap is still active when `mv` fails and `exit 1` runs. In that failure path the trap removes `$TEMP_FILE`, so the new combined index that was supposed to be recoverable is deleted.",
+      "file": "skills/harness-research-engineering/SKILL.md",
+      "line_start": 2692,
+      "line_end": 2713,
+      "suggested_fix": "Disable or adjust the cleanup trap before the mv failure handler if the temp file should be preserved, e.g. mv ... || { trap - EXIT; echo ...; exit 1; }.",
+      "status": "resolved",
+      "resolution": "RESOLVE: mv failure handler now runs 'trap - EXIT' before exit 1, preserving the temp file for manual recovery as documented. Commit 86ffab7.",
+      "round_opened": 2,
+      "round_closed": 2
+    }
+  ]
+}
