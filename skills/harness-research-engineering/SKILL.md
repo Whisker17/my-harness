@@ -34,16 +34,17 @@ You are a protocol analysis engine for blockchain engineering research. The user
 1. [Preamble](#preamble) — prerequisite checks, directory bootstrap, stale cleanup
 2. [Mode Selection](#mode-selection) — detect analysis mode from user input
 3. [Input Resolution](#input-resolution) — resolve required inputs (URLs, refs)
-4. [Agent Roles](#agent-roles) — role definitions for pipeline agents
-5. [Artifact Schemas](#artifact-schemas) — JSON schemas for intermediate artifacts and validation gates
-6. [Phase 1: Source Ingestion](#phase-1-source-ingestion) — fallback chain fetch, claims extraction, source snapshot, user checkpoint
-7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — treeless clone, fuzzy tag matching, SHA resolution, diff-map generation
-8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — claim batching, evidence mapping, code-first delta pass, quality gates
-9. [Phase 6: Verification](#phase-6-verification) — independent claim verification via Agent subagent, dispute detection, fix-verify loop
-10. [Phase 4: Cross-Reference Analysis](#phase-4-cross-reference-analysis) — knowledge index query, chain association mapping, cross-version comparison
-11. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
-12. [Phase 7: Knowledge Index Management](#phase-7-knowledge-index-management) — dedup check, public/internal separation, append-only JSONL, malformed line handling
-13. [Failure and Abort](#failure-and-abort) — error handling and cleanup
+4. [Linear Integration](#linear-integration) — opt-in progress tracking via Linear (parent issue, lazy sub-issues, graceful degradation)
+5. [Agent Roles](#agent-roles) — role definitions for pipeline agents
+6. [Artifact Schemas](#artifact-schemas) — JSON schemas for intermediate artifacts and validation gates
+7. [Phase 1: Source Ingestion](#phase-1-source-ingestion) — fallback chain fetch, claims extraction, source snapshot, user checkpoint
+8. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — treeless clone, fuzzy tag matching, SHA resolution, diff-map generation
+9. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — claim batching, evidence mapping, code-first delta pass, quality gates
+10. [Phase 6: Verification](#phase-6-verification) — independent claim verification via Agent subagent, dispute detection, fix-verify loop
+11. [Phase 4: Cross-Reference Analysis](#phase-4-cross-reference-analysis) — knowledge index query, chain association mapping, cross-version comparison
+12. [Phase 5: Report Generation](#phase-5-report-generation) — artifact validation with graceful degradation, internal report synthesis, user checkpoint
+13. [Phase 7: Knowledge Index Management](#phase-7-knowledge-index-management) — dedup check, public/internal separation, append-only JSONL, malformed line handling
+14. [Failure and Abort](#failure-and-abort) — error handling and cleanup
 
 ---
 
@@ -142,6 +143,7 @@ Once the mode is detected, resolve the required inputs. For `upgrade-analysis`, 
 | `repo` | Yes | Git repository URL to analyze |
 | `base_ref` | No | Git ref for the "before" state (tag, branch, or SHA) |
 | `head_ref` | No | Git ref for the "after" state (tag, branch, or SHA) |
+| `linear_project` | No | Linear project name or ID for progress tracking (enables Linear integration). Pass via `--linear <project>` flag. |
 
 ### Resolution order (3-step)
 
@@ -152,7 +154,10 @@ Parse the user's invocation for URLs and git refs. Examples:
 ```
 /harness-research-engineering analyze Base Azul https://blog.base.org/azul https://github.com/base-org/node
 /harness-research-engineering 研究 Base Azul 升级 --repo https://github.com/base-org/node --announcement https://blog.base.org/azul
+/harness-research-engineering analyze Base Azul https://blog.base.org/azul https://github.com/base-org/node --linear WHI-project
 ```
+
+Parse `--linear <value>` to extract `linear_project`. The value can be a Linear project name, ID, or slug. If `--linear` is not present, set `LINEAR_ENABLED = false` — the pipeline runs without any Linear integration (no Linear output, no Linear errors).
 
 If all required inputs are found, proceed to the pipeline. Skip Steps 2 and 3.
 
@@ -183,6 +188,205 @@ For missing `repo`:
 
 For missing `base_ref` and `head_ref` (optional — can be auto-detected in Phase 2):
 > These are resolved during Phase 2 (codebase navigation) via tag matching. Only ask if auto-detection fails.
+
+---
+
+## Linear Integration
+
+> **Implemented by:** WHI-237
+
+Linear integration is **opt-in** (D14). It tracks pipeline progress by creating a parent issue and lazy sub-issues in Linear. When disabled (the default), no Linear API calls are made and no Linear-related output appears.
+
+### Enabling Linear Integration
+
+Linear integration is enabled when the user passes `--linear <project>` in the invocation arguments. This is the only activation path — Input Resolution Step 2 (Linear project description lookup) resolves URLs from a project description but does NOT enable Linear progress tracking on its own.
+
+If `--linear` is not present, set `LINEAR_ENABLED = false` and skip all Linear integration steps throughout the pipeline.
+
+### State Variables
+
+When `LINEAR_ENABLED = true`, maintain these pipeline-scoped variables:
+
+```
+LINEAR_ENABLED = true
+LINEAR_PROJECT = "<project name or ID>"  # from --linear flag or input resolution
+LINEAR_TEAM = "<team name>"              # resolved from project metadata
+LINEAR_PARENT_ISSUE_ID = null            # set after parent issue creation
+LINEAR_SUB_ISSUES = {}                   # map of phase_number → issue_id (populated lazily)
+LINEAR_ERRORS = []                       # accumulated warning log for Methodology section
+```
+
+### Step L.1 — Resolve Project and Team
+
+Before the pipeline starts (after Input Resolution, before Phase 1), resolve the Linear project and team:
+
+```
+Use mcp__linear-server__get_project with query: "<LINEAR_PROJECT>"
+```
+
+Extract:
+- `project_id` — the resolved project ID
+- `team` — the team associated with the project (for issue creation)
+
+**On failure:** Log warning, set `LINEAR_ENABLED = false`, continue pipeline without Linear.
+
+```
+[LINEAR WARNING] Failed to resolve project "<LINEAR_PROJECT>": <error>
+Linear integration disabled — pipeline will continue without progress tracking.
+```
+
+### Step L.2 — Create Parent Issue
+
+Create a single parent issue to represent the entire analysis run:
+
+```
+Use mcp__linear-server__save_issue with:
+  title: "Protocol Analysis: <chain> <upgrade_name>"
+  team: "<LINEAR_TEAM>"
+  project: "<LINEAR_PROJECT>"
+  state: "In Progress"
+  description: |
+    Automated protocol analysis run.
+
+    Chain: <chain>
+    Upgrade: <upgrade_name>
+    Source: <announcement_url>
+    Repo: <repo>
+
+    Created by harness-research-engineering v1.
+```
+
+Store the returned issue ID as `LINEAR_PARENT_ISSUE_ID`.
+
+**On failure:** Log warning, set `LINEAR_ENABLED = false`, continue pipeline.
+
+```
+[LINEAR WARNING] Failed to create parent issue: <error>
+Linear integration disabled — pipeline will continue without progress tracking.
+```
+
+### Step L.3 — Phase Sub-Issue Lifecycle (Lazy Creation — D5)
+
+Sub-issues are created **lazily** — only when a phase actually starts. If the pipeline aborts at Phase 2, only Phase 1 and Phase 2 sub-issues exist.
+
+**On phase start**, call `linear_phase_start(phase_number, phase_name)`:
+
+```
+If LINEAR_ENABLED == false: return (no-op)
+
+Use mcp__linear-server__save_issue with:
+  title: "Phase <phase_number>: <phase_name> — <chain> <upgrade_name>"
+  team: "<LINEAR_TEAM>"
+  project: "<LINEAR_PROJECT>"
+  parentId: "<LINEAR_PARENT_ISSUE_ID>"
+  state: "In Progress"
+
+Store returned issue ID in LINEAR_SUB_ISSUES[phase_number].
+
+On failure:
+  Append to LINEAR_ERRORS: "[LINEAR WARNING] Failed to create sub-issue for Phase <N>: <error>"
+  Print the warning.
+  Do NOT abort the phase — continue execution.
+```
+
+**On phase completion (success)**, call `linear_phase_complete(phase_number)`:
+
+```
+If LINEAR_ENABLED == false: return (no-op)
+If LINEAR_SUB_ISSUES[phase_number] is null: return (sub-issue creation had failed)
+
+Use mcp__linear-server__save_issue with:
+  id: "<LINEAR_SUB_ISSUES[phase_number]>"
+  state: "Done"
+
+On failure:
+  Append to LINEAR_ERRORS: "[LINEAR WARNING] Failed to update sub-issue for Phase <N> to Done: <error>"
+  Print the warning.
+  Continue.
+```
+
+**On phase failure**, call `linear_phase_failed(phase_number, error_message)`:
+
+```
+If LINEAR_ENABLED == false: return (no-op)
+If LINEAR_SUB_ISSUES[phase_number] is null: return (sub-issue creation had failed)
+
+Use mcp__linear-server__save_comment with:
+  issueId: "<LINEAR_SUB_ISSUES[phase_number]>"
+  body: "Phase <N> failed:\n\n<error_message>\n\nThe sub-issue remains In Progress. Manual resolution required."
+
+On failure:
+  Append to LINEAR_ERRORS: "[LINEAR WARNING] Failed to comment on Phase <N> failure: <error>"
+  Print the warning.
+  Continue.
+```
+
+### Step L.4 — Final Report Comment
+
+**On report approved (success)**, call `linear_final_report_comment()`:
+
+After the final report is approved in Phase 5 (Step 5.5) — or after Phase 7 completes in M2 pipelines — post a summary comment on the parent issue:
+
+```
+If LINEAR_ENABLED == false: return (no-op)
+If LINEAR_PARENT_ISSUE_ID is null: return
+
+Use mcp__linear-server__save_comment with:
+  issueId: "<LINEAR_PARENT_ISSUE_ID>"
+  body: |
+    ## Analysis Complete
+
+    **Report:** `<session_dir>/internal-report.md`
+
+    ### Pipeline Summary
+    - **Chain:** <chain>
+    - **Upgrade:** <upgrade_name>
+    - **Phases completed:** <list of completed phase numbers>
+    - **Claims analyzed:** <N total> (<N confirmed> ✅, <N partial> ⚠️, <N unverified> ❌)
+    - **Unreported changes:** <N>
+
+    ### Report Sections
+    - Executive Summary
+    - Claims Analysis (<N claims>)
+    - Unclaimed Changes (<N changes>)
+    - Methodology
+    - Raw Data References
+
+    <if LINEAR_ERRORS is non-empty:>
+    ### Linear Integration Warnings
+    <list each warning>
+    <end if>
+
+Use mcp__linear-server__save_issue with:
+  id: "<LINEAR_PARENT_ISSUE_ID>"
+  state: "Done"
+
+On failure for the comment call:
+  Append to LINEAR_ERRORS: "[LINEAR WARNING] Failed to post final report comment on parent issue <LINEAR_PARENT_ISSUE_ID>: <error>"
+  Print the warning.
+  Continue — the report is already saved to disk.
+
+On failure for the state-change call:
+  Append to LINEAR_ERRORS: "[LINEAR WARNING] Failed to mark parent issue <LINEAR_PARENT_ISSUE_ID> as Done: <error>. Issue remains In Progress — manual update required."
+  Print the warning.
+  Continue — the report is already saved to disk.
+```
+
+### Graceful Degradation Summary
+
+Every Linear API call in this section follows the same pattern:
+
+1. **Check `LINEAR_ENABLED`** — if false, skip entirely (no-op)
+2. **Attempt the API call**
+3. **On failure:**
+   - Log a warning: `[LINEAR WARNING] <operation>: <error>`
+   - Append to `LINEAR_ERRORS` array
+   - **Do NOT abort the pipeline phase** — continue execution
+   - If the failure is in Step L.1 or L.2 (setup), disable Linear entirely for the rest of the run
+
+The `LINEAR_ERRORS` array is included in:
+- The final report comment (Step L.4)
+- The report's Methodology section (Phase 5 adds a "Linear Integration Status" subsection)
 
 ---
 
@@ -904,6 +1108,8 @@ else:
 
 Phase 1 fetches the announcement source, extracts structured claims, and saves a reproducible snapshot. This is the entry point of the pipeline — all subsequent phases depend on its output.
 
+**Linear hook (on start):** Call `linear_phase_start(1, "Source Ingestion")` — creates a sub-issue if Linear is enabled.
+
 **Agent role:** `source_ingestion_agent` (see [Agent Roles](#1-source_ingestion_agent-phase-1))
 
 ### Step 1.0 — Session Directory Bootstrap
@@ -1137,6 +1343,9 @@ Use AskUserQuestion:
 
 If the user provides corrections or additions, update claims.json, re-run validation (Step 1.6), and re-display the updated summary. Repeat until the user approves.
 
+**Linear hook (on completion):** After user approves, call `linear_phase_complete(1)`.
+**Linear hook (on abort):** If user chooses "Abort pipeline", call `linear_phase_failed(1, "User aborted pipeline at Phase 1 checkpoint")`.
+
 **Output artifacts:**
 ```
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/claims.json
@@ -1150,6 +1359,8 @@ If the user provides corrections or additions, update claims.json, re-run valida
 > **Implemented by:** WHI-230
 
 Phase 2 clones the target repository, identifies the git refs that bracket the upgrade, and produces a structured diff map of every file that changed. This bridges "what the announcement claimed" to "what the code actually changed."
+
+**Linear hook (on start):** Call `linear_phase_start(2, "Codebase Navigation")`.
 
 **Agent role:** `codebase_navigation_agent` (see [Agent Roles](#2-codebase_navigation_agent-phase-2))
 
@@ -1620,6 +1831,9 @@ Use AskUserQuestion:
 
 If the user provides corrections, update the relevant steps, re-generate diff-map.json, re-validate, and re-display.
 
+**Linear hook (on completion):** After user approves, call `linear_phase_complete(2)`.
+**Linear hook (on abort):** If user chooses "Abort pipeline", call `linear_phase_failed(2, "User aborted pipeline at Phase 2 checkpoint")`.
+
 **Output artifacts:**
 ```
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/diff-map.json
@@ -1639,6 +1853,8 @@ Cleanup: Clone is kept alive until the pipeline completes (Phase 5 in M1; Phase 
 > **Implemented by:** WHI-231
 
 Phase 3 is the core analysis stage: cross-reference Phase 1 claims against Phase 2 diff data to verify which claims have code evidence, then independently scan the diff for important changes the announcement didn't mention.
+
+**Linear hook (on start):** Call `linear_phase_start(3, "Implementation Analysis")`.
 
 **Agent role:** `implementation_analysis_agent` (see [Agent Roles > implementation_analysis_agent](#3-implementation_analysis_agent-phase-3))
 
@@ -2112,6 +2328,9 @@ If the user overrides claim statuses:
 3. Re-compute summary statistics
 4. Re-validate and save
 
+**Linear hook (on completion):** After user approves (any non-abort option), call `linear_phase_complete(3)`.
+**Linear hook (on abort):** If user chooses "Abort pipeline", call `linear_phase_failed(3, "User aborted pipeline at Phase 3 checkpoint")`.
+
 **Output artifacts:**
 ```
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/analysis.json
@@ -2124,6 +2343,8 @@ If the user overrides claim statuses:
 > **Implemented by:** WHI-234
 
 Phase 6 is the pipeline's quality assurance layer: an independent Agent subagent acting as Devil's Advocate re-examines the top 10 claims from Phase 3, challenging whether the evidence actually supports each conclusion. It does NOT trust Phase 3's judgment — it forms its own opinion from the evidence alone. When the reviewer disagrees with Phase 3, a fix-verify loop attempts resolution (max 3 rounds).
+
+**Linear hook (on start):** Call `linear_phase_start(6, "Verification")`.
 
 **Agent role:** `verification_agent` (see [Agent Roles > verification_agent](#6-verification_agent-phase-6--m2))
 
@@ -2739,6 +2960,9 @@ If the user selects "Looks good — proceed to report generation":
 1. Run Phase 4 (Cross-Reference Analysis) — this is non-interactive and runs automatically.
 2. Proceed to Phase 5 (Report Generation).
 
+**Linear hook (on completion):** After user approves (any non-abort option), call `linear_phase_complete(6)`.
+**Linear hook (on abort):** If user chooses "Abort pipeline", call `linear_phase_failed(6, "User aborted pipeline at Phase 6 checkpoint")`.
+
 **Output artifacts:**
 ```
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/verification-report.json
@@ -2754,6 +2978,8 @@ If the user selects "Looks good — proceed to report generation":
 Phase 4 queries the knowledge index for prior analyses on the same chain, same repo, or related chains, and compares them against the current analysis. This is the "research compound interest" mechanism — each new analysis builds on previous findings to detect cross-version evolution patterns.
 
 Phase 4 runs after Phase 6 (verification) and before Phase 5 (report generation). When the knowledge index is empty or contains no relevant entries, Phase 4 outputs an empty comparison.json and logs a skip message — the pipeline continues normally.
+
+**Linear hook (on start):** Call `linear_phase_start(4, "Cross-Reference Analysis")`.
 
 **Agent role:** `comparison_agent` (see [Agent Roles > comparison_agent](#4-comparison_agent-phase-4--m2))
 
@@ -3151,6 +3377,9 @@ Relevant:   <len(relevant_entries)> entries matched
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/comparison.json
 ```
 
+**Linear hook (on completion):** Call `linear_phase_complete(4)` after summary output.
+**Linear hook (on failure):** If Phase 4 aborts (e.g., analysis.json missing and comparison cannot proceed), call `linear_phase_failed(4, "<error>")`. Note: most Phase 4 failures produce an empty comparison.json rather than aborting, so the failure hook is rarely triggered.
+
 ---
 
 ## Phase 5: Report Generation
@@ -3158,6 +3387,8 @@ Relevant:   <len(relevant_entries)> entries matched
 > **Implemented by:** WHI-232
 
 Phase 5 synthesizes all upstream artifacts into a structured internal technical report. This is the M1 terminal phase — the report is the primary deliverable that answers "is this tool useful for researchers?"
+
+**Linear hook (on start):** Call `linear_phase_start(5, "Report Generation")`.
 
 **Agent role:** `report_generation_agent` (see [Agent Roles > report_generation_agent](#5-report_generation_agent-phase-5))
 
@@ -3493,6 +3724,13 @@ Document the pipeline execution:
 - Errors or skipped steps: <document any degradation>
 - Source fetch method: <webfetch/websearch/user_paste or unknown>
 - Clone method: <treeless/shallow/reused/local or unknown>
+- Linear integration: <"enabled (project: <LINEAR_PROJECT>)" | "disabled (not requested)" | "disabled (API failure during setup)">
+  - <if LINEAR_ENABLED was true at any point:>
+  - Parent issue: <LINEAR_PARENT_ISSUE_ID or "creation failed">
+  - Sub-issues created: <count> / <phases executed count>
+  - Warnings: <count from LINEAR_ERRORS>
+  - <for each warning in LINEAR_ERRORS: list the warning text>
+  - <end if>
 
 ## Raw Data References
 
@@ -3662,12 +3900,14 @@ If the user approves:
 1. Rename the draft to the final path: move `{session_dir}/internal-report.draft.md` → `{session_dir}/internal-report.md`
 2. Delete the draft file if it still exists (the rename should have removed it)
 3. The report at `{session_dir}/internal-report.md` is the final deliverable
-4. Print confirmation and proceed to pipeline completion
+4. **Linear hook (on completion):** Call `linear_phase_complete(5)`. If Phase 7 will NOT run (M1 pipeline or user declines knowledge indexing), also call `linear_final_report_comment()` (Step L.4) to post the summary comment and mark the parent issue Done. If Phase 7 will run, defer Step L.4 — it will be triggered by Phase 7's completion hook instead.
+5. Print confirmation and proceed to pipeline completion
 
 If the user aborts:
 1. Delete `{session_dir}/internal-report.draft.md`
 2. Print: "Draft report discarded. No final report was saved."
 3. The session directory retains upstream artifacts but has no `internal-report.md`
+4. **Linear hook (on abort):** Call `linear_phase_failed(5, "User discarded report at Phase 5 checkpoint")`.
 
 **Output artifacts:**
 ```
@@ -3714,6 +3954,8 @@ The following error handling framework applies across all pipeline phases. Phase
 Phase 7 persists the analysis results to the knowledge index — an append-only JSONL file at `~/.gstack/research/research-index.jsonl`. This is the "research compound interest" storage layer: as analyses accumulate, cross-referencing (Phase 4) becomes increasingly valuable.
 
 Phase 7 runs after Phase 5 (report generation) and after the user has approved the final report. It is the last phase in the M2 pipeline.
+
+**Linear hook (on start):** Call `linear_phase_start(7, "Knowledge Index Management")`.
 
 **Agent role:** `knowledge_index_agent` (see [Agent Roles > knowledge_index_agent](#7-knowledge_index_agent-phase-7))
 
@@ -4127,13 +4369,15 @@ Session:     <session_dir>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
+**Linear hook (on completion):** After the success banner is displayed, call `linear_phase_complete(7)`, then call `linear_final_report_comment()` (Step L.4 from the [Linear Integration](#linear-integration) section) to post the summary comment and mark the parent issue Done. This is the M2 terminal hook — Step L.4 is deferred from Phase 5 to here when Phase 7 executes.
+
 ### Per-Phase Error Handling (Phase 7)
 
 | Phase 7 Scenario | Recovery Action |
 |-------------------|-----------------|
-| `internal-report.md` missing | Abort — report must be approved first |
+| `internal-report.md` missing | Abort — report must be approved first. **Linear hook:** call `linear_phase_failed(7, "Phase 7 aborted: internal-report.md not found — Phase 5 must be completed first")`, then call `linear_final_report_comment()` (Step L.4) to finalize the parent issue. |
 | Other artifacts missing | Extract fields from available artifacts; use `"[UNAVAILABLE]"` for missing fields |
-| Index directory cannot be created | Abort with clear error message |
+| Index directory cannot be created | Abort with clear error message. **Linear hook:** call `linear_phase_failed(7, "Phase 7 aborted: index directory creation failed — <error>")`, then call `linear_final_report_comment()` (Step L.4) to finalize the parent issue. |
 | Malformed JSON lines in existing index | Skip the line, log warning with line number, continue reading |
 | Dedup found + user chooses "skip" | Do not write; Phase 7 completes without index mutation |
 | Dedup found + user chooses "overwrite" | Remove old entry, append new entry |
@@ -4149,7 +4393,12 @@ If the skill is interrupted, errors out, or the user aborts mid-pipeline:
 - **Phases 1-4, 6:** Partial artifacts are saved to disk. No knowledge index entry is created. v1 does NOT support resume-from-phase. If interrupted, re-run from scratch. Partial artifacts remain on disk for manual reference.
 - **Phase 7:** If interrupted after the append but before confirmation, the index entry is already written (append-only). On re-invocation, the dedup check (Step 7.4) will detect the existing entry and offer overwrite/keep-both/skip. If interrupted before the append, no index entry exists — re-run Phase 7 after ensuring the report is approved.
 - **Temp repo clone:** Always clean up on exit (success, error, or abort). Stale directories (>24h in `~/.gstack/tmp/research-*`) are cleaned on next invocation by the preamble.
-- **Linear issues:** Sub-issues remain in their current state (In Progress, not Done). The user must manually resolve or re-run.
+- **Linear issues (when LINEAR_ENABLED):**
+  - Sub-issues for completed phases remain in Done state (correct).
+  - Sub-issues for the interrupted phase remain in In Progress — the user must manually resolve or re-run.
+  - The parent issue remains in In Progress — it is only moved to Done when Phase 5 completes successfully and the final report comment is posted (Step L.4).
+  - No automatic cleanup of orphaned sub-issues — the scope boundary (WHI-237) explicitly excludes this.
+  - If `LINEAR_ENABLED` was set to false mid-run due to API failures, the `LINEAR_ERRORS` array documents which operations failed.
 
 ```bash
 # Cleanup trap pattern (used within pipeline phases)

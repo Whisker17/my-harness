@@ -1,0 +1,28 @@
+{
+  "verdict": "fail",
+  "summary": "The branch introduces a silent local security-policy mutation and an automated merge path without an explicit final human approval gate.",
+  "findings": [
+    {
+      "severity": "HIGH",
+      "title": "Setup silently weakens plugin invocation guard",
+      "description": "The general setup path silently changes a third-party Claude Code plugin command from `disable-model-invocation: true` to `false`. That is a persistent trust-boundary change outside this repo, applied without explicit opt-in, version/content verification, backup, or rollback. A normal `./setup.sh` run for optional v2 support can therefore broaden future model-invoked plugin behavior across Claude Code sessions, not just this harness run.",
+      "file": "setup.sh",
+      "line_start": 254,
+      "line_end": 265,
+      "recommendation": "Remove the automatic `sed` mutation. If v2 requires this, put it behind an explicit flag or confirmation prompt, verify the exact plugin file/version/hash, create a backup, and print restore instructions."
+    },
+    {
+      "severity": "HIGH",
+      "title": "Review v2 can merge without explicit human approval",
+      "description": "The new v2 review flow routes a model-only `PASS`/`PASS_WITH_NOTES` directly into the approval path and then executes `gh pr merge ... --delete-branch`. There is no final human confirmation gate between the generated review report and the merge. This violates the repo's stated invariant that PRs are not merged until the user explicitly says review is finished, and it makes a successful automated convergence loop capable of irreversibly merging and deleting branches when the user only intended to run review.",
+      "file": "skills/harness-review-v2/SKILL.md",
+      "line_start": 1241,
+      "line_end": 1334,
+      "recommendation": "Add an explicit user approval gate after the final report and before Step 9b, or split merge/cleanup into a separate command/flag so `/harness-review-v2` cannot merge on model verdict alone."
+    }
+  ],
+  "next_steps": [
+    "Remove or explicitly gate the plugin-cache mutation in setup.",
+    "Add a human approval checkpoint before v2 review merges PRs."
+  ]
+}
