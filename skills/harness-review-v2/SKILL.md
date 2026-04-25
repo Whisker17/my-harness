@@ -1238,11 +1238,225 @@ Please review the disputed findings and decide how to proceed.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
+After the console output, proceed to Step 9 (Approval) or Step 10 (Rejection) based on `LOOP_STATUS`:
+
+- `PASS` or `PASS_WITH_NOTES` → **Step 9 — Approval Path**
+- `ESCALATED` → **Step 10 — Rejection Path**
+
+---
+
+## Step 9 — Approval Path
+
+**Only proceed here if: `LOOP_STATUS` is `PASS` or `PASS_WITH_NOTES`.**
+
+### 9a. CI Check (pre-merge safety)
+
+Before merging, verify CI status on the PR:
+
+```bash
+gh pr checks ${PR_NUMBER} 2>/dev/null || echo "No CI checks configured"
+```
+
+If any check has **failed** status:
+
+```
+❌  STOP: CI checks are failing for PR #<PR_NUMBER>.
+
+Failing checks:
+  - <check name>: <status>
+
+Cannot merge with failing CI. Fix the failures and re-invoke /harness-review-v2.
+```
+
+Then STOP — do NOT merge even if the convergence loop passed.
+
+If checks are **pending**, wait briefly:
+
+```bash
+sleep 30
+gh pr checks ${PR_NUMBER} 2>/dev/null
+```
+
+If still pending after the second check, report the pending state and ask the user whether to wait or abort. Do NOT auto-merge with pending checks.
+
+### 9b. Merge the PR
+
+```bash
+gh pr merge ${PR_NUMBER} --merge --delete-branch
+```
+
+Verify the merge succeeded by checking the output for "Merged pull request".
+
+**On failure:** Warn but do NOT panic. Print the error and preserve the worktree. The review report is still valid — the user can merge manually.
+
+### 9c. Sync dev branch
+
+```bash
+cd "$REPO_ROOT"
+git checkout dev && git pull origin dev
+```
+
+### 9d. Remove the worktree
+
+Detect the worktree path from the feature branch:
+
+```bash
+WORKTREE_PATH=$(git worktree list | grep "${BRANCH_NAME}" | awk '{print $1}')
+git worktree remove "$WORKTREE_PATH"
+```
+
+If the worktree removal fails (uncommitted changes, etc.), warn but do NOT block — the merge already happened. Tell the user to clean it up manually.
+
+### 9e. Delete the local feature branch
+
+```bash
+git branch -d "$BRANCH_NAME"
+```
+
+If the branch deletion fails, warn but do NOT block.
+
+### 9f. Verify and delete remote feature branch
+
+`--delete-branch` on `gh pr merge` is unreliable when run inside a worktree. Always verify:
+
+```bash
+git ls-remote --heads origin "$BRANCH_NAME" | grep -q . && git push origin --delete "$BRANCH_NAME"
+```
+
+### 9g. Move Linear issue to Done
+
+Extract the issue ID from the branch name (pattern: `WHI-<N>`).
+
+Use `mcp__linear-server__save_issue` with `id: "<issue-id>", state: "Done"`.
+
+Also move any sub-issues that are not yet Done: use `mcp__linear-server__list_issues` with `parentId: "<issue-id>"` then update each to Done.
+
+**On failure:** Warn, but do NOT roll back the merge. The code is merged — Linear state can be fixed manually.
+
+### 9h. Post Linear comment
+
+Use `mcp__linear-server__save_comment` with `issueId: "<issue-id>"` and body:
+
+```markdown
+## Review v2: Approved & Merged
+
+**PR:** <PR URL> (merged)
+**Branch:** <BRANCH_NAME> (deleted)
+**Rounds:** {ROUND_N}
+**Status:** {LOOP_STATUS}
+
+### Summary
+- Total findings: {TOTAL_FINDINGS}
+- Resolved: {RESOLVED_COUNT} | Confirmed fixed: {CONFIRMED_FIXED_COUNT}
+- Rebutted: {REBUTTED_COUNT} | Deferred: {DEFERRED_COUNT}
+
+Review report: `.reviews/{BRANCH_SAFE}/review-report.md`
+```
+
+### 9i. Output success message
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅  Review PASSED — merged and closed
+
+PR:      <PR URL> (merged)
+Branch:  <BRANCH_NAME> (deleted)
+Status:  Done (Linear updated)
+
+Rounds:  {ROUND_N}
+Findings: {TOTAL_FINDINGS} total | {RESOLVED_COUNT} resolved | {CONFIRMED_FIXED_COUNT} confirmed fixed
+Review report: .reviews/{BRANCH_SAFE}/review-report.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## Step 10 — Rejection Path
+
+**Only proceed here if: `LOOP_STATUS` is `ESCALATED`.**
+
+Do NOT merge. Do NOT move the issue out of "In Review".
+
+### 10a. Post GitHub PR review comment
+
+Use `gh pr review` to post a review requesting changes:
+
+```bash
+gh pr review ${PR_NUMBER} --request-changes --body "$(cat <<'REVIEW_EOF'
+## harness-review-v2 — Changes Requested
+
+**Verdict:** ESCALATED — convergence loop did not resolve all findings after {ROUND_N} rounds
+
+### Findings Summary
+- Total findings: {TOTAL_FINDINGS}
+- Resolved: {RESOLVED_COUNT} | Confirmed fixed: {CONFIRMED_FIXED_COUNT}
+- Rebutted: {REBUTTED_COUNT} | Deferred: {DEFERRED_COUNT}
+- **Unresolved: {UNRESOLVED_COUNT}** (disputed: {DISPUTED_COUNT}, open: {OPEN_COUNT})
+
+### Unresolved Findings
+
+<For each unresolved finding:>
+- **{finding.id} [{finding.severity}]** — {finding.claim_title}
+  File: {finding.file}:{finding.line_start}-{finding.line_end}
+  Claim: {finding.claim}
+  Status: {finding.status}
+
+### How to proceed
+
+1. Review the unresolved findings in `.reviews/{BRANCH_SAFE}/review-report.md`
+2. Fix or rebut the remaining issues in the feature branch
+3. Push the fixes to `{BRANCH_NAME}`
+4. Re-invoke `/harness-review-v2` for another review pass
+
+*Reviewed by harness-review-v2 (Codex↔Opus convergence) — do not merge until all medium+ findings are resolved*
+REVIEW_EOF
+)"
+```
+
+### 10b. Post Linear comment
+
+Use `mcp__linear-server__save_comment` with `issueId: "<issue-id>"` and body:
+
+```markdown
+## Review v2: Changes Requested
+
+**PR:** <PR URL>
+**Verdict:** ESCALATED — {UNRESOLVED_COUNT} findings remain unresolved after {ROUND_N} rounds
+
+### Unresolved Findings
+
+<For each unresolved finding: id, severity, claim_title, status>
+
+### Next Step
+
+Review the findings in `.reviews/{BRANCH_SAFE}/review-report.md`, fix or rebut the remaining issues, push to `{BRANCH_NAME}`, and re-invoke `/harness-review-v2`.
+```
+
+### 10c. Output rejection summary
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+❌  Review ESCALATED — not merged
+
+PR:      <PR URL> (changes requested)
+Status:  In Review (unchanged)
+
+Unresolved: {UNRESOLVED_COUNT} findings ({DISPUTED_COUNT} disputed, {OPEN_COUNT} open)
+Review report: .reviews/{BRANCH_SAFE}/review-report.md
+
+Feedback posted to:
+  • GitHub PR #{PR_NUMBER} (review comment)
+  • Linear issue WHI-<N> (comment)
+
+Fix the issues and re-invoke /harness-review-v2.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
 ---
 
 ## Output Contract
 
-After completing Steps 1-8, the skill has produced:
+After completing Steps 1-10, the skill has produced:
 
 | Artifact | Path | Description |
 |----------|------|-------------|
@@ -1307,8 +1521,36 @@ The final review report (`review-report.md`) is the primary artifact for human r
 | Stale loop detected (Step 7) | "ESCALATED (stale)" | Review disputed findings in report, resolve manually |
 | Max rounds reached (Step 7) | "ESCALATED (max rounds)" | Review unresolved findings in report, resolve manually |
 | Report write failure (Step 8) | "Failed to write review report" | Check .reviews/ directory permissions, re-invoke |
+| CI checks failing (Step 9) | "CI checks are failing" | Fix CI failures, re-invoke — never merge with failing CI |
+| CI checks pending (Step 9) | "CI checks still pending" | Ask user whether to wait or abort — do not auto-merge |
+| PR merge failed (Step 9) | "gh pr merge failed: {stderr}" | Warn, preserve worktree — user can merge manually |
+| Worktree removal failed (Step 9) | "git worktree remove failed" | Warn — merge already done, user cleans up manually |
+| Linear update failed (Step 9/10) | "Linear update failed: {stderr}" | Warn — do NOT roll back the merge |
+| PR review comment failed (Step 10) | "gh pr review failed: {stderr}" | Warn — findings are still in local report |
 
 **Never proceed past a STOP error.** Each error is terminal for this invocation. Fix the issue and re-invoke the skill.
+
+**Never merge with failing CI.** This is an absolute constraint — no exceptions.
+
+**Never silently delete a worktree.** If removal fails, tell the user what happened and leave it intact.
+
+---
+
+## State Machine
+
+```
+In Review ──[Step 9: PASS/PASS_WITH_NOTES]──► Done
+    │
+    │ (Step 10: ESCALATED)
+    └─── stays In Review
+```
+
+Linear state transitions managed by this skill:
+- `In Review → Done` — only on PASS or PASS_WITH_NOTES after successful merge
+
+Transitions NOT managed by this skill:
+- `Todo → In Progress` — managed by `/harness-dev`
+- `In Progress → In Review` — managed by `/harness-dev`
 
 ---
 
@@ -1326,11 +1568,12 @@ This skill file covers:
 - Convergence loop: outer loop orchestration driving Codex re-review → Opus fix → convergence check (max 3 rounds)
 - Convergence check: PASS, PASS_WITH_NOTES, stale detection → ESCALATED, MAX_ROUNDS → ESCALATED
 - Final report generation: review-report.md with status, summary counts, findings detail table, unresolved section
+- Approval path: CI check, PR merge, dev sync, worktree/branch cleanup, Linear → Done
+- Rejection path: PR review comment with unresolved findings, Linear comment, issue stays In Review
 
 This skill file does NOT cover (deferred to v3):
 - Retry/resume (if the skill crashes mid-loop, user re-runs from scratch)
 - Convergence metrics collection
-- PR comment posting (the report is a local file only)
 - Cost tracking
 - Rebuttal quality enforcement beyond prompt guidance
 - Rival branch spawning
