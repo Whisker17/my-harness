@@ -24,7 +24,7 @@ allowed-tools:
 
 You are running a cross-model convergence review for a Linear issue. The user invoked this skill as `/harness-review-v2 WHI-<N>` (or similar). Extract the issue ID from the invocation arguments.
 
-This skill orchestrates Codex (adversarial reviewer) and Opus (acceptance reviewer) in a convergence loop. This file implements Steps 1-5: pre-flight checks, initial Codex invocation, findings normalization with `schema_version: 1`, re-raise detection, round merge logic, and the Opus fix loop (resolve/rebut/defer handling with git commit/push). The convergence loop and final report generation (WHI-222) will be added in a later sub-issue.
+This skill orchestrates Codex (adversarial reviewer) and Opus (acceptance reviewer) in a convergence loop. The skill implements the complete review pipeline: pre-flight checks, Codex invocation, findings normalization with `schema_version: 1`, re-raise detection, round merge logic, the Opus fix loop (resolve/rebut/defer handling with git commit/push), the convergence loop (max 3 rounds with stale detection), and final report generation.
 
 ---
 
@@ -316,7 +316,7 @@ Status: PASS — skip to report
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Write a minimal findings file and skip to the report step (WHI-222):
+Write a minimal findings file and skip to Step 8 (Final Report Generation):
 
 ```bash
 jq -n --argjson round "$ROUND_N" \
@@ -324,7 +324,7 @@ jq -n --argjson round "$ROUND_N" \
   > ".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json"
 ```
 
-STOP further normalization — the convergence loop (WHI-222) will handle the report.
+STOP further normalization — proceed directly to Step 8 (Final Report Generation) with `LOOP_STATUS="PASS"`.
 
 **Otherwise:** Proceed with full normalization below.
 
@@ -717,7 +717,7 @@ echo "Open findings requiring Opus attention: $OPEN_COUNT"
 No open CRITICAL/HIGH/MEDIUM findings — skipping Opus fix loop.
 ```
 
-Skip to Step 6 (or the convergence loop when WHI-222 is implemented).
+Skip to Step 6 (Convergence Loop) for convergence evaluation.
 
 ### 5b. Present Findings to Opus
 
@@ -932,19 +932,328 @@ Findings: .reviews/{branch_safe}/findings-round-{ROUND_N}.json
 
 ---
 
+## Step 6 — Convergence Loop
+
+This step orchestrates the outer loop: after Step 5 (Opus fix), re-invoke Codex for the full branch diff, normalize findings with round merge, run Opus fix again, and check convergence. Maximum 3 rounds.
+
+### 6a. Loop Initialization
+
+Initialize loop state before entering the convergence loop:
+
+```bash
+ROUND_N=1
+MAX_ROUNDS=3
+PREV_ACTIVE_IDS=""  # Updated inside Step 7b after each convergence evaluation
+LOOP_STATUS="CONTINUE"
+```
+
+**Round 1** is the initial invocation (Steps 2-5) which has already completed by the time Step 6 runs. The convergence check starts evaluating from the findings produced by round 1.
+
+### 6b. Convergence Check (after each round)
+
+After each round's Opus fix loop (Step 5) completes, evaluate convergence. Run the check defined in Step 7 below.
+
+```
+LOOP_STATUS = evaluate_convergence(ROUND_N, findings, PREV_ACTIVE_IDS)
+```
+
+**If `LOOP_STATUS` is `PASS`, `PASS_WITH_NOTES`, or `ESCALATED`:** Break out of the loop and proceed to Step 8 (Final Report).
+
+**If `LOOP_STATUS` is `CONTINUE`:** Proceed to the next round (Step 6c).
+
+### 6c. Next Round — Re-invoke Codex
+
+When the loop continues, increment the round and re-invoke Codex on the **full branch diff** (not just the fix commit):
+
+```bash
+ROUND_N=$((ROUND_N + 1))
+```
+
+**Important:** Codex must re-review the FULL branch diff (`git diff dev...HEAD`), not just the changes from the fix commit. This ensures Codex evaluates the complete state of the branch.
+
+1. **Re-invoke Codex** using the same mechanism as Step 2 (PR mode or local diff fallback). The Skill tool invocation is identical — Codex auto-detects the PR and reviews the full diff.
+
+2. **Parse and normalize** the new Codex output using Steps 3-4. Because `ROUND_N > 1`, Step 4d (Round Merge) activates, performing re-raise detection against `findings-round-{N-1}.json`.
+
+3. **Run Opus fix loop** (Step 5) on the merged findings for this round.
+
+4. **Return to Step 6b** to re-evaluate convergence.
+
+### 6d. Loop Orchestration Summary
+
+The complete loop flow:
+
+```
+Round 1:
+  Step 2 → Codex invocation
+  Step 3 → Parse output
+  Step 4 → Normalize findings (round 1, no merge)
+  Step 5 → Opus fix loop
+  Step 6b → Convergence check (updates PREV_ACTIVE_IDS)
+    → CONTINUE? → Step 6c (Round 2)
+    → PASS/PASS_WITH_NOTES/ESCALATED? → Step 8
+
+Round 2:
+  Step 6c → Re-invoke Codex (full branch diff)
+  Step 3 → Parse output
+  Step 4 → Normalize + merge with round 1 findings (re-raise detection)
+  Step 5 → Opus fix loop
+  Step 6b → Convergence check (updates PREV_ACTIVE_IDS)
+    → CONTINUE? → Step 6c (Round 3)
+    → PASS/PASS_WITH_NOTES/ESCALATED? → Step 8
+
+Round 3:
+  Step 6c → Re-invoke Codex (full branch diff)
+  Step 3 → Parse output
+  Step 4 → Normalize + merge with round 2 findings
+  Step 5 → Opus fix loop
+  Step 6b → Convergence check (at MAX_ROUNDS: exits ESCALATED unless PASS or PASS_WITH_NOTES)
+    → Step 8
+```
+
+---
+
+## Step 7 — Convergence Check
+
+Evaluate whether the review loop has converged. This check runs after each round's Opus fix loop completes.
+
+### 7a. Compute Active Findings
+
+Load the current round's findings and compute the active sets:
+
+```bash
+FINDINGS_FILE=".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json"
+
+# Active findings: status in (open, disputed) AND severity in (critical, high, medium)
+ACTIVE=$(jq '[.findings[] | select(
+  (.status == "open" or .status == "disputed") and
+  (.severity == "CRITICAL" or .severity == "HIGH" or .severity == "MEDIUM")
+)]' "$FINDINGS_FILE")
+ACTIVE_COUNT=$(echo "$ACTIVE" | jq 'length')
+ACTIVE_IDS=$(echo "$ACTIVE" | jq -r '[.[].id] | sort | join(",")')
+
+# Low-only findings: status in (open, disputed) AND severity == low
+LOW_ONLY=$(jq '[.findings[] | select(
+  (.status == "open" or .status == "disputed") and
+  .severity == "LOW"
+)]' "$FINDINGS_FILE")
+LOW_ONLY_COUNT=$(echo "$LOW_ONLY" | jq 'length')
+```
+
+### 7b. Evaluate Convergence (first match wins)
+
+Evaluate the following conditions in order. The **first** matching condition determines the loop status:
+
+```bash
+if [ "$ACTIVE_COUNT" -eq 0 ] && [ "$LOW_ONLY_COUNT" -eq 0 ]; then
+  LOOP_STATUS="PASS"
+  echo "Convergence: PASS — 0 active findings, 0 low-only findings"
+
+elif [ "$ACTIVE_COUNT" -eq 0 ] && [ "$LOW_ONLY_COUNT" -gt 0 ]; then
+  LOOP_STATUS="PASS_WITH_NOTES"
+  echo "Convergence: PASS_WITH_NOTES — 0 medium+ active, $LOW_ONLY_COUNT low-severity remain"
+
+elif [ "$ROUND_N" -ge 2 ] && [ "$ACTIVE_IDS" = "$PREV_ACTIVE_IDS" ]; then
+  # Note: this branch is only reached when ACTIVE_COUNT > 0 (the PASS checks above fire first when ACTIVE_COUNT == 0)
+  LOOP_STATUS="ESCALATED"
+  echo "Convergence: ESCALATED (stale) — active finding IDs identical to previous round"
+  echo "Active IDs: $ACTIVE_IDS"
+
+elif [ "$ROUND_N" -ge "$MAX_ROUNDS" ]; then
+  LOOP_STATUS="ESCALATED"
+  echo "Convergence: ESCALATED (max rounds) — reached round $ROUND_N of $MAX_ROUNDS"
+  echo "Remaining active findings: $ACTIVE_COUNT"
+
+else
+  LOOP_STATUS="CONTINUE"
+  echo "Convergence: CONTINUE — $ACTIVE_COUNT active findings remain, round $ROUND_N of $MAX_ROUNDS"
+fi
+
+# Store current active IDs for next round's stale detection
+# (This updates the outer loop variable from Step 6a — required for cross-round stale comparison)
+PREV_ACTIVE_IDS="$ACTIVE_IDS"
+```
+
+**Note:** The `PREV_ACTIVE_IDS` assignment above mutates the outer loop variable declared in Step 6a. This is intentional — the stale check in the next round needs the current round's active IDs as its baseline. When the loop exits (`PASS`, `PASS_WITH_NOTES`, or `ESCALATED`), the final assignment is harmless since the variable is no longer read.
+
+### 7c. Convergence Rules Reference
+
+| Condition | Status | Description |
+|-----------|--------|-------------|
+| 0 active (medium+) AND 0 low-only | `PASS` | All findings resolved, rebutted, deferred, or confirmed fixed |
+| 0 active (medium+) AND >0 low-only | `PASS_WITH_NOTES` | Only low-severity findings remain open |
+| Round >= 2 AND active IDs == previous round's active IDs | `ESCALATED` | Stale: loop is not making progress — same findings persist |
+| Round >= 3 (MAX_ROUNDS) | `ESCALATED` | Max rounds: hard cap reached |
+| None of the above | `CONTINUE` | More rounds needed |
+
+**Note:** Both stale detection and max-rounds produce `LOOP_STATUS="ESCALATED"` — there is no separate `STALE` or `MAX_ROUNDS` enum value. The distinction is logged in the console message for debugging but does not affect the loop's control flow.
+
+**Stale detection detail:**
+- Compare `sorted(active_finding_ids_this_round)` vs `sorted(active_finding_ids_prev_round)`
+- If identical, the loop is not making progress — Opus is unable to resolve or Codex keeps re-raising the same issues
+- Only evaluated when `ROUND_N >= 2` (round 1 can never be stale — there's no previous round)
+- Active findings = those with `status in ("open", "disputed")` AND `severity in ("CRITICAL", "HIGH", "MEDIUM")` (severity values are uppercase in the findings JSON as normalized in Step 4b)
+
+---
+
+## Step 8 — Final Report Generation
+
+After the convergence loop exits (PASS, PASS_WITH_NOTES, or ESCALATED), generate the final review report.
+
+### 8a. Compute Report Data
+
+Load the final round's findings and compute summary statistics:
+
+```bash
+FINAL_FINDINGS=".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json"
+BRANCH_NAME=$(git branch --show-current)
+REPORT_DATE=$(date '+%Y-%m-%d %H:%M:%S')
+
+# Summary counts
+TOTAL_FINDINGS=$(jq '.findings | length' "$FINAL_FINDINGS")
+RESOLVED_COUNT=$(jq '[.findings[] | select(.status == "resolved")] | length' "$FINAL_FINDINGS")
+CONFIRMED_FIXED_COUNT=$(jq '[.findings[] | select(.status == "confirmed_fixed")] | length' "$FINAL_FINDINGS")
+REBUTTED_COUNT=$(jq '[.findings[] | select(.status == "rebutted")] | length' "$FINAL_FINDINGS")
+DEFERRED_COUNT=$(jq '[.findings[] | select(.status == "deferred")] | length' "$FINAL_FINDINGS")
+DISPUTED_COUNT=$(jq '[.findings[] | select(.status == "disputed")] | length' "$FINAL_FINDINGS")
+OPEN_COUNT=$(jq '[.findings[] | select(.status == "open")] | length' "$FINAL_FINDINGS")
+LOW_ONLY_COUNT=$(jq '[.findings[] | select(
+  (.status == "open" or .status == "disputed") and .severity == "LOW"
+)] | length' "$FINAL_FINDINGS")
+UNRESOLVED_COUNT=$((DISPUTED_COUNT + OPEN_COUNT))
+```
+
+### 8b. Write Report File
+
+Write the report to `.reviews/{branch_safe}/review-report.md`:
+
+```bash
+REPORT_FILE=".reviews/${BRANCH_SAFE}/review-report.md"
+```
+
+**Report content:**
+
+```markdown
+# Harness Review v2 Report
+Branch: {BRANCH_NAME} (path: .reviews/{BRANCH_SAFE}/)
+Date: {REPORT_DATE}
+Rounds: {ROUND_N}
+Status: {LOOP_STATUS}
+
+## Summary
+- Total findings: {TOTAL_FINDINGS}
+- Resolved: {RESOLVED_COUNT} | Rebutted: {REBUTTED_COUNT} | Deferred: {DEFERRED_COUNT}
+- Confirmed fixed: {CONFIRMED_FIXED_COUNT}
+- Disputed (unresolved): {DISPUTED_COUNT}
+- Open (unresolved): {OPEN_COUNT}
+
+## Findings Detail
+| ID | Severity | Claim | Status | Resolution | Opened | Closed |
+|----|----------|-------|--------|------------|--------|--------|
+```
+
+For each finding in the final findings JSON, append a row to the table:
+
+```bash
+jq -r '.findings[] | "| \(.id) | \(.severity) | \(if (.claim_title // "") == "" then .claim else .claim_title end | .[0:60]) | \(.status) | \(.resolution // "—" | .[0:40]) | \(.round_opened) | \(.round_closed // "—") |"' "$FINAL_FINDINGS"
+```
+
+**Truncation:** Truncate `claim` to 60 characters and `resolution` to 40 characters in the table for readability. The full details are available in the findings JSON files.
+
+### 8c. Unresolved Section (ESCALATED only)
+
+If `LOOP_STATUS == "ESCALATED"`, append the Unresolved Issues section to the report.
+
+First, write the section header:
+
+```markdown
+## Unresolved Issues
+
+The following findings remain unresolved after {ROUND_N} rounds:
+```
+
+Then, enumerate the unresolved findings:
+
+```bash
+UNRESOLVED=$(jq '[.findings[] | select(
+  (.status == "open" or .status == "disputed") and
+  (.severity == "CRITICAL" or .severity == "HIGH" or .severity == "MEDIUM")
+)]' "$FINAL_FINDINGS")
+```
+
+For each finding in the `UNRESOLVED` array, write a detailed entry:
+
+```markdown
+### {finding.id} [{finding.severity}] — {finding.claim_title}
+
+**Status:** {finding.status}
+**File:** {finding.file}:{finding.line_start}-{finding.line_end}
+**Claim:** {finding.claim}
+**Suggested fix:** {finding.suggested_fix}
+**Resolution attempts:** {finding.resolution or "None"}
+**Rounds:** opened in round {finding.round_opened}
+```
+
+If a finding has `file: null`, display `File: (architectural — no specific file)` instead.
+
+### 8d. Console Output
+
+After writing the report, print the appropriate console message based on the loop status:
+
+**On PASS:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅  REVIEW PASSED
+Rounds: {ROUND_N}
+Total findings: {TOTAL_FINDINGS}
+Resolved: {RESOLVED_COUNT} | Confirmed fixed: {CONFIRMED_FIXED_COUNT}
+Rebutted: {REBUTTED_COUNT} | Deferred: {DEFERRED_COUNT}
+Review report: .reviews/{BRANCH_SAFE}/review-report.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**On PASS_WITH_NOTES:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅  REVIEW PASSED (with notes)
+Rounds: {ROUND_N}
+Total findings: {TOTAL_FINDINGS}
+Resolved: {RESOLVED_COUNT} | Confirmed fixed: {CONFIRMED_FIXED_COUNT}
+Rebutted: {REBUTTED_COUNT} | Deferred: {DEFERRED_COUNT}
+Low-severity remaining: {LOW_ONLY_COUNT} (documented in report)
+Review report: .reviews/{BRANCH_SAFE}/review-report.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**On ESCALATED:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  REVIEW ESCALATED
+Review loop did not converge after {ROUND_N} rounds. {UNRESOLVED_COUNT} findings remain unresolved.
+Review report: .reviews/{BRANCH_SAFE}/review-report.md
+Please review the disputed findings and decide how to proceed.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
 ## Output Contract
 
-After completing Steps 1-5, the skill has produced:
+After completing Steps 1-8, the skill has produced:
 
 | Artifact | Path | Description |
 |----------|------|-------------|
-| Codex findings JSON | `.reviews/{branch_safe}/codex-findings-round-{N}.json` | Raw structured Codex findings |
-| Normalized findings | `.reviews/{branch_safe}/findings-round-{N}.json` | Harness-format findings with `schema_version: 1`, updated with Opus resolutions |
+| Codex findings JSON | `.reviews/{branch_safe}/codex-findings-round-{N}.json` | Raw structured Codex findings (one per round) |
+| Normalized findings | `.reviews/{branch_safe}/findings-round-{N}.json` | Harness-format findings with `schema_version: 1`, updated with Opus resolutions (one per round) |
+| Final review report | `.reviews/{branch_safe}/review-report.md` | Summary report with status, counts, findings table, and unresolved section (if ESCALATED) |
 | Raw output (on parse failure) | `.reviews/{branch_safe}/codex-raw-round-{N}.txt` | Unprocessed Codex output |
 | Local diff (if no PR) | `.reviews/{branch_safe}/local-diff.patch` | Git diff against dev |
 | Invocation log | `.reviews/{branch_safe}/codex-invocation.log` | Timeout/retry tracking |
 
-The normalized findings file (`findings-round-{N}.json`) is the primary artifact consumed by the convergence loop (WHI-222). After Step 5, each finding's `status` reflects Opus's action (resolved, rebutted, deferred, or still open).
+The final review report (`review-report.md`) is the primary artifact for human reviewers. The normalized findings files (`findings-round-{N}.json`) contain the full audit trail of each round's findings and Opus resolutions.
 
 **Findings JSON schema (`schema_version: 1`):**
 
@@ -994,6 +1303,10 @@ The normalized findings file (`findings-round-{N}.json`) is the primary artifact
 | DEFER validation failed | "insufficient justification" | Finding stays open, Opus can retry next round |
 | Git commit failed (Step 5) | "Git commit failed: {stderr}" | Findings JSON preserved, fix manually and re-invoke |
 | Git push failed (Step 5) | "Git push failed: {stderr}" | Commit exists locally, push manually or re-invoke |
+| Codex re-review failed (Step 6) | Same as Step 2 errors | Fix the underlying issue and re-invoke the skill |
+| Stale loop detected (Step 7) | "ESCALATED (stale)" | Review disputed findings in report, resolve manually |
+| Max rounds reached (Step 7) | "ESCALATED (max rounds)" | Review unresolved findings in report, resolve manually |
+| Report write failure (Step 8) | "Failed to write review report" | Check .reviews/ directory permissions, re-invoke |
 
 **Never proceed past a STOP error.** Each error is terminal for this invocation. Fix the issue and re-invoke the skill.
 
@@ -1010,7 +1323,16 @@ This skill file covers:
 - Round merge logic (confirmed_fixed, reopened, disputed states)
 - Quick exit path (approve + 0 medium+ → PASS)
 - Opus fix loop: literal Opus prompt, RESOLVE/REBUT/DEFER handling, findings JSON update, git commit/push, error recovery
+- Convergence loop: outer loop orchestration driving Codex re-review → Opus fix → convergence check (max 3 rounds)
+- Convergence check: PASS, PASS_WITH_NOTES, stale detection → ESCALATED, MAX_ROUNDS → ESCALATED
+- Final report generation: review-report.md with status, summary counts, findings detail table, unresolved section
 
-This skill file does NOT cover (handled by later sub-issues):
-- Convergence loop and final report generation (WHI-222)
-- Fix loop orchestration (iteration logic between Codex re-review and Opus fix rounds)
+This skill file does NOT cover (deferred to v3):
+- Retry/resume (if the skill crashes mid-loop, user re-runs from scratch)
+- Convergence metrics collection
+- PR comment posting (the report is a local file only)
+- Cost tracking
+- Rebuttal quality enforcement beyond prompt guidance
+- Rival branch spawning
+- Auto-routing between v1/v2
+- Codex model selection configuration
