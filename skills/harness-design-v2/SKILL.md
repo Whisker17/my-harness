@@ -613,6 +613,19 @@ Brief "## Risk Assessment"               → Informs "## Dependencies" (risks th
 Brief "## Suggested Sub-task Breakdown"  → Sub-issues (see Step 5d)
 ```
 
+**Heading detection — fuzzy matching:** Codex may use slightly different heading names than instructed (e.g., "## Architecture" instead of "## Proposed Architecture"). Use **keyword-based matching** rather than exact string match:
+
+| Target section | Match if heading contains (case-insensitive) |
+|----------------|----------------------------------------------|
+| Problem Statement | "problem" OR "statement" OR "context" OR "overview" |
+| Proposed Architecture | "architecture" OR "technical design" OR "design" (but NOT "design brief") |
+| Key Decisions | "decision" OR "tradeoff" OR "trade-off" |
+| Acceptance Criteria | "acceptance" OR "criteria" OR "requirements" |
+| Risk Assessment | "risk" OR "assessment" OR "concern" |
+| Sub-task Breakdown | "sub-task" OR "breakdown" OR "subtask" OR "implementation steps" |
+
+If a brief section does not match any target, log it: `Unmatched brief section: "## {heading}" — content will be appended to Architecture Notes.` Append unmatched sections to Architecture Notes rather than silently discarding them.
+
 **Construct the parent issue:**
 
 - **Title:** Derive from the design topic. Format: `feat(v2): <topic>` or use the topic text directly if it already has a meaningful title.
@@ -673,6 +686,7 @@ For each sub-task, construct:
 
 ## Dependencies
 {If this sub-task depends on a prior sub-task, reference it by title using @@DEP:<title>@@ placeholder.}
+{IMPORTANT: The <title> inside @@DEP@@ must exactly match the sub-issue title as generated in this step. Copy-paste the title verbatim to avoid mismatches. Step 7e resolves these using case-insensitive, whitespace-normalized matching, but exact titles are preferred.}
 {If no dependencies: "None — no blocking dependencies."}
 
 ## Scope Boundary
@@ -785,10 +799,11 @@ State: Backlog (all issues)
 
 Parent Issue: {parent title}
   {Show [OPUS INFERRED] sections if any: "⚠️ [OPUS INFERRED] sections: Context, Scope Boundary"}
+  {Show [VALIDATION WARNING] sections if any: "🛑 [VALIDATION WARNING] sections: Architecture Notes — requires manual review"}
 
 Sub-issues:
-  1. {sub-issue title} ({complexity}) {[OPUS INFERRED] marker if any}
-  2. {sub-issue title} ({complexity}) {[OPUS INFERRED] marker if any}
+  1. {sub-issue title} ({complexity}) {[OPUS INFERRED] / [VALIDATION WARNING] markers if any}
+  2. {sub-issue title} ({complexity}) {[OPUS INFERRED] / [VALIDATION WARNING] markers if any}
   ...
 
 Dependencies:
@@ -796,6 +811,10 @@ Dependencies:
   ...
 
 Total issues to create: {N} (1 parent + {N-1} sub-issues)
+
+{If any [VALIDATION WARNING] sections exist:}
+🛑  WARNING: {count} section(s) failed schema validation and are marked [VALIDATION WARNING].
+    Review the full schema proposal carefully before approving.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -821,9 +840,20 @@ C) Reject — exit without creating any issues
 - Proceed to Step 7 (Linear issue creation)
 
 **Revise:**
-- Collect user feedback (the user types their revisions in the "Other" text input or selects Revise and provides notes)
+- The user selects "Revise" which indicates they want changes. AskUserQuestion provides an "Other" option where the user can type free-form feedback.
+- If the user selected "Revise" without providing notes in the "Other" field, use a **follow-up AskUserQuestion** to collect specific feedback:
+
+  ```
+  What changes would you like to the proposal? Select the areas to revise:
+  A) Parent issue title or description
+  B) Sub-issue structure (add, remove, or rename sub-issues)
+  C) Dependencies between sub-issues
+  D) Other (describe in text)
+  ```
+
 - Apply the requested changes to the schema proposal
 - Re-validate affected descriptions (Step 5f)
+- Re-write the updated schema-proposal.md to disk (so re-entry picks up revisions)
 - Re-present the updated proposal (go back to 6a)
 - Track the revision round number
 
@@ -885,7 +915,17 @@ If the parent issue specifies a milestone (e.g., from the brief's phase structur
 mcp__linear-server__list_milestones(project: "<PROJECT_ID>")
 ```
 
-If a matching milestone exists, record its ID. If not, and the brief suggests a phase/milestone:
+If a matching milestone exists, record its ID. If not, and the brief suggests a phase/milestone, **ask the user for confirmation before creating:**
+
+```
+AskUserQuestion:
+  "The brief suggests milestone '{name}' but it doesn't exist in project {PROJECT_NAME}."
+  A) Create the milestone
+  B) Skip milestone assignment (issues will have no milestone)
+  C) Assign to an existing milestone (list the existing ones)
+```
+
+Only create the milestone after explicit user approval:
 
 ```
 mcp__linear-server__save_milestone(
@@ -898,6 +938,19 @@ mcp__linear-server__save_milestone(
 If no milestone is suggested by the brief, skip milestone assignment — issues will be created without a milestone.
 
 ### 7c. Create parent issue
+
+**Dedup check first:**
+
+```
+mcp__linear-server__list_issues(
+  project: "<PROJECT_ID>",
+  query: "<parent issue title>"
+)
+```
+
+Compare returned issue titles against the parent title using **case-insensitive, whitespace-normalized** comparison (see 7d for details). If an exact match exists, record its ID as `PARENT_ISSUE_ID` and skip creation. Print: `Existing parent issue found: WHI-{id}. Skipping creation.`
+
+**If no match — create:**
 
 ```
 mcp__linear-server__save_issue(
@@ -919,10 +972,21 @@ Record the returned issue ID as `PARENT_ISSUE_ID`.
 
 ### 7d. Create sub-issues in dependency order
 
-Process sub-issues in order:
-1. Sub-issues with no dependencies first
-2. Sub-issues whose dependencies have been created (IDs recorded)
-3. Continue until all sub-issues are created
+**Topological sort:** Before creating any sub-issues, build a dependency graph from the `@@DEP:<title>@@` placeholders and perform a topological sort. Use Kahn's algorithm (BFS-based):
+
+1. Build adjacency list: for each sub-issue, record which other sub-issues it depends on
+2. Compute in-degree for each sub-issue
+3. Start with sub-issues that have in-degree 0 (no dependencies)
+4. Process queue: create issue, decrement in-degree of dependents, enqueue newly-zero dependents
+5. **Cycle detection:** If the queue empties but not all sub-issues are processed, a dependency cycle exists
+
+**If a cycle is detected:**
+- Print: `ERROR: Dependency cycle detected among sub-issues: {list of titles in the cycle}`
+- Print: `Breaking cycle by removing the dependency from the last sub-issue in the cycle.`
+- Remove one edge to break the cycle and retry the topological sort
+- Warn the user which dependency was dropped
+
+Process sub-issues in topological order:
 
 **Dedup check before each create:**
 
@@ -933,7 +997,7 @@ mcp__linear-server__list_issues(
 )
 ```
 
-If an exact title match exists, skip creation — record the existing ID.
+Compare returned issue titles using **case-insensitive, whitespace-normalized** comparison: lowercase both, collapse whitespace to single spaces, trim. If a normalized match exists, skip creation — record the existing ID. If multiple partial matches are returned but none is an exact normalized match, proceed with creation (do not skip on fuzzy matches).
 
 **For each sub-issue:**
 
@@ -959,14 +1023,17 @@ Record each returned issue ID. Map: sub-issue title → Linear issue ID.
 
 ### 7e. Resolve dependency placeholders (second pass)
 
-After ALL issues are created, rewrite descriptions to replace `@@DEP:<title>@@` placeholders with actual `WHI-<N>` references:
+After ALL issues are created, rewrite descriptions to replace `@@DEP:<title>@@` placeholders with actual `WHI-<N>` references.
 
-1. For every issue whose description contains `@@DEP:...@@` tags:
-   - Build the final Dependencies section: replace each `@@DEP:<title>@@` with the resolved `WHI-<N>` from the title → ID map
-   - Call `mcp__linear-server__save_issue(id: "<issue-id>", description: "<rewritten description>")` to update
-   - Also add the `blockedBy` relation: `mcp__linear-server__save_issue(id: "<issue-id>", blockedBy: ["<blocking-issue-id>"])`
-2. If a referenced title was not created (failed or skipped), replace the tag with `(dependency "<title>" — not created; see schema-proposal.md)`
-3. Validate no `@@DEP:...@@` tags remain in any live description
+**Scope:** This pass covers ALL issues in the title → ID map — both newly created and pre-existing (found via dedup check). Pre-existing issues from prior failed runs may still have stale `@@DEP:` tags that need resolution.
+
+1. For every issue in the title → ID map whose description contains `@@DEP:...@@` tags:
+   - Read the current description from Linear (not from the in-memory version) to catch any manual edits: `mcp__linear-server__get_issue(id: "<issue-id>")`
+   - Build the final Dependencies section: replace each `@@DEP:<title>@@` with the resolved `WHI-<N>` from the title → ID map. Use **case-insensitive, whitespace-normalized** matching for the title lookup.
+   - Call `mcp__linear-server__save_issue(id: "<issue-id>", description: "<rewritten description>", blockedBy: ["<blocking-issue-id>"])` in a single call to update description AND set the blocking relation atomically
+   - **If this call fails:** Print `WARNING: Failed to resolve dependencies for "<title>": <error>`. Do NOT silently continue — the user must know which issues have unresolved dependency text.
+2. If a referenced title was not created (failed or skipped), replace the tag with `(dependency "<title>" — not created; see schema-proposal.md)` and print `WARNING: Unresolvable dependency "<title>" in issue "<issue title>".`
+3. Validate no `@@DEP:...@@` tags remain in any live description. If any remain after the pass, print a final warning listing them.
 
 ### 7f. All issues in Backlog state
 
@@ -1052,12 +1119,15 @@ echo "Schema proposal: $SCHEMA_EXISTS"
 |---|---|---|
 | No | No | Full run — Steps 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 |
 | Yes | No | Skip Codex invocation — jump to Step 5 (reuse existing brief) |
-| Yes | Yes | Skip to Step 6 (reuse existing schema proposal for approval) |
+| Yes | Yes | Skip to Step 5f (re-validate existing schema), then proceed to Step 6 |
+
+**Important:** On re-entry with existing schema-proposal.md, always re-run Step 5f (schema validation) before entering the approval loop. The on-disk schema may be stale, corrupted, or from a partially failed prior run. Never skip validation.
 
 When skipping steps, print:
 
 ```
 ⏩  Re-entry detected: {brief/schema} found at {path}.
+    Re-validating schema (Step 5f) before proceeding to approval...
     Resuming from Step {N}.
 ```
 
