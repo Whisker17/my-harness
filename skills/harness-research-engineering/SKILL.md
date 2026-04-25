@@ -2705,8 +2705,10 @@ echo "$NEW_ENTRY_JSON" >> "$TEMP_FILE"
 
 # Atomically replace the index file
 mv "$TEMP_FILE" "$INDEX_FILE" || {
+  trap - EXIT  # Disable cleanup so temp file is preserved for recovery
   echo "❌ Atomic replace failed: $INDEX_FILE not updated."
   echo "   Temp file preserved at $TEMP_FILE for manual recovery."
+  echo "   To recover: mv $TEMP_FILE $INDEX_FILE"
   echo "   Phase 7 aborted."
   exit 1
 }
@@ -2715,7 +2717,8 @@ trap - EXIT  # Clear the cleanup trap on success
 
 **Key safety properties:**
 - The temp file is created in the same directory as the index file (`${INDEX_FILE}.tmp.XXXXXX`) to ensure `mv` is atomic (same filesystem)
-- A `trap` ensures the temp file is cleaned up on any signal or error, preventing data leakage
+- A `trap` ensures the temp file is cleaned up on any signal or error during filtering/appending, preventing data leakage
+- On `mv` failure, the trap is disabled BEFORE `exit 1` so the temp file is preserved for manual recovery
 - The new entry is appended to the temp file BEFORE the `mv`, so the replacement is all-or-nothing: either both the removal and addition happen, or neither does
 
 **On "Keep both":** Proceed to Step 7.5 (append normally — both entries coexist).
@@ -2729,18 +2732,26 @@ Write the index entry as a single-line JSON record appended to the JSONL file.
 ```bash
 # Serialize the entry as compact single-line JSON and append
 echo '<entry as single-line JSON>' >> "$INDEX_FILE"
+APPEND_STATUS=$?
 ```
 
 **Validation after write:**
 
-Verify the append succeeded:
+First, check that the append command itself succeeded. Then verify the written entry matches what we intended:
 ```bash
-# Read back the last line and verify it parses
+# Step 1: Check append exit status
+if [ $APPEND_STATUS -ne 0 ]; then
+  echo "❌ Append command failed (exit $APPEND_STATUS): entry was NOT written to $INDEX_FILE."
+  echo "   Check disk space, permissions, and filesystem health."
+  # Do NOT proceed to Step 7.6 success display — skip to error state
+fi
+
+# Step 2: Read back the last line and verify it matches the new entry's dedup_key
 LAST_LINE=$(tail -1 "$INDEX_FILE")
-echo "$LAST_LINE" | jq -e '.schema_version' > /dev/null 2>&1
-if [ $? -ne 0 ]; then
-  echo "❌ Write verification failed: last line of $INDEX_FILE is not valid JSON."
-  echo "   The index file may be corrupted. Manual inspection required."
+LAST_DEDUP_KEY=$(echo "$LAST_LINE" | jq -r '.dedup_key // empty' 2>/dev/null)
+if [ "$LAST_DEDUP_KEY" != "$DEDUP_KEY" ]; then
+  echo "❌ Write verification failed: last line dedup_key='$LAST_DEDUP_KEY' does not match expected='$DEDUP_KEY'."
+  echo "   The index file may be corrupted or the append was silently lost."
   echo "   The entry was NOT successfully persisted."
   # Do NOT proceed to Step 7.6 success display — skip to error state
 fi
