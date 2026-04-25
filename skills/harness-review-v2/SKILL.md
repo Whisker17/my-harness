@@ -69,6 +69,26 @@ Fix: Run `codex:setup` to install and configure the Codex CLI.
 
 STOP — do not proceed.
 
+### 1a-2. Verify Codex authentication
+
+After confirming the CLI is installed, verify that Codex is authenticated:
+
+```bash
+codex auth status 2>&1 || codex whoami 2>&1
+```
+
+If the command fails or indicates no active session:
+
+```
+ERROR: Codex CLI is not authenticated.
+
+Fix: Run `codex login` to authenticate with your Codex account.
+```
+
+STOP — do not proceed.
+
+**Note:** If neither `codex auth status` nor `codex whoami` is a valid subcommand, skip this check — authentication errors will surface during the Codex invocation in Step 2, where the error handler should also emit the `"Run codex login to authenticate"` message.
+
 ### 1b. Verify working tree is clean
 
 ```bash
@@ -162,6 +182,16 @@ Fix: Check Codex CLI connectivity with `codex --version` and retry, or run the r
 ```
 
 Save any partial output to `.reviews/${BRANCH_SAFE}/codex-raw-round-1.txt` and STOP.
+
+**Authentication failure handling:** If the Codex invocation fails with an authentication or authorization error (e.g., "unauthorized", "not logged in", "invalid token"), print:
+
+```
+ERROR: Codex authentication failed.
+
+Fix: Run `codex login` to authenticate with your Codex account.
+```
+
+STOP — do not proceed. Do not retry auth failures.
 
 ### 2b. Local diff fallback (REVIEW_MODE=local-diff)
 
@@ -282,9 +312,11 @@ These artifacts are consumed by the findings normalization step (WHI-220) and th
 | Failure point | Error message | Recovery action |
 |---------------|---------------|-----------------|
 | Codex CLI not found | "Run `codex:setup` to install" | Install Codex, re-invoke |
+| Codex not authenticated | "Run `codex login` to authenticate" | Authenticate, re-invoke |
 | Dirty working tree | "Commit or stash changes first" | Clean working tree, re-invoke |
 | No PR + no local diff | "No changes detected" | Ensure commits exist on branch |
 | Codex timeout (2x) | "Codex invocation timed out" | Check connectivity, retry manually |
+| Codex auth failure during invocation | "Run `codex login` to authenticate" | Re-authenticate, re-invoke |
 | JSON parse failure | "Could not parse Codex output" | Inspect raw output, retry |
 
 **Never proceed past a STOP error.** Each error is terminal for this invocation. Fix the issue and re-invoke the skill.
