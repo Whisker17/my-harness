@@ -656,7 +656,7 @@ Each line in `~/.gstack/research/research-index.jsonl` is a standalone JSON obje
 {
   "schema_version": 1,
   "id": "base-azul-20260425-120000",
-  "dedup_key": "base:Azul:base-org/base-contracts",
+  "dedup_key": "base:azul:base-org/base-contracts",
   "public": {
     "chain": "base",
     "upgrade_name": "Azul",
@@ -724,16 +724,34 @@ Each line in `~/.gstack/research/research-index.jsonl` is a standalone JSON obje
 
 **Dedup key construction (D4):**
 
-The dedup key is a composite of three fields joined by colons:
+The dedup key is a composite of three fields joined by colons, **all lowercased** for case-insensitive matching:
 ```
-dedup_key = "{chain}:{upgrade_name}:{repo}"
+dedup_key = "{chain}:{upgrade_name_lower}:{repo}"
 ```
 Where:
-- `chain` = `public.chain` (lowercase)
-- `upgrade_name` = `public.upgrade_name` (original case preserved)
-- `repo` = `internal.repo` (org/repo format, no protocol prefix)
+- `chain` = `public.chain` (already lowercase)
+- `upgrade_name_lower` = `public.upgrade_name` converted to lowercase (original case preserved in `public.upgrade_name`, but the dedup key always uses lowercase to prevent case-variant duplicates like `Azul` vs `azul` vs `AZUL`)
+- `repo` = `internal.repo` (org/repo format, no protocol prefix, no `.git` suffix — see normalization rules below)
 
-Example: `base:Azul:base-org/base-contracts`
+Example: `base:azul:base-org/base-contracts`
+
+**`repo` normalization rules:**
+
+When extracting `repo_short` from a full repository URL, apply these transformations in order:
+1. Strip protocol prefix: `https://`, `http://`, `git://`, `ssh://`
+2. Strip `git@` prefix and replace `:` with `/` (SSH URLs: `git@github.com:org/repo` → `github.com/org/repo`)
+3. Strip the hostname: remove `github.com/`, `gitlab.com/`, or any `<host>/` prefix
+4. Strip trailing `.git` suffix
+5. Strip trailing `/`
+6. The result should be `org/repo` format (e.g., `base-org/base-contracts`)
+
+```
+Examples:
+  "https://github.com/base-org/base-contracts"       → "base-org/base-contracts"
+  "https://github.com/base-org/base-contracts.git"    → "base-org/base-contracts"
+  "git@github.com:base-org/base-contracts.git"        → "base-org/base-contracts"
+  "https://github.com/base-org/base-contracts/"       → "base-org/base-contracts"
+```
 
 **Overall verification_status computation:**
 
@@ -2475,13 +2493,28 @@ analysis_summary = analysis.summary
 ```
 
 **Compute `claims_summary`:**
+
+Cross-reference: these field names correspond to `analysis.json` > `summary` fields as defined in the [analysis.json schema](#analysisjson). The mapping is:
+
+| Index entry field | analysis.json summary field |
+|-------------------|---------------------------|
+| `confirmed` | `summary.verified` |
+| `partial` | `summary.partially_verified` |
+| `unconfirmed` | `summary.unverified` |
+
 ```
 IF analysis.json is available:
+  # Validate expected fields exist before extracting
+  REQUIRED_FIELDS = ["total_claims", "verified", "partially_verified", "unverified"]
+  For each field in REQUIRED_FIELDS:
+    IF field is missing from analysis_summary:
+      Log warning: "⚠️  analysis.json summary missing field '<field>' — defaulting to 0"
+
   claims_summary = {
-    "total": analysis_summary.total_claims,
-    "confirmed": analysis_summary.verified,
-    "partial": analysis_summary.partially_verified,
-    "unconfirmed": analysis_summary.unverified,
+    "total": analysis_summary.total_claims or 0,
+    "confirmed": analysis_summary.verified or 0,
+    "partial": analysis_summary.partially_verified or 0,
+    "unconfirmed": analysis_summary.unverified or 0,
     "contradicted": 0  // reserved for future use
   }
 ELSE:
@@ -2495,16 +2528,28 @@ ELSE:
 ```
 
 **Compute `full_claims` (compact claim array for internal fields):**
+
+Join key: match `claims.json` entries by `claims[].id` against `analysis.json` entries by `claims_analyzed[].claim_id`. These are the same identifier (format: `claim-NNN`), assigned in Phase 1 and carried through to Phase 3.
+
 ```
 IF analysis.json is available AND claims.json is available:
   For each claim in claims.json.claims:
-    Find matching entry in analysis.claims_analyzed
-    full_claims.append({
-      "id": claim.id,
-      "text": claim.text,
-      "category": claim.category,
-      "verification_status": matched_entry.verification_status or "not_analyzed"
-    })
+    Find matching entry in analysis.claims_analyzed WHERE entry.claim_id == claim.id
+    IF match found:
+      full_claims.append({
+        "id": claim.id,
+        "text": claim.text,
+        "category": claim.category,
+        "verification_status": matched_entry.verification_status
+      })
+    ELSE:
+      Log warning: "⚠️  Claim <claim.id> has no matching entry in analysis.claims_analyzed — marking as not_analyzed"
+      full_claims.append({
+        "id": claim.id,
+        "text": claim.text,
+        "category": claim.category,
+        "verification_status": "not_analyzed"
+      })
 ELSE:
   full_claims = []
 ```
@@ -2562,7 +2607,7 @@ DATE_SLUG = YYYYMMDD-HHMMSS from TIMESTAMP
 entry = {
   "schema_version": 1,
   "id": "{CHAIN_SLUG}-{UPGRADE_SLUG}-{DATE_SLUG}",
-  "dedup_key": "{chain}:{upgrade_name}:{repo_short}",
+  "dedup_key": "{CHAIN_SLUG}:{UPGRADE_SLUG}:{repo_short}",
   "public": {
     "chain": CHAIN_SLUG,
     "upgrade_name": "<upgrade name, original case>",
@@ -2634,24 +2679,43 @@ Use AskUserQuestion:
 **On "Overwrite":**
 1. Read the entire index file
 2. Filter out all lines whose parsed `dedup_key` matches the new entry's `dedup_key`
-3. Write the filtered lines back to the file (this removes the old entry)
-4. Proceed to Step 7.5 to append the new entry
+3. Append the new entry to the filtered output (atomic: remove + add in one operation)
+4. Write the combined result back to the file atomically via temp file + mv
+5. Skip Step 7.5 (the new entry is already included)
 
 ```bash
-# Overwrite: remove old entry, then append new
-TEMP_FILE=$(mktemp)
+# Atomic overwrite: filter out old entry AND append new entry in one pass,
+# then atomically replace the file. This avoids the corruption window where
+# the old entry is removed but the new entry hasn't been appended yet.
+DEDUP_KEY="<the computed dedup_key>"
+NEW_ENTRY_JSON='<the new entry as single-line JSON>'
+TEMP_FILE=$(mktemp "${INDEX_FILE}.tmp.XXXXXX")
+trap 'rm -f "$TEMP_FILE"' EXIT  # Clean up temp file on any failure
+
+# Filter out old entries and write remaining to temp file
 while IFS= read -r line; do
   KEY=$(echo "$line" | jq -r '.dedup_key // empty' 2>/dev/null)
-  if [ "$KEY" != "<new_dedup_key>" ]; then
+  if [ "$KEY" != "$DEDUP_KEY" ]; then
     echo "$line"
   fi
 done < "$INDEX_FILE" > "$TEMP_FILE"
+
+# Append the new entry to the temp file
+echo "$NEW_ENTRY_JSON" >> "$TEMP_FILE"
+
+# Atomically replace the index file
 mv "$TEMP_FILE" "$INDEX_FILE"
+trap - EXIT  # Clear the cleanup trap on success
 ```
+
+**Key safety properties:**
+- The temp file is created in the same directory as the index file (`${INDEX_FILE}.tmp.XXXXXX`) to ensure `mv` is atomic (same filesystem)
+- A `trap` ensures the temp file is cleaned up on any signal or error, preventing data leakage
+- The new entry is appended to the temp file BEFORE the `mv`, so the replacement is all-or-nothing: either both the removal and addition happen, or neither does
 
 **On "Keep both":** Proceed to Step 7.5 (append normally — both entries coexist).
 
-**On "Skip":** Print `"Skipping index write. Existing entry preserved."` and skip Step 7.5 entirely. Phase 7 is complete.
+**On "Skip":** Print `"Skipping index write. Existing entry preserved."` and skip Steps 7.5-7.6 entirely. Phase 7 is complete.
 
 ### Step 7.5 — Append Entry
 
@@ -2672,16 +2736,27 @@ echo "$LAST_LINE" | jq -e '.schema_version' > /dev/null 2>&1
 if [ $? -ne 0 ]; then
   echo "❌ Write verification failed: last line of $INDEX_FILE is not valid JSON."
   echo "   The index file may be corrupted. Manual inspection required."
+  echo "   The entry was NOT successfully persisted."
+  # Do NOT proceed to Step 7.6 success display — skip to error state
 fi
 ```
 
-Print confirmation:
+**If write verification fails:** Do NOT display the success banner in Step 7.6. Instead, print:
+```
+⚠️  Phase 7 completed with errors — index entry write could not be verified.
+    Manual inspection of ~/.gstack/research/research-index.jsonl is required.
+    The last line may be malformed. Remove it and re-run Phase 7 to retry.
+```
+
+**If write verification succeeds,** print confirmation:
 ```
 ✅ Knowledge index updated: <entry.id>
    File: ~/.gstack/research/research-index.jsonl
    Key:  <dedup_key>
-   Total entries: <line count of INDEX_FILE>
+   Total entries: <line count of parseable entries in INDEX_FILE>
 ```
+
+**Note on entry counting:** The "total entries" count should reflect the number of *parseable* JSON lines, not the raw line count. Count lines where `jq -e '.' >/dev/null 2>&1` succeeds.
 
 ### Step 7.6 — User Checkpoint 🧑
 
