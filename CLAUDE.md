@@ -228,7 +228,7 @@ PR    ──►  /harness-review-v2  ──►  Codex↔Opus convergence review
 The v2 pipeline requires additional tools beyond the v1 prerequisites:
 
 - **Codex CLI**: `npm install -g @openai/codex`
-- **Codex Plugin**: `npm install -g codex-plugin-cc`
+- **Codex Plugin**: Install `codex-plugin-cc` via Claude Code's plugin system (NOT an npm package). In Claude Code, run `/install-plugin codex-plugin-cc` or see [github.com/openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc)
 - **Codex Authentication**: `codex login`
 - **gstack**: Must be installed (provides `/codex` skill used by v2 skills)
 
