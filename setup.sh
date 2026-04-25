@@ -221,6 +221,26 @@ else
   check_warn "gstack not found (optional, required for v2 pipeline)"
 fi
 
+# ── Step 6: Patch plugin settings for v2 compatibility ─
+
+header "Step 6: Patching plugin settings for v2 pipeline"
+
+# codex:adversarial-review has disable-model-invocation: true by default,
+# which prevents harness-review-v2 from invoking it via the Skill tool.
+# Patch it to false so the v2 pipeline can call Codex programmatically.
+CODEX_AR_CMD=$(find "$HOME/.claude/plugins/cache/openai-codex" -path "*/commands/adversarial-review.md" 2>/dev/null | head -1)
+if [ -n "$CODEX_AR_CMD" ] && [ -f "$CODEX_AR_CMD" ]; then
+  if grep -q "disable-model-invocation: true" "$CODEX_AR_CMD"; then
+    sed -i '' 's/disable-model-invocation: true/disable-model-invocation: false/' "$CODEX_AR_CMD"
+    check_pass "codex:adversarial-review patched (disable-model-invocation → false)"
+  else
+    check_pass "codex:adversarial-review already allows model invocation"
+  fi
+else
+  check_warn "codex:adversarial-review command not found (codex plugin not installed?)"
+  echo "         Install the codex plugin first, then re-run setup.sh"
+fi
+
 # ── Summary ─────────────────────────────────────────────
 
 header "Summary"
