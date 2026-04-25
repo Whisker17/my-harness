@@ -636,7 +636,7 @@ If validation fails at any phase boundary:
 **Produced by:** Phase 6 (Verification Agent — M2)
 **Consumed by:** Phase 5 (Report Generation — verification section, when Phase 6 data is available)
 
-Phase 6 outputs a structured JSON artifact containing the independent reviewer's per-claim assessments, dispute tracking, and final verification status.
+Phase 6 outputs a structured JSON artifact containing the independent reviewer's per-claim assessments, dispute tracking, and final verification status. The example below shows 2 reviews for brevity; a real run would have up to 10 (matching `claims_reviewed`). Summary counts must equal `len(reviews)`.
 
 ```json
 {
@@ -644,7 +644,7 @@ Phase 6 outputs a structured JSON artifact containing the independent reviewer's
   "generated_at": "2026-04-25T14:00:00Z",
   "verification_status": "verified",
   "total_rounds": 1,
-  "claims_reviewed": 10,
+  "claims_reviewed": 2,
   "claims_total": 24,
   "selection_criteria": "top 10 by significance (security > consensus > feature > parameter)",
   "reviews": [
@@ -683,13 +683,13 @@ Phase 6 outputs a structured JSON artifact containing the independent reviewer's
     }
   ],
   "summary": {
-    "confirmed": 8,
+    "confirmed": 1,
     "partial": 1,
     "unconfirmed": 0,
-    "contradicted": 1,
-    "disputes_found": 2,
+    "contradicted": 0,
+    "disputes_found": 1,
     "disputes_resolved": 1,
-    "disputes_unresolved": 1
+    "disputes_unresolved": 0
   }
 }
 ```
