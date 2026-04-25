@@ -36,7 +36,7 @@ You are a protocol analysis engine for blockchain engineering research. The user
 3. [Input Resolution](#input-resolution) — resolve required inputs (URLs, refs)
 4. [Agent Roles](#agent-roles) — role definitions for pipeline agents
 5. [Artifact Schemas](#artifact-schemas) — JSON schemas for intermediate artifacts and validation gates
-6. [Phase 1: Source Ingestion](#phase-1-source-ingestion) — fetch and parse external signals
+6. [Phase 1: Source Ingestion](#phase-1-source-ingestion) — fallback chain fetch, claims extraction, source snapshot, user checkpoint
 7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — clone, map, diff
 8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — trace claims to code
 9. [Phase 5: Report Generation](#phase-5-report-generation) — produce internal + public reports
@@ -191,12 +191,14 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
 
 - **Mission:** Fetch and parse external signals — blog posts, EIPs, release notes
 - **Inputs:** `announcement_url`
-- **Tools:** WebFetch, WebSearch
-- **Outputs:** `claims.json` — structured list of claims extracted from the source
+- **Tools:** WebFetch, WebSearch, AskUserQuestion
+- **Outputs:** `claims.json` — structured list of claims extracted from the source; `source-snapshot.md` — reproducible snapshot of raw fetched content
 - **Behavior:**
-  - Fetch the announcement URL, extract full text content
+  - Fetch source using 3-tier fallback chain: WebFetch → WebSearch → AskUserQuestion (D10)
+  - Save raw fetched content as `source-snapshot.md` with YAML frontmatter before processing (D13)
   - Identify and extract discrete claims: "Feature X was added", "Removed dependency on Y", "Changed architecture of Z"
-  - For each claim: extract a short title, full description, and any referenced code artifacts (PRs, commits, files)
+  - For each claim: extract id, text, source_section, category, confidence, and any referenced code artifacts (PRs, commits, files)
+  - If claims exceed 15, re-extract in chunks of 5-8 claims per section and deduplicate (D1)
   - If the source references additional URLs (linked blog posts, specs), fetch those too
   - Output structured JSON, NOT prose
 
@@ -309,7 +311,7 @@ If validation fails at any phase boundary:
 {
   "schema_version": 1,
   "source_url": "https://blog.example.com/upgrade-announcement",
-  "source_snapshot_path": "sources/announcement-2026-04-25.md",
+  "source_snapshot_path": "source-snapshot.md",
   "fetched_at": "2026-04-25T11:00:00Z",
   "claims": [
     {
@@ -626,18 +628,247 @@ If validation fails at any phase boundary:
 
 ## Phase 1: Source Ingestion
 
-> **Implemented by:** WHI-229 (not yet implemented — this is a placeholder)
+> **Implemented by:** WHI-229
 
-Dispatch `source_ingestion_agent`. See [Agent Roles > source_ingestion_agent](#1-source_ingestion_agent-phase-1) for behavior.
+Phase 1 fetches the announcement source, extracts structured claims, and saves a reproducible snapshot. This is the entry point of the pipeline — all subsequent phases depend on its output.
 
-**Quality gate (user checkpoint):** After claims extraction, present claims to user:
-> "I extracted N claims from the announcement. Here they are: [list]. Are these correct? Anything missing?"
+**Agent role:** `source_ingestion_agent` (see [Agent Roles](#1-source_ingestion_agent-phase-1))
 
-Wait for user confirmation before proceeding to Phase 2.
+### Step 1.0 — Session Directory Bootstrap
+
+Before any artifact writes, create a concrete session directory for this analysis run:
+
+```bash
+CHAIN_SLUG=$(echo "<chain>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
+UPGRADE_SLUG=$(echo "<upgrade>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
+SESSION_DIR="$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$SESSION_DIR"
+echo "Session directory: $SESSION_DIR"
+```
+
+Store `SESSION_DIR` as the canonical path for all Phase 1 artifacts. All subsequent steps in Phase 1 write to this directory — `{session_dir}` in the instructions below refers to the value of `$SESSION_DIR` created here.
+
+**On failure** (mkdir fails due to permissions, disk full, etc.): print `"ERROR: Cannot create session directory at $SESSION_DIR"` and abort Phase 1.
+
+### Step 1.1 — Source Fetching (Fallback Chain — D10)
+
+Fetch the announcement content using a 3-tier fallback chain. Each tier is tried in order; proceed to the next only on failure.
+
+**Tier 1: WebFetch**
+
+```
+Use WebFetch with:
+  url: <announcement_url>
+  prompt: "Extract the full text content of this page. Preserve section headings, bullet points,
+           and any technical details. Include all code references, PR numbers, commit hashes,
+           and links to specs or EIPs."
+```
+
+**Success criteria:** Response is non-empty AND contains at least 200 characters of meaningful content (not just error messages or login prompts).
+
+If WebFetch succeeds → set `fetch_method = "webfetch"` → proceed to Step 1.2.
+
+**Tier 2: WebSearch (fallback)**
+
+If WebFetch returns an error, empty content, or content shorter than 200 characters:
+
+```
+Use WebSearch with:
+  query: "<chain> <upgrade> upgrade announcement site:<domain-from-url>"
+```
+
+If no results from site-scoped search, broaden:
+
+```
+Use WebSearch with:
+  query: "<chain> <upgrade> upgrade announcement blog post"
+```
+
+From the search results, fetch the most relevant result(s) using WebFetch. Combine content if multiple sources provide complementary information.
+
+**Success criteria:** At least one search result is found AND the content fetched from the top result(s) meets the same 200-character meaningful content threshold as Tier 1. **Failure criteria:** No results returned from either search query, OR all fetched results contain only error messages, login prompts, or content shorter than 200 characters.
+
+If WebSearch yields usable content → set `fetch_method = "websearch"` → proceed to Step 1.2.
+
+**Tier 3: User paste (last resort)**
+
+If both WebFetch and WebSearch fail:
+
+```
+Use AskUserQuestion:
+  question: "I couldn't fetch the announcement at <url> and web search didn't find usable results.
+             Could you paste the announcement content here?"
+  options:
+    - "I'll paste the content" (user pastes raw text)
+    - "Try a different URL" (user provides alternate URL → restart from Tier 1)
+    - "Skip Phase 1" (abort pipeline)
+```
+
+If user provides content → set `fetch_method = "user_paste"` → proceed to Step 1.2.
+If user chooses "Try a different URL" → restart from Tier 1 with the new URL. **Limit: 3 alternate URL attempts.** After the third failure, only offer "I'll paste the content" and "Skip Phase 1".
+If user chooses "Skip Phase 1" → abort with message: "Phase 1 skipped. Pipeline cannot continue without source content."
+
+### Step 1.2 — Source Snapshot (D13)
+
+Save the fetched content as a reproducible snapshot before any processing.
+
+**File:** `{session_dir}/source-snapshot.md`
+
+**Format:**
+
+```markdown
+---
+url: <announcement_url>
+fetched_at: <ISO 8601 timestamp>
+fetch_method: <webfetch | websearch | user_paste>
+content_length: <character count of raw content>
+---
+
+<raw content as fetched — no modifications>
+```
+
+Write this file using the Write tool. The snapshot preserves the content as returned by the fetching tool — **note that this is tool-processed content** (WebFetch applies markdown conversion, WebSearch returns summaries, user paste is as-provided), not the raw HTML/PDF source. The `fetch_method` field in the frontmatter records which tool produced the content, enabling downstream consumers to assess fidelity. For Tier 2 (WebSearch), if multiple sources were combined, record all fetched URLs in a `source_urls` list in the frontmatter alongside the primary `url`.
+
+### Step 1.3 — Claims Extraction
+
+Extract structured claims from the fetched content. Each claim is a discrete, verifiable technical assertion from the announcement.
+
+**Extraction prompt (dispatched via Agent tool):**
+
+```
+You are the Source Intelligence Analyst. Your job is to read a protocol upgrade
+announcement and extract every concrete technical claim into a structured list.
+
+Source content:
+<insert fetched content>
+
+For each claim, extract:
+- id: Sequential identifier (claim-001, claim-002, ...)
+- text: The specific technical assertion (what the source claims was done/changed)
+- source_section: The heading or section where this claim appears
+- category: One of: architecture, performance, security, governance, tooling, deprecation, other
+- confidence: high (explicit statement), medium (inferred from context), low (ambiguous/vague)
+- referenced_artifacts: Any PRs, commits, file paths, specs, or EIPs mentioned alongside this claim (empty array if none)
+
+Rules:
+- Extract EVERY concrete technical claim, not just major features
+- Split compound claims into individual items (e.g., "Added X and removed Y" → two claims)
+- Do NOT include marketing language, opinions, or non-technical statements
+- Do NOT infer claims that aren't stated or strongly implied in the source
+- Preserve the original technical terminology from the source
+
+Output as a valid JSON array of claim objects. No prose, no commentary — just the JSON array.
+```
+
+### Step 1.4 — Chunked Extraction (D1)
+
+Chunking is triggered by **either** of these conditions (first match wins):
+
+1. **Source size trigger:** If the source content has 4 or more distinct sections (level-2 or level-3 headings) OR exceeds 5,000 characters, skip the single-pass extraction in Step 1.3 entirely and go directly to chunked extraction below. This prevents the initial pass from silently omitting claims on long/dense announcements.
+
+2. **Output count trigger:** If a single-pass extraction (Step 1.3) was performed and produced more than 15 claims, re-extract using chunked processing to improve quality.
+
+**Chunked extraction process:**
+
+1. **Split the source content** into logical sections (by heading or natural breaks)
+2. **Process each chunk** independently with the same extraction prompt, targeting 5-8 claims per chunk
+3. **Reconciliation pass:** After merging all chunks, compare section coverage against the source snapshot. If any section with a heading in the source has zero extracted claims, flag it:
+   ```
+   WARNING: Section "<heading>" has 0 extracted claims. Review for potential omissions.
+   ```
+   Present flagged sections to the user in the Step 1.7 checkpoint for manual review.
+4. **Deduplicate:** Combine all chunks, then:
+   - For each pair of claims, if the `text` fields share >80% of key terms (nouns, verbs, technical terms), treat them as duplicates
+   - Keep the claim with higher confidence; if tied, keep the one from the earlier chunk
+   - Re-number IDs sequentially after deduplication (claim-001, claim-002, ...)
+
+If the source has fewer than 4 sections AND fewer than 5,000 characters AND the initial extraction produces ≤15 claims, skip chunking — use the initial results directly.
+
+### Step 1.5 — Build claims.json
+
+Assemble the final `claims.json` artifact following the schema from [Artifact Schemas > claims.json](#claimsjson):
+
+```json
+{
+  "schema_version": 1,
+  "source_url": "<announcement_url>",
+  "source_snapshot_path": "source-snapshot.md",
+  "fetched_at": "<ISO 8601 timestamp>",
+  "claims": [ <extracted claims array> ]
+}
+```
+
+**Write to:** `{session_dir}/claims.json`
+
+### Step 1.6 — Self-Validation Gate
+
+Before presenting to the user, validate claims.json against the schema. **Note:** This is a pre-output self-validation, not a phase-boundary gate. Unlike the inter-phase validation rules in [Artifact Schemas > Validation Gate](#validation-gate--general-rules) (which abort immediately), Phase 1 self-validation allows one auto-fix attempt because the artifact hasn't been committed yet — the user hasn't seen it, and no downstream phase depends on it at this point.
+
+Validation checks:
+
+1. `schema_version` equals `1`
+2. `source_url` is a non-empty string
+3. `source_snapshot_path` is a non-empty string
+4. `claims` array is non-empty
+5. Each claim has non-null `id`, `text`, `source_section`, `category`, `confidence`
+6. Each `category` is one of: `architecture`, `performance`, `security`, `governance`, `tooling`, `deprecation`, `other`
+7. Each `confidence` is one of: `high`, `medium`, `low`
+
+**On validation failure:**
+
+```
+❌ Validation failed: claims.json
+   Field: <field_name>
+   Error: <missing | null | empty array | wrong type | invalid enum value>
+   Phase 1 self-validation failed. Attempting auto-fix...
+```
+
+Auto-fix attempt: Re-run the extraction prompt with the specific validation errors appended as constraints. If the second attempt also fails validation, abort Phase 1 with the error.
+
+### Step 1.7 — User Checkpoint 🧑
+
+Present the extracted claims to the user for confirmation. This is a mandatory checkpoint — do NOT proceed to Phase 2 without user approval.
+
+**Display format:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 Phase 1 Complete — Claims Extracted
+
+Source:  <announcement_url>
+Method:  <webfetch | websearch | user_paste>
+Claims:  <N> total
+
+| # | Category | Confidence | Claim |
+|---|----------|------------|-------|
+| 1 | architecture | high | <claim text truncated to 80 chars> |
+| 2 | performance | medium | <claim text truncated to 80 chars> |
+| ... | ... | ... | ... |
+
+Artifacts saved:
+  • {session_dir}/claims.json
+  • {session_dir}/source-snapshot.md
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Then ask:
+
+```
+Use AskUserQuestion:
+  question: "Are these claims correct? Anything missing or incorrect?"
+  options:
+    - "Looks good — proceed to Phase 2"
+    - "I have corrections" (user provides feedback → re-extract with corrections applied, re-validate, re-display)
+    - "Add missing claims" (user provides additional claims → append to claims.json, re-validate, re-display)
+    - "Abort pipeline"
+```
+
+If the user provides corrections or additions, update claims.json, re-run validation (Step 1.6), and re-display the updated summary. Repeat until the user approves.
 
 **Output artifacts:**
 ```
 ~/.gstack/research/sessions/<chain>-<upgrade>-<date>/claims.json
+~/.gstack/research/sessions/<chain>-<upgrade>-<date>/source-snapshot.md
 ```
 
 ---
