@@ -1903,17 +1903,20 @@ For each artifact in [claims.json, diff-map.json, analysis.json]:
 | `diff-map.json` | missing/corrupt | Metadata header shows `[DATA UNAVAILABLE]` for repo/SHA fields. Unclaimed Changes section degraded. |
 | `analysis.json` | available | Full Claims Analysis with verification status, evidence, code snippets. Full Unclaimed Changes. |
 | `analysis.json` | missing/corrupt | Claims listed without verification status (`[ANALYSIS UNAVAILABLE]`). Unclaimed Changes section shows `[DATA UNAVAILABLE]`. |
-| `analysis.json` | partial (e.g., `unreported_changes` missing) | Use available fields; mark missing sub-sections with `[DATA UNAVAILABLE]` |
+| `analysis.json` | partial — `claims_analyzed` valid, `unreported_changes` missing | Claims Analysis section uses available verification data normally. Unclaimed Changes section shows `[DATA UNAVAILABLE — unreported_changes field missing from analysis.json]`. |
+| `analysis.json` | partial — `claims_analyzed` missing, `unreported_changes` valid | Claims listed without verification status (`[ANALYSIS UNAVAILABLE]`). Unclaimed Changes section uses available data normally. |
+| `analysis.json` | partial — other validation failures | Use all parseable fields; mark each invalid/missing sub-section with `[DATA UNAVAILABLE]` and note the specific validation failure. |
 
-**If ALL three artifacts are missing:** abort Phase 5 with:
+**If ALL three artifacts are missing or corrupt (no artifact has status "available" or "partial"):** abort Phase 5 with:
 ```
-❌ Phase 5 aborted: No upstream artifacts found in {session_dir}.
+❌ Phase 5 aborted: No usable upstream artifacts found in {session_dir}.
    Expected: claims.json, diff-map.json, analysis.json
-   At least one artifact must be present to generate a report.
+   Status: claims.json=<status>, diff-map.json=<status>, analysis.json=<status>
+   At least one artifact must be loadable to generate a report.
    Run Phases 1-3 first.
 ```
 
-**If at least one artifact is available:** proceed with partial report generation. Print a warning:
+**If at least one artifact has status "available" or "partial":** proceed with partial report generation. Print a warning:
 ```
 ⚠️  Partial artifacts detected:
    claims.json:   <status>
@@ -1958,8 +1961,19 @@ analysis_summary = analysis.summary  // aggregate stats
 ```
 For each claim in claims_list:
   Find matching entry in claims_analyzed where claim_id == claim.id
-  Merge: claim text + category + confidence FROM claims.json
-         verification_status + evidence + code_snippets + analysis_notes FROM analysis.json
+  IF match found:
+    Merge: claim text + category + confidence FROM claims.json
+           verification_status + evidence + code_snippets + analysis_notes FROM analysis.json
+  IF no match found (claim exists in claims.json but not in analysis.json):
+    Set verification_status = "not_analyzed"
+    Set analysis_notes = "This claim has no corresponding entry in analysis.json. Phase 3 may not have processed it."
+    Log warning: "⚠️  Claim <claim.id> has no analysis entry — marking as not_analyzed"
+
+After join, check for orphaned analysis entries:
+  For each entry in claims_analyzed:
+    IF entry.claim_id does NOT match any claim.id in claims_list:
+      Log warning: "⚠️  analysis.json contains entry for <claim_id> which does not exist in claims.json — skipping (stale analysis)"
+      Do NOT include orphaned entries in the report
 ```
 
 ### Step 5.2 — Generate Internal Report (D15)
@@ -2074,13 +2088,15 @@ Document the pipeline execution:
 
 ## Output Rules
 
-- Output the FULL markdown report content, nothing else
-- Do NOT wrap in a code fence — output raw markdown
+- Begin your output IMMEDIATELY with the line: # Protocol Upgrade Analysis: <upgrade_name>
+- Do NOT wrap the output in a code fence (no ``` before or after)
+- Do NOT add any preamble, commentary, or explanation before the heading
+- Output the FULL markdown report content — nothing else
 - Use the exact section structure above
 - Every claim from the input must appear in the Claims Analysis section
 - Every unreported change must appear in the Unclaimed Changes section
 - For [DATA UNAVAILABLE] sections, always include a brief explanation of WHY the data is missing
-- Code snippets should use fenced code blocks with appropriate language hints
+- Code snippets within the report should use fenced code blocks with appropriate language hints
 - Keep the Executive Summary concise but substantive (not generic platitudes)
 ```
 
@@ -2096,17 +2112,18 @@ Validate the generated report structure before presenting to the user.
 
 **Validation checks:**
 
-1. **Metadata header present:** Report starts with `# Protocol Upgrade Analysis:` heading
-2. **Required sections present:** All six sections exist as level-2 headings:
+1. **Metadata header present:** The first non-empty line of the report must be `# Protocol Upgrade Analysis:` (prefix match). If the agent prepended commentary or a code fence, this check catches it.
+2. **Required sections present:** All five sections exist as level-2 headings (exact string match at start of line):
    - `## Executive Summary`
    - `## Claims Analysis`
    - `## Unclaimed Changes`
    - `## Methodology`
    - `## Raw Data References`
-3. **Metadata fields present:** Report contains `**Repo:**`, `**Commits:**`, `**Source:**`, `**Generated:**`
-4. **Claims completeness:** If `claims.json` was available, count the number of `### Claim` sub-headings — must equal the number of input claims. If any claims are missing from the report, list the missing claim IDs.
-5. **No empty sections:** Each section has at least 20 characters of content below its heading (excluding `[DATA UNAVAILABLE]` markers, which are valid content)
-6. **Unreported changes completeness:** If `analysis.json` was available and had `unreported_changes`, verify they appear in the report
+3. **No duplicate sections:** Each required level-2 heading appears exactly once. Duplicate headings indicate a splicing error.
+4. **Metadata fields present:** Report contains `**Repo:**`, `**Commits:**`, `**Source:**`, `**Generated:**`
+5. **Claims completeness:** If `claims.json` was available, count the number of `### Claim ` sub-headings (note trailing space — match `### Claim \d+:` pattern to avoid false positives from claim text). The count must equal the number of input claims. If any claims are missing from the report, list the missing claim IDs.
+6. **No empty sections:** Each section has at least 20 characters of non-whitespace content below its heading. `[DATA UNAVAILABLE ...]` markers count as valid content (they are the expected output for degraded sections).
+7. **Unreported changes completeness:** If `analysis.json` was available and had `unreported_changes`, verify they appear in the report
 
 **On validation failure:**
 
@@ -2116,7 +2133,19 @@ Validate the generated report structure before presenting to the user.
    Attempting regeneration of failed sections...
 ```
 
-Auto-fix: Re-dispatch the agent with only the failed sections and the relevant input data. Splice the regenerated sections into the report. If the second attempt also fails, proceed with the report as-is and note the validation failures in the Methodology section.
+**Auto-fix strategy:** Re-dispatch the agent with a section-specific prompt that includes:
+- The section heading to generate
+- The relevant input data for that section only
+- Instruction: "Output ONLY the content for this section, starting with the `## <heading>` line."
+
+Then replace the content between the failed section's heading and the next `## ` heading (or end of file) with the regenerated content. If the section heading itself is missing, insert it at the correct position (maintaining the section order from the template).
+
+If the second attempt also fails validation, proceed with the report as-is and append a validation failure note to the Methodology section:
+```
+### Validation Notes
+The following validation checks failed and could not be auto-fixed:
+- <check>: <failure description>
+```
 
 ### Step 5.5 — User Checkpoint 🧑
 
@@ -2171,6 +2200,14 @@ If the user provides edits:
 2. Re-write `{session_dir}/internal-report.md`
 3. Re-validate (Step 5.4)
 4. Re-display the summary
+
+If the user requests section regeneration:
+1. Ask which sections to regenerate
+2. For each section, use the same auto-fix strategy as Step 5.4: dispatch the agent with a section-specific prompt containing the relevant input data and the instruction to output only that section
+3. Replace the section content in the report (between heading and next `## ` heading)
+4. Re-write `{session_dir}/internal-report.md`
+5. Re-validate (Step 5.4)
+6. Re-display the summary
 
 If the user approves:
 1. The report at `{session_dir}/internal-report.md` is the final deliverable
