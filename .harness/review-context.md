@@ -1,41 +1,64 @@
-# Review Context — WHI-229: Phase 1 source ingestion agent
+# Review Context — WHI-230: Phase 2 Codebase Navigation
 
 ## Implementation Summary
 
-Replaced the Phase 1 placeholder section in SKILL.md with a complete implementation covering source fetching with a 3-tier fallback chain (D10), source snapshot saving (D13), structured claims extraction via Agent tool, chunked extraction for large sources (D1), self-validation against WHI-228 schema, and a mandatory user checkpoint before Phase 2.
+Implemented the full Phase 2 (Codebase Navigation) section in SKILL.md, replacing the placeholder with detailed step-by-step instructions for:
+- Treeless clone with timeout, known-large-repo depth limiting, and shallow clone fallback
+- Fuzzy tag matching using Levenshtein distance with confidence-based thresholds
+- SHA resolution with chronological order validation and shallow-clone deepening
+- Diff-map generation with file categorization and hunk counting
+- Self-validation gate against WHI-228 schema
+- User checkpoint with summary display
 
-The implementation uses the WHI-228 canonical schema categories (`architecture/performance/security/governance/tooling/deprecation/other`) which differ from the issue's AC categories (`feature/parameter/deprecation/migration/security`). The schema is the authoritative source — this is a deliberate choice, not a bug.
+Also updated the Artifact Schemas section to add `num_hunks` and `summary.renamed` fields to the diff-map.json schema, and fixed the cleanup trap in the Failure and Abort section.
 
 ## Files Changed
 
-- `skills/harness-research-engineering/SKILL.md` — Replaced Phase 1 placeholder with full 7-step implementation (Steps 1.1-1.7), updated agent role definition for `source_ingestion_agent`, fixed `source_snapshot_path` schema example, updated TOC description
+- `skills/harness-research-engineering/SKILL.md` — replaced Phase 2 placeholder (~15 lines) with full implementation (~480 lines); updated artifact schema, validation rules, Table of Contents, and cleanup trap
 
 ## Adversarial Review Findings
 
 ### Addressed (Critical/High)
 
-1. **Finding 2 (Major):** `source_snapshot_path` example in Artifact Schema showed `sources/announcement-2026-04-25.md` but actual output is `source-snapshot.md` — Fixed schema example
-2. **Finding 3 (Major):** Agent role definition missing fallback chain, snapshot output, and chunking behavior — Updated role definition with all 3 additions
-3. **Finding 4 (Major):** Tier 2 had no explicit success/failure criteria — Added 200-character threshold matching Tier 1
-4. **Finding 5 (Major):** Self-validation auto-fix conflicts with general abort-only policy — Added explicit carve-out note explaining pre-output vs phase-boundary distinction
-5. **Finding 7 (Minor):** "Try a different URL" had no retry limit — Added 3-attempt limit
+**Round 1:**
+- CRITICAL: `REPO_URL` never assigned in bash code → added explicit assignment at top of Step 2.1
+- CRITICAL: `--no-checkout` without `git checkout` → added `git checkout HEAD` after treeless clone
+- CRITICAL: `TAG_COUNT=0` check broken (`echo "" | wc -l` = 1) → switched to `grep -c .`
+- CRITICAL: `summary.renamed` missing from schema → added to schema, JSON examples, field reference, and validation
+- HIGH: No URL integrity check on reused clone → added `remote get-url` comparison with mismatch handling
+- HIGH: `/tmp/` paths for diff output → changed to write to `$SESSION_DIR`
+- HIGH: `git rev-parse` fails on shallow clones → added `git fetch --depth=500` fallback
+- HIGH: `FILTERED_TAGS` string concatenation corruption → rewrote with proper newline handling
+- HIGH: AC-6 hunks not implemented → added `num_hunks` field to schema, extraction logic with per-file and batch counting
+- HIGH: Local path never sets `REPO_URL` → documented in Step 2.0
+- HIGH: Cleanup trap uses unslugified variables → trap now references `$CLONE_DIR` directly
+
+**Round 2:**
+- CRITICAL: Reused clone falls through to re-clone → added `clone_method` skip guard
+- CRITICAL: Batch awk hunk counter always outputs 0 → fixed count/reset ordering
+- HIGH: SHA deepen fallback only covers BASE_REF → added HEAD_REF deepen
+- HIGH: Large-repo clone missing `git checkout HEAD` → added checkout step
 
 ### Remaining (Medium/Low — not auto-fixed)
 
-1. **Finding 1 (Critical — disputed):** Category enum mismatch between Linear issue AC and implementation. The implementation follows WHI-228 schema categories which are authoritative. **Recommendation:** Update the WHI-229 issue's AC #2 to reflect the schema's category set.
-2. **Finding 6 (Minor — pre-existing):** Phase 4 silently absent from TOC. This was present before WHI-229 and is not introduced by this PR.
+- MEDIUM (NEW-6): `other` category is unreachable but appears in validation/display — cosmetic, no data integrity impact. Suggestion: either add a path pattern for `other` or remove from categorization enum.
+- MEDIUM: `new_module` detection for root-level files always returns non-empty from `git ls-tree` — minor categorization quirk for files in repo root.
+- MEDIUM: D13 label reused for two different concepts (source snapshot vs SHA resolution) — documentation clarity issue.
+- LOW (NEW-7): Shallow-clone fallback missing `cd $CLONE_DIR` — Step 2.2 re-cd's immediately, so no functional impact.
+- LOW: Substring containment boost can produce scores near 1.0 for short inputs — rare edge case.
+- LOW: Phase 2 checkpoint uses different emoji vs Phase 1 — cosmetic only.
 
 ## PR
 
-https://github.com/Whisker17/my-harness/pull/20
+https://github.com/Whisker17/my-harness/pull/21
 
 ## Acceptance Criteria Status
 
-- [x] WebFetch 成功时，从 HTML/Markdown 中提取结构化 claims 数组 — Step 1.1 Tier 1 + Step 1.3
-- [x] 每个 claim 包含：id、text、category、confidence、source_section — Step 1.3 extraction prompt (uses WHI-228 schema categories)
-- [x] WebFetch 失败时自动尝试 WebSearch 摘要提取 — Step 1.1 Tier 2
-- [x] WebSearch 也失败时通过 AskUserQuestion 请求用户粘贴原文 — Step 1.1 Tier 3
-- [x] 源内容快照保存到 `{workdir}/source-snapshot.md` — Step 1.2
-- [x] 输出 `claims.json` 符合 WHI-228 定义的 schema，通过验证门控 — Step 1.5 + Step 1.6
-- [x] claims 数量 > 15 时按 5-8 个一批分块提取 — Step 1.4
-- [x] 用户检查点展示提取的 claims 摘要，用户确认后才进入 Phase 2 — Step 1.7
+- ✅ AC-1: Treeless clone (`--filter=blob:none --no-checkout`) — Step 2.1
+- ✅ AC-2: Clone timeout (5 min) + cleanup — Step 2.1 with `timeout 300`
+- ✅ AC-3: Fuzzy tag matching with similarity scoring — Step 2.2
+- ✅ AC-4: Confidence thresholds (≥0.8 auto, ≥0.5/<0.8 candidates, <0.5 full list) — Step 2.2c
+- ✅ AC-5: `base_sha`/`head_sha` via `git rev-parse` in diff-map.json — Step 2.3
+- ✅ AC-6: diff-map.json with additions/deletions/hunks per file — Step 2.4b with `num_hunks`
+- ✅ AC-7: diff-map.json matches WHI-228 schema — Step 2.6 self-validation + schema updates
+- ✅ AC-8: Local repo path skips clone — Step 2.0 with `clone_method = "local"`
