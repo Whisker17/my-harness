@@ -2731,33 +2731,44 @@ Write the index entry as a single-line JSON record appended to the JSONL file.
 
 ```bash
 # Serialize the entry as compact single-line JSON and append
+WRITE_OK=false
 echo '<entry as single-line JSON>' >> "$INDEX_FILE"
 APPEND_STATUS=$?
 ```
 
 **Validation after write:**
 
-First, check that the append command itself succeeded. Then verify the written entry matches what we intended:
+First, check that the append command itself succeeded (terminal on failure). Then verify the written entry matches what we intended using both `dedup_key` and `generated_at` (the combination uniquely identifies the entry, preventing false matches against older same-key entries):
 ```bash
-# Step 1: Check append exit status
+# Step 1: Check append exit status — TERMINAL on failure
 if [ $APPEND_STATUS -ne 0 ]; then
   echo "❌ Append command failed (exit $APPEND_STATUS): entry was NOT written to $INDEX_FILE."
   echo "   Check disk space, permissions, and filesystem health."
-  # Do NOT proceed to Step 7.6 success display — skip to error state
+  echo "   Phase 7 aborted. Re-run to retry."
+  # Skip ALL remaining steps — do NOT proceed to Step 7.6
+  return 1  # or exit 1 if not in a function context
 fi
 
-# Step 2: Read back the last line and verify it matches the new entry's dedup_key
+# Step 2: Read back the last line and verify it matches the new entry
 LAST_LINE=$(tail -1 "$INDEX_FILE")
 LAST_DEDUP_KEY=$(echo "$LAST_LINE" | jq -r '.dedup_key // empty' 2>/dev/null)
-if [ "$LAST_DEDUP_KEY" != "$DEDUP_KEY" ]; then
-  echo "❌ Write verification failed: last line dedup_key='$LAST_DEDUP_KEY' does not match expected='$DEDUP_KEY'."
+LAST_GENERATED_AT=$(echo "$LAST_LINE" | jq -r '.generated_at // empty' 2>/dev/null)
+if [ "$LAST_DEDUP_KEY" != "$DEDUP_KEY" ] || [ "$LAST_GENERATED_AT" != "$GENERATED_AT" ]; then
+  echo "❌ Write verification failed: last line does not match the entry we just wrote."
+  echo "   Expected dedup_key='$DEDUP_KEY', generated_at='$GENERATED_AT'"
+  echo "   Got      dedup_key='$LAST_DEDUP_KEY', generated_at='$LAST_GENERATED_AT'"
   echo "   The index file may be corrupted or the append was silently lost."
-  echo "   The entry was NOT successfully persisted."
-  # Do NOT proceed to Step 7.6 success display — skip to error state
+  echo "   Phase 7 aborted. Re-run to retry."
+  # Skip ALL remaining steps — do NOT proceed to Step 7.6
+  return 1  # or exit 1 if not in a function context
 fi
+
+WRITE_OK=true
 ```
 
-**If write verification fails:** Do NOT display the success banner in Step 7.6. Instead, print:
+**Gate on WRITE_OK:** Step 7.6 MUST check `WRITE_OK == true` before displaying any success output. If `WRITE_OK` is not `true`, Step 7.6 displays the error banner instead.
+
+**If `WRITE_OK` is not `true` (write verification failed or append failed):** Do NOT display the success banner in Step 7.6. The error path above already printed the abort message and returned/exited. Step 7.6 should not be reachable in this case, but as a defense-in-depth guard:
 ```
 ⚠️  Phase 7 completed with errors — index entry write could not be verified.
     Manual inspection of ~/.gstack/research/research-index.jsonl is required.
