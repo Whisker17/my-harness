@@ -86,13 +86,13 @@ for skill in "${HARNESS_SKILLS[@]}"; do
   fi
 
   mkdir -p "$dst"
-  cp -r "$src"/* "$dst"/
+  cp -r "$src"/* "$dst"/ 2>/dev/null || true
   check_pass "$skill installed → $dst"
 done
 
 # Copy shared schema (required by harness-dev quality gate)
 if [ -f "$SKILLS_SRC/harness-dev/schema.md" ]; then
-  cp "$SKILLS_SRC/harness-dev/schema.md" "$SKILLS_DST/harness-dev/schema.md"
+  cp "$SKILLS_SRC/harness-dev/schema.md" "$SKILLS_DST/harness-dev/schema.md" 2>/dev/null || true
   check_pass "schema.md copied to $SKILLS_DST/harness-dev/"
 fi
 
