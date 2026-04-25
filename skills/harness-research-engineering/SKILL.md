@@ -189,7 +189,7 @@ For missing `base_ref` and `head_ref` (optional — can be auto-detected in Phas
 
 ## Agent Roles
 
-Six agent roles across the pipeline. Each role is a behavioral directive dispatched via the Agent tool (not a separate process). Roles use compact bullet-list format.
+Seven agent roles across the pipeline. Each role is a behavioral directive dispatched via the Agent tool (not a separate process). Roles use compact bullet-list format.
 
 ### 1. source_ingestion_agent (Phase 1)
 
@@ -3719,6 +3719,11 @@ The following error handling framework applies across all pipeline phases. Phase
 | Phase 7 | Malformed JSON in existing index | Skip the malformed line, log warning, continue reading |
 | Phase 7 | Duplicate entry detected | AskUserQuestion: overwrite / keep-both / skip |
 | Phase 7 | Index directory creation fails | Abort with clear error message |
+| Phase 8 | `internal-report.md` missing | Abort Phase 8; Phase 5 must complete first |
+| Phase 8 | Knowledge index missing | Proceed without supplementary data; use internal report only |
+| Phase 8 | Agent fails to generate summary or returns malformed markdown | Retry once with simplified prompt; if still fails, abort |
+| Phase 8 | Code leak detected in validation | Auto-fix: re-dispatch agent for offending section with stricter prompt |
+| Phase 8 | User aborts mid-approval | Preserve draft at `public-summary.draft.md`; do not create final `public-summary.md` |
 
 **Error handling philosophy:** Phase 5 always attempts to produce output. The only condition that aborts Phase 5 is ALL upstream artifacts being missing. Any other combination of missing/partial/corrupt artifacts results in a degraded but functional report.
 
@@ -4144,6 +4149,19 @@ Session:     <session_dir>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
+After displaying the success banner, offer to proceed to Phase 8 (M3 public summary):
+
+```
+Use AskUserQuestion:
+  question: "Phase 7 complete. Generate a public-facing summary for external stakeholders (Phase 8)?"
+  options:
+    - "Yes — generate public summary (Phase 8)"
+    - "No — pipeline complete"
+```
+
+If "Yes": proceed to Phase 8.
+If "No": print `"Pipeline complete. Session artifacts at: <session_dir>"` and stop.
+
 ### Per-Phase Error Handling (Phase 7)
 
 | Phase 7 Scenario | Recovery Action |
@@ -4401,12 +4419,13 @@ Validate the draft summary at `{session_dir}/public-summary.draft.md` before pre
    - `## Key Changes` (or `## 关键变更`)
    - `## Impact Assessment` (or `## 影响评估`)
    - `## Verification Status` (or `## 验证状态`)
-3. **No code leaks:** Scan the entire summary for patterns that indicate leaked internal details:
+3. **No code leaks:** Scan the entire summary for patterns that indicate leaked internal details. **Exclude** content inside `**Source:**` metadata lines and `https?://` URLs when checking path patterns.
    - Fenced code blocks (` ``` `) — FAIL if found
-   - File path patterns (`/`, `.sol`, `.go`, `.ts`, `.js`, `.py` preceded by directory-like text) — FAIL if found
-   - Line number references (`:L\d+`, `line \d+`) — FAIL if found
-   - SHA hashes (40-character hex strings) — FAIL if found
-   - `analysis_notes`, `code_snippets`, `evidence_map_path` — FAIL if found
+   - Multi-segment file paths outside URLs: regex `(?<!https?://\S*)\b[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_.\-]+` — FAIL if found (matches patterns like `contracts/src/L2/file.sol` but not `https://example.com/path`)
+   - Source code file extensions in path context: regex `\b\w+\.(sol|go|ts|js|py|rs|cpp|c|yaml|toml)\b` when NOT inside a URL — FAIL if found
+   - Line number references: `:L\d+` or `at line \d+` or `lines \d+[-–]\d+` — FAIL if found (plain English "line" followed by a number in narrative context is allowed)
+   - SHA hashes (40-character hex strings): regex `\b[0-9a-f]{40}\b` — FAIL if found
+   - Internal field names: `analysis_notes`, `code_snippets`, `evidence_map_path` — FAIL if found
 4. **Disclaimer present:** The summary ends with the appropriate disclaimer text (last non-empty paragraph).
 5. **No empty sections:** Each section has at least 20 characters of non-whitespace content.
 6. **No duplicate sections:** Each required heading appears exactly once.
@@ -4441,7 +4460,9 @@ APPROVED_SECTIONS = {}
 
 For each SECTION in SECTIONS:
   1. Extract the section content from the draft summary
-     (text between "## <SECTION>" heading and the next "## " heading or disclaimer)
+     (text from and INCLUDING the "## <SECTION>" heading line,
+      up to but NOT INCLUDING the next "## " heading or the disclaimer separator "---")
+     The extracted content INCLUDES the heading — this is important for reassembly in Step 8.6.
   
   2. Display the section to the user:
      ```
@@ -4498,7 +4519,7 @@ After ALL sections approved:
 
 After all sections are approved:
 
-1. **Assemble the final summary:** Combine the metadata header, all approved sections, and the disclaimer:
+1. **Assemble the final summary:** Combine the metadata header, all approved sections, and the disclaimer. Each `APPROVED_SECTIONS[...]` value already includes its `## <Heading>` line (see Step 8.5 extraction rule) — do NOT add extra headings.
 
 ```
 FINAL_CONTENT = """
