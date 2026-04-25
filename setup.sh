@@ -74,7 +74,7 @@ header "Step 2: Installing harness skills"
 
 mkdir -p "$SKILLS_DST"
 
-HARNESS_SKILLS=("harness-dev" "harness-review" "harness-design" "harness-bootstrap" "harness-review-v2" "harness-design-v2" "harness-triage")
+HARNESS_SKILLS=("harness-dev" "harness-review" "harness-design" "harness-bootstrap" "harness-review-v2" "harness-design-v2" "harness-triage" "harness-research-engineering")
 
 for skill in "${HARNESS_SKILLS[@]}"; do
   src="$SKILLS_SRC/$skill"
@@ -308,6 +308,7 @@ elif [ $WARN -gt 0 ]; then
   echo "    /harness-dev WHI-123       — implement a Linear issue"
   echo "    /harness-review WHI-123    — final review + merge"
   echo "    /harness-bootstrap <proj>  — bootstrap a new project"
+  echo "    /harness-research-engineering analyze [chain] [upgrade]"
   echo ""
   echo "  V2 pipeline (if prerequisites installed):"
   echo "    /harness-design-v2         — Codex-powered design"
@@ -322,6 +323,7 @@ else
   echo "    /harness-bootstrap <proj>  — bootstrap a project repo"
   echo "    /harness-dev WHI-123       — implement a Linear issue"
   echo "    /harness-review WHI-123    — final review + merge"
+  echo "    /harness-research-engineering analyze [chain] [upgrade]"
   echo ""
   echo "  V2 pipeline:"
   echo "    /harness-design-v2         — Codex-powered design"
