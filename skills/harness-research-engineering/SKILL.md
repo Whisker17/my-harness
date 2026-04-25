@@ -38,7 +38,7 @@ You are a protocol analysis engine for blockchain engineering research. The user
 5. [Artifact Schemas](#artifact-schemas) — JSON schemas for intermediate artifacts and validation gates
 6. [Phase 1: Source Ingestion](#phase-1-source-ingestion) — fallback chain fetch, claims extraction, source snapshot, user checkpoint
 7. [Phase 2: Codebase Navigation](#phase-2-codebase-navigation) — treeless clone, fuzzy tag matching, SHA resolution, diff-map generation
-8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — trace claims to code
+8. [Phase 3: Implementation Analysis](#phase-3-implementation-analysis) — claim batching, evidence mapping, code-first delta pass, quality gates
 9. [Phase 5: Report Generation](#phase-5-report-generation) — produce internal + public reports
 10. [Failure and Abort](#failure-and-abort) — error handling and cleanup
 
@@ -218,16 +218,19 @@ Six agent roles across the pipeline. Each role is a behavioral directive dispatc
 
 ### 3. implementation_analysis_agent (Phase 3)
 
-- **Mission:** Deep dive into specific code changes, trace claims to implementation
+- **Mission:** Cross-reference claims against code diffs; independently scan for unreported changes
 - **Inputs:** `claims.json`, `diff-map.json`, cloned repo path
-- **Tools:** Read, Grep, Bash
-- **Outputs:** `analysis.json` — claim-to-code evidence mapping
+- **Tools:** Read, Grep, Bash, Agent (for sub-dispatches)
+- **Outputs:** `analysis.json` — claim-to-code evidence mapping + unreported changes
 - **Behavior:**
-  - For each claim in `claims.json`, find the corresponding code changes in the diff
-  - Trace function call chains for new or modified functions
-  - Document data flow changes with 20-30 line code snippets plus surrounding context
-  - Mark claims as VERIFIED (code evidence found) or UNVERIFIED (no matching code)
-  - Read only relevant entries by claim ID to manage context window pressure
+  - Batch claims 5-8 per group, prioritizing same-category claims together (D1)
+  - For each batch: read relevant diff hunks, match claims to code evidence (file path, line range, code snippet)
+  - Mark each claim as `verified` (code evidence found), `partially_verified` (partial evidence), or `unverified` (no matching code)
+  - Collect extended code snippets (20-30 lines) for claims with strong evidence
+  - After all claim batches: run code-first delta pass (D12) — independently scan all diffs to find changes NOT covered by any claim
+  - Output `unreported_changes` array with file, change description, and significance (high/medium/low)
+  - Machine gate: warn if confirmed+partial coverage < 30% (claims quality concern)
+  - Progress output after each batch: "Batch N/M complete, X/Y claims processed"
 
 ### 4. comparison_agent (Phase 4 — v2, not in M1)
 
@@ -480,6 +483,7 @@ If validation fails at any phase boundary:
   "summary": {
     "total_claims": 12,
     "verified": 10,
+    "partially_verified": 0,
     "unverified": 2,
     "unreported_change_count": 3
   }
@@ -507,6 +511,7 @@ If validation fails at any phase boundary:
 | `claims_analyzed[].code_snippets[].content` | string | ✅ | The code content |
 | `claims_analyzed[].code_snippets[].annotation` | string | ✅ | Explanation of what the snippet demonstrates |
 | `claims_analyzed[].analysis_notes` | string | ❌ | Free-form notes from the analysis agent |
+| `claims_analyzed[].manual_override` | boolean | ❌ | Set to `true` when the user manually overrode this claim's `verification_status` at the Phase 3 checkpoint |
 | `unreported_changes` | array | ✅ | Code changes NOT tied to any claim — discovered via code-first delta pass (per D12) |
 | `unreported_changes[].file` | string | ✅ | File path |
 | `unreported_changes[].status` | string | ✅ | One of: `added`, `modified`, `deleted`, `renamed` |
@@ -517,6 +522,7 @@ If validation fails at any phase boundary:
 | `summary` | object | ✅ | Aggregate statistics |
 | `summary.total_claims` | number | ✅ | Total claims analyzed |
 | `summary.verified` | number | ✅ | Claims with code evidence |
+| `summary.partially_verified` | number | ✅ | Claims with partial code evidence |
 | `summary.unverified` | number | ✅ | Claims without code evidence |
 | `summary.unreported_change_count` | number | ✅ | Number of code-first delta findings |
 
@@ -528,6 +534,7 @@ If validation fails at any phase boundary:
 - `unreported_changes` must be present (may be empty array — empty is valid, missing is not)
 - `summary` must be present with all required sub-fields
 - `summary.total_claims` must equal `len(claims_analyzed)`
+- `summary.verified + summary.partially_verified + summary.unverified` must equal `summary.total_claims`
 
 ### comparison.json
 
@@ -1369,11 +1376,473 @@ Cleanup: Clone is kept alive until the pipeline completes (Phase 5 in M1). Clean
 
 ## Phase 3: Implementation Analysis
 
-> **Implemented by:** WHI-229/WHI-230 dependent (not yet implemented — this is a placeholder)
+> **Implemented by:** WHI-231
 
-Dispatch `implementation_analysis_agent`. See [Agent Roles > implementation_analysis_agent](#3-implementation_analysis_agent-phase-3) for behavior.
+Phase 3 is the core analysis stage: cross-reference Phase 1 claims against Phase 2 diff data to verify which claims have code evidence, then independently scan the diff for important changes the announcement didn't mention.
 
-**Quality gate (machine):** Every claim must have code evidence or be marked `[UNVERIFIED]`. If >50% of claims are unverified, warn the user before proceeding.
+**Agent role:** `implementation_analysis_agent` (see [Agent Roles > implementation_analysis_agent](#3-implementation_analysis_agent-phase-3))
+
+### Step 3.0 — Input Validation Gate
+
+Before processing, validate both input artifacts from previous phases.
+
+**Recovering `session_dir` and `clone_path`:** Phase 3 runs in the same session as Phases 1-2. The `SESSION_DIR` variable should still be available. If not (e.g., re-invocation), recover:
+
+```bash
+SESSION_DIR=$(ls -dt "$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-"* 2>/dev/null | head -1)
+if [ -z "$SESSION_DIR" ]; then
+  echo "❌ No session directory found. Run Phase 1 first."
+  exit 1
+fi
+echo "Session directory: $SESSION_DIR"
+```
+
+**Validate claims.json:**
+
+```bash
+CLAIMS_FILE="$SESSION_DIR/claims.json"
+if [ ! -f "$CLAIMS_FILE" ]; then
+  echo "❌ Validation failed: claims.json not found at $CLAIMS_FILE"
+  echo "   Phase 3 aborted. Run Phase 1 first."
+  exit 1
+fi
+```
+
+Parse and check using the validation rules from [Artifact Schemas > claims.json](#claimsjson):
+
+1. File must be valid JSON
+2. `schema_version` must equal `1`
+3. `source_url` must be a non-empty string
+4. `source_snapshot_path` must be a non-empty string
+5. `claims` array must be non-empty
+6. Each claim must have non-null `id`, `text`, `source_section`, `category`, `confidence`
+7. `category` must be one of: `architecture`, `performance`, `security`, `governance`, `tooling`, `deprecation`, `other`
+8. `confidence` must be one of: `high`, `medium`, `low`
+
+**Validate diff-map.json:**
+
+```bash
+DIFFMAP_FILE="$SESSION_DIR/diff-map.json"
+if [ ! -f "$DIFFMAP_FILE" ]; then
+  echo "❌ Validation failed: diff-map.json not found at $DIFFMAP_FILE"
+  echo "   Phase 3 aborted. Run Phase 2 first."
+  exit 1
+fi
+```
+
+Parse and check using the validation rules from [Artifact Schemas > diff-map.json](#diff-mapjson):
+
+1. File must be valid JSON
+2. `schema_version` must equal `1`
+3. `repo`, `base_sha`, `head_sha` must be non-empty strings
+4. `files` array must be non-empty
+5. Each file must have non-null `path`, `status`, `category`, `lines_changed`, `num_hunks`
+6. `status` must be one of: `added`, `modified`, `deleted`, `renamed`
+7. `category` must be one of: `core`, `new_module`, `config`, `test`, `docs`, `dependency`, `other`
+8. `summary` must be present with all required sub-fields
+
+**On any validation failure:**
+
+```
+❌ Validation failed: <artifact>.json
+   Field: <field_name>
+   Error: <missing | null | empty array | wrong type (expected <type>, got <type>)>
+   Phase 3 aborted. Fix the artifact and re-run.
+```
+
+Report ALL failures (not just the first one), then abort.
+
+**Extract working variables after validation passes:**
+
+```bash
+CLONE_PATH=$(cat "$DIFFMAP_FILE" | jq -r '.clone_path')
+BASE_SHA=$(cat "$DIFFMAP_FILE" | jq -r '.base_sha')
+HEAD_SHA=$(cat "$DIFFMAP_FILE" | jq -r '.head_sha')
+TOTAL_CLAIMS=$(cat "$CLAIMS_FILE" | jq '.claims | length')
+TOTAL_FILES=$(cat "$DIFFMAP_FILE" | jq '.files | length')
+
+echo "Clone path: $CLONE_PATH"
+echo "Diff range: ${BASE_SHA:0:8}..${HEAD_SHA:0:8}"
+echo "Claims to analyze: $TOTAL_CLAIMS"
+echo "Files in diff: $TOTAL_FILES"
+```
+
+Verify the clone path still exists:
+```bash
+if [ ! -d "$CLONE_PATH/.git" ]; then
+  echo "❌ Clone directory not found at $CLONE_PATH"
+  echo "   The repository clone from Phase 2 may have been cleaned up."
+  echo "   Re-run Phase 2 to re-clone the repository."
+  exit 1
+fi
+```
+
+### Step 3.1 — Claim Batching (D1)
+
+Group claims into batches of 5-8 for processing. Prioritize grouping by `category` to maximize diff relevance per batch.
+
+**Batching algorithm:**
+
+1. Read all claims from `claims.json`
+2. Group claims by `category`
+3. For each category group:
+   - If the group has ≤8 claims → it becomes one batch
+   - If the group has >8 claims → split into sub-batches of 5-8
+4. If any category group has <5 claims, attempt to merge it with the next-smallest group. If the merged result is ≤8 claims, merge them into one batch. If the merged result would exceed 8, keep the small group as its own batch (batches with <5 claims are allowed when no valid merge target exists). Never create a batch exceeding 8 claims.
+5. Assign batch IDs: `batch-001`, `batch-002`, ...
+
+**Batch context preparation:**
+
+For each batch, identify the relevant diff hunks:
+
+1. Read the claims in the batch — extract any file references from `text` and `referenced_artifacts`
+2. Cross-reference with `diff-map.json` to identify candidate files:
+   - Files explicitly named in claims
+   - Files whose `path` contains keywords from the claim text (function names, module names, feature names)
+   - For `architecture` claims: prioritize `core` and `new_module` category files
+   - For `performance` claims: prioritize files with high `lines_changed`
+   - For `security` claims: include all files regardless of category
+3. For each candidate file, fetch the diff hunks:
+   ```bash
+   cd "$CLONE_PATH"
+   git diff "$BASE_SHA..$HEAD_SHA" -- "<file_path>"
+   ```
+
+**Context budget per batch (D1):**
+- Claims text: ~2KB
+- Diff hunks: ~4KB (truncate long diffs to the most relevant hunks — first 200 lines per file, prioritize files matching claim keywords)
+- Instructions: ~2KB
+- Total: ~8KB per batch
+
+If the total diff hunks for a batch exceed 4KB, prioritize files by relevance:
+1. Files explicitly mentioned in claim text → always include (full diff)
+2. Files matching claim keywords → include (truncated to 100 lines)
+3. Remaining candidate files → include file path and summary only (no diff content)
+
+### Step 3.2 — Batch Analysis (Claim-to-Code Matching)
+
+Process each batch by dispatching the `implementation_analysis_agent` via the Agent tool.
+
+**Per-batch prompt:**
+
+```
+You are the Implementation Analyst. Your job is to read code diffs and determine
+whether each claimed change actually exists in the codebase, collecting file paths
+and line numbers as evidence.
+
+## Claims to analyze (Batch <batch_id>)
+
+<JSON array of claims in this batch>
+
+## Relevant code diffs
+
+<diff hunks for candidate files, with file paths as headers>
+
+## Instructions
+
+For each claim, determine its verification status:
+- **verified**: Code evidence directly confirms the claim. The diff clearly shows
+  the described change was implemented.
+- **partially_verified**: Some evidence exists but the claim is only partly supported.
+  Part of the described change is present, or the implementation differs from the
+  claim's description in non-trivial ways.
+- **unverified**: No code evidence found in the diff that supports this claim.
+  The described change may not exist, may be in a different location, or may not
+  be captured in this diff range.
+
+For each claim, collect evidence:
+- file: path relative to repo root
+- lines: line range as string (e.g., "45-78")
+- description: what this code evidence shows
+- relevance: high (direct evidence), medium (indirect/supporting), low (tangential)
+
+Optionally collect extended code snippets (20-30 lines) for claims with strong evidence.
+These will be used in the final report:
+- file: path relative to repo root
+- start_line: starting line number
+- end_line: ending line number
+- content: the code content
+- annotation: explanation of what the snippet demonstrates
+
+Also provide analysis_notes for each claim — free-form notes explaining your reasoning,
+especially for partially_verified or unverified claims.
+
+Output as a valid JSON array of objects, one per claim:
+{
+  "claim_id": "<claim id>",
+  "verification_status": "verified | partially_verified | unverified",
+  "evidence": [{ "file": "...", "lines": "...", "description": "...", "relevance": "..." }],
+  "code_snippets": [{ "file": "...", "start_line": N, "end_line": N, "content": "...", "annotation": "..." }],
+  "analysis_notes": "..."
+}
+
+No prose, no commentary — just the JSON array.
+```
+
+**Progress output after each batch:**
+
+```
+Batch <N>/<total> complete, <claims_processed>/<total_claims> claims processed
+  - verified: <count>
+  - partially_verified: <count>
+  - unverified: <count>
+```
+
+**Accumulate results:** After each batch, merge the results into a running `claims_analyzed` array.
+
+**Batch completeness check:** After all batches are processed, verify `len(claims_analyzed) == TOTAL_CLAIMS`. If any claims are missing (batch agent truncated output or dropped claims), identify which `claim_id`s from `claims.json` are absent and re-dispatch those specific claims as a recovery batch. If the recovery batch also fails to produce results for the missing claims, mark them as `unverified` with `analysis_notes: "Claim could not be analyzed — batch processing failed to produce a result for this claim."` to ensure `claims_analyzed` always has exactly one entry per input claim.
+
+### Step 3.3 — Code-First Delta Pass (D12)
+
+After all claim batches are processed, run an independent scan of the entire diff to find changes NOT covered by claims.
+
+**Purpose:** Discover unreported changes — important code modifications that the announcement didn't mention. This is a critical integrity check.
+
+**Input:** `diff-map.json` files list (all changed files)
+
+**Process:**
+
+1. **Collect all claimed files:** Build a set of file paths that appeared as evidence in Step 3.2 results
+2. **Identify unclaimed files:** Files in `diff-map.json` that are NOT in the claimed files set
+3. **Filter for significance:** From unclaimed files, exclude:
+   - `test` category files (test changes without claims are normal)
+   - `docs` category files (doc changes without claims are normal)
+   - `dependency` category files with ≤10 `lines_changed` (minor version bumps)
+4. **Analyze remaining unclaimed files:** For each file, fetch its diff and assess:
+   ```bash
+   cd "$CLONE_PATH"
+   git diff "$BASE_SHA..$HEAD_SHA" -- "<file_path>" | head -100
+   ```
+
+**Delta analysis prompt (dispatched via Agent tool):**
+
+```
+You are the Code Delta Analyst. Your job is to scan code diffs for changes that
+were NOT mentioned in the project's announcement/claims. You are looking for
+"unreported changes" — things the announcement missed or didn't talk about.
+
+## Changed files NOT covered by any claim
+
+<For each unclaimed file: path, status, lines_changed, first 100 lines of diff>
+
+## Instructions
+
+For each file, determine:
+1. What changed (new feature? parameter change? bug fix? refactor? config change?)
+2. How significant is this change:
+   - **high**: Involves security, consensus, state migration, or breaking API changes
+   - **medium**: Non-trivial functional change (new behavior, modified logic, error handling)
+   - **low**: Refactor, cleanup, formatting, minor config, or boilerplate changes
+
+3. Suggest a potential_category for each: architecture, performance, security,
+   governance, tooling, deprecation, other
+
+Output as a valid JSON array:
+[{
+  "file": "<path>",
+  "status": "<added|modified|deleted|renamed>",
+  "lines_changed": <number>,
+  "description": "<what changed and why it matters>",
+  "significance": "<high|medium|low>",
+  "potential_category": "<category>"
+}]
+
+Include ALL files provided. Filter nothing — the orchestrator will decide what's relevant.
+No prose, no commentary — just the JSON array.
+```
+
+**Also check claimed files for additional unreported changes:**
+
+For files that DID appear as evidence for claims, check whether the diff contains OTHER significant changes beyond what the claims described. This catches cases where a file was partially analyzed for one claim but contains additional unreported modifications.
+
+For each such file:
+1. Read the full diff (not just the hunks matched to claims)
+2. Compare the full set of hunks against the evidence already recorded
+3. If there are significant hunks not covered by any claim's evidence, add them to `unreported_changes`
+
+### Step 3.4 — Build analysis.json
+
+Assemble the `analysis.json` artifact following the schema from [Artifact Schemas > analysis.json](#analysisjson):
+
+```json
+{
+  "schema_version": 1,
+  "generated_at": "<ISO 8601 timestamp>",
+  "claims_analyzed": [
+    <merged results from all batch processing in Step 3.2>
+  ],
+  "unreported_changes": [
+    <results from Step 3.3 code-first delta pass>
+  ],
+  "summary": {
+    "total_claims": <total claims analyzed>,
+    "verified": <count of verified>,
+    "partially_verified": <count of partially_verified>,
+    "unverified": <count of unverified>,
+    "unreported_change_count": <count of unreported changes>
+  }
+}
+```
+
+**Compute summary statistics:**
+```
+total_claims = len(claims_analyzed)
+verified = count where verification_status == "verified"
+partially_verified_count = count where verification_status == "partially_verified"
+unverified = count where verification_status == "unverified"
+unreported_change_count = len(unreported_changes)
+```
+
+**Write to:** `{session_dir}/analysis.json`
+
+### Step 3.5 — Machine Quality Gate
+
+After writing `analysis.json`, run automated quality checks.
+
+**Gate 1 — Evidence coverage warning (D7):**
+
+```
+confirmed_and_partial = verified + partially_verified_count
+coverage_ratio = confirmed_and_partial / total_claims
+```
+
+If `coverage_ratio < 0.30` (less than 30% of claims have any evidence):
+```
+⚠️  Machine gate WARNING: Only <N>% of claims (<confirmed_and_partial>/<total_claims>)
+    have code evidence (verified or partially_verified).
+    This may indicate:
+    - Claims are about changes outside the analyzed diff range
+    - The announcement describes planned (not yet implemented) changes
+    - The wrong git refs were selected in Phase 2
+    
+    Consider re-running Phase 2 with different refs before proceeding.
+```
+
+**Gate 2 — Majority unverified warning:**
+
+If `unverified / total_claims > 0.50` (more than 50% of all claims are `unverified`):
+```
+⚠️  Machine gate WARNING: >50% of claims are unverified (<unverified>/<total_claims>).
+    The analysis may be unreliable. Review the claims and diff range carefully.
+```
+
+**Gate 3 — High-significance unreported changes alert:**
+
+```
+high_sig_count = count of unreported_changes where significance == "high"
+```
+
+If `high_sig_count > 0`:
+```
+⚠️  Machine gate ALERT: <high_sig_count> high-significance unreported changes found.
+    These are important code changes NOT mentioned in the announcement.
+    Review them carefully in the analysis output.
+```
+
+**These gates produce warnings only — they do NOT abort the pipeline.** The user checkpoint in Step 3.6 will present these warnings for human judgment.
+
+### Step 3.6 — Self-Validation Gate
+
+Before presenting to the user, validate `analysis.json` against the schema. This is a pre-output self-validation (same approach as Phase 1 Step 1.6 and Phase 2 Step 2.6).
+
+Validation checks:
+
+1. `schema_version` equals `1`
+2. `generated_at` is a valid ISO 8601 timestamp
+3. `claims_analyzed` array is non-empty
+4. Each entry has non-null `claim_id`, `verification_status`, `evidence`
+5. `verification_status` must be one of: `verified`, `unverified`, `partially_verified`
+6. `evidence` must be an array (may be empty for unverified claims)
+7. Each evidence entry (if present) must have non-null `file`, `lines`, `description`, `relevance`
+8. `relevance` must be one of: `high`, `medium`, `low`
+9. `unreported_changes` must be present (may be empty array — empty is valid, missing is not)
+10. Each unreported change (if present) must have non-null `file`, `status`, `lines_changed`, `description`, `significance`
+11. `status` must be one of: `added`, `modified`, `deleted`, `renamed`
+12. `significance` must be one of: `high`, `medium`, `low`
+13. `summary` must be present with all required sub-fields
+14. `summary.total_claims` must equal `len(claims_analyzed)`
+15. `summary.verified + summary.partially_verified + summary.unverified` must equal `summary.total_claims`
+
+**On validation failure:**
+
+```
+❌ Validation failed: analysis.json
+   Field: <field_name>
+   Error: <missing | null | empty array | wrong type | invalid enum value>
+   Phase 3 self-validation failed. Attempting auto-fix...
+```
+
+Auto-fix attempt: Re-process the problematic entries. If the second attempt also fails validation, abort Phase 3 with the error.
+
+### Step 3.7 — User Checkpoint
+
+Present the analysis results to the user for confirmation. This is a mandatory checkpoint — do NOT proceed to Phase 5 without user approval.
+
+**Display format:**
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔍 Phase 3 Complete — Implementation Analysis
+
+Claims analyzed:    <total_claims>
+  Verified:         <verified> ✅
+  Partially verified: <partially_verified_count> ⚠️
+  Unverified:       <unverified> ❌
+
+Evidence coverage:  <coverage_ratio as percentage>%
+<if coverage_ratio < 0.30: show Gate 1 warning>
+<if (unverified / total_claims) > 0.50: show Gate 2 warning>
+
+Unreported changes: <unreported_change_count>
+  High significance:   <high_sig_count>
+  Medium significance: <medium_sig_count>
+  Low significance:    <low_sig_count>
+<if high_sig_count > 0: show Gate 3 alert>
+
+Claim-by-Claim Summary:
+| # | Claim (truncated) | Status | Evidence Files |
+|---|-------------------|--------|----------------|
+| 1 | <claim text, 60 chars> | ✅ verified | file1.go, file2.go |
+| 2 | <claim text, 60 chars> | ⚠️ partial | file3.go |
+| 3 | <claim text, 60 chars> | ❌ unverified | — |
+| ... | ... | ... | ... |
+
+<if unreported_changes is non-empty:>
+Top Unreported Changes:
+| # | File | Significance | Description (truncated) |
+|---|------|-------------|------------------------|
+| 1 | pkg/sequencer/batch.go | 🔴 high | <description, 60 chars> |
+| 2 | pkg/config/defaults.go | 🟡 medium | <description, 60 chars> |
+| ... | ... | ... | ... |
+
+Artifacts saved:
+  • {session_dir}/analysis.json
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Then ask:
+
+```
+Use AskUserQuestion:
+  question: "Does the analysis look correct? Any claims need re-investigation or manual override?"
+  options:
+    - "Looks good — proceed to Phase 5"
+    - "Re-investigate specific claims" (user identifies claims to re-analyze with broader file search)
+    - "Override claim statuses" (user manually sets verification_status for specific claims)
+    - "Abort pipeline"
+```
+
+If the user requests re-investigation:
+1. For each flagged claim, broaden the file search — include ALL `core` and `new_module` files from `diff-map.json`
+2. Re-run the analysis prompt for those claims only
+3. Merge updated results into `analysis.json`
+4. Re-validate and re-display
+
+If the user overrides claim statuses:
+1. Update the specified claims' `verification_status` in `analysis.json`
+2. Add `"manual_override": true` to each overridden claim entry
+3. Re-compute summary statistics
+4. Re-validate and save
 
 **Output artifacts:**
 ```
