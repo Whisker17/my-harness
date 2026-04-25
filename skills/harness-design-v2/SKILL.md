@@ -1,7 +1,7 @@
 ---
 name: harness-design-v2
-version: 0.1.0
-description: "Codex-powered design with Opus Linear translation. Gathers project context, invokes Codex in consult mode to produce a structured design brief. First step of the two-step v2 design pipeline. Invoke with /harness-design-v2 <topic or Linear issue URL>."
+version: 0.2.0
+description: "Codex-powered design with Opus Linear translation. Full v2 design pipeline: gathers project context, invokes Codex in consult mode to produce a structured design brief, translates the brief into harness issue schema with [OPUS INFERRED] markers, presents the proposed structure for human approval, and creates Linear issues upon approval. Invoke with /harness-design-v2 <topic or Linear issue URL>."
 triggers:
   - harness-design-v2
   - v2 design
@@ -14,13 +14,25 @@ allowed-tools:
   - AskUserQuestion
   - mcp__linear-server__get_issue
   - mcp__linear-server__list_issues
+  - mcp__linear-server__save_issue
+  - mcp__linear-server__list_teams
+  - mcp__linear-server__get_project
+  - mcp__linear-server__list_milestones
+  - mcp__linear-server__save_milestone
+  - mcp__linear-server__get_user
 ---
 
 # harness-design-v2
 
 You are running the Codex-powered design skill. The user invoked this skill as `/harness-design-v2 <topic or Linear issue URL>` (or similar). Extract the argument from the invocation.
 
-This skill gathers project context that Codex cannot read directly (local files, Linear state), embeds it in a structured prompt, and asks Codex to produce a design brief. This is the "Codex thinks" step of the v2 design pipeline.
+This skill runs the full v2 design pipeline:
+1. Gathers project context that Codex cannot read directly (local files, Linear state)
+2. Invokes Codex in consult mode to produce a structured design brief
+3. Translates the brief into the harness issue schema (5 required sections per issue)
+4. Marks gaps with [OPUS INFERRED] markers for human review
+5. Presents the proposed issue structure for human approval (approve / revise / reject)
+6. Creates parent issue + sub-issues in Linear upon approval
 
 ---
 
@@ -516,7 +528,7 @@ Write the brief to `.reviews/design/{topic_slug}/brief.md`:
 {clean brief content from Codex}
 ```
 
-### 4c. Present output
+### 4c. Present output and transition
 
 Display the brief to the user:
 
@@ -529,12 +541,573 @@ CODEX DESIGN BRIEF:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Brief saved to: .reviews/design/{topic_slug}/brief.md
 Session saved — run /codex to continue the conversation with Codex.
+
+Proceeding to brief-to-schema translation (Step 5)...
 ```
 
 **If Claude disagrees with any of Codex's analysis,** flag it clearly:
 
 ```
 Note: Claude Code disagrees on X because Y.
+```
+
+Continue immediately to Step 5 — do NOT stop here.
+
+---
+
+## Step 5 — Brief-to-Schema Translation
+
+This step translates the Codex design brief into the harness issue schema (5 required sections per issue). Opus reads the brief, maps sections to the schema, detects gaps, and marks inferred content.
+
+### 5a. Read the brief
+
+Read the brief from `.reviews/design/{topic_slug}/brief.md`:
+
+```bash
+TOPIC_SLUG="<computed slug from Step 1c>"
+BRIEF_PATH=".reviews/design/$TOPIC_SLUG/brief.md"
+cat "$BRIEF_PATH"
+```
+
+Also read the harness issue schema for reference:
+
+```bash
+cat ~/.claude/skills/harness-dev/schema.md
+```
+
+### 5b. Detect the Linear project context
+
+The translation needs a target project and user for issue creation. Detect using this precedence:
+
+1. If a Linear issue was fetched in Step 1b, use `issue.project` and `issue.assignee`
+2. Else, read `.linear-project` at repo root for the project name
+3. Else, default to `"My Harness"` with a visible warning
+
+```
+mcp__linear-server__get_project(query: "<detected project name>")
+mcp__linear-server__get_user(query: "me")
+```
+
+Record: `PROJECT_ID`, `PROJECT_NAME`, `USER_ID`, `USER_NAME`.
+
+If the project cannot be resolved, use `AskUserQuestion`:
+
+```
+Which Linear project should issues be created in?
+A) My Harness
+B) Specify a different project name
+C) Cancel
+```
+
+### 5c. Map brief sections to parent issue schema
+
+Apply the following mapping from the Codex brief to the harness 5-section schema:
+
+```
+Brief "## Problem Statement"            → Issue "## Context"
+Brief "## Acceptance Criteria"           → Issue "## Acceptance Criteria"
+Brief "## Proposed Architecture"         → Issue "## Architecture Notes" (first half)
+Brief "## Key Decisions and Tradeoffs"   → Issue "## Architecture Notes" (second half)
+Brief "## Risk Assessment"               → Informs "## Dependencies" (risks that are blockers)
+                                           and "## Scope Boundary" (risks that are out of scope)
+Brief "## Suggested Sub-task Breakdown"  → Sub-issues (see Step 5d)
+```
+
+**Heading detection — fuzzy matching with priority:** Codex may use slightly different heading names than instructed (e.g., "## Architecture" instead of "## Proposed Architecture"). Use **keyword-based matching** with explicit priority ordering. **Process headings in the order listed below** — the first matching row wins. This prevents ambiguity when a heading matches multiple rows.
+
+| Priority | Target section | Match if heading contains (case-insensitive) | Excludes |
+|----------|----------------|----------------------------------------------|----------|
+| 1 | Acceptance Criteria | "acceptance criteria" OR ("criteria" AND NOT "design") | — |
+| 2 | Key Decisions | "decision" OR "tradeoff" OR "trade-off" | — |
+| 3 | Risk Assessment | "risk" OR "assessment" | — |
+| 4 | Sub-task Breakdown | "sub-task" OR "breakdown" OR "subtask" OR "implementation steps" | — |
+| 5 | Problem Statement | "problem" OR "statement" OR "context" OR "overview" | "architectural overview" |
+| 6 | Proposed Architecture | "architecture" OR "technical design" | — |
+| 7 (catch-all) | — | Any remaining unmatched `##` heading | — |
+
+**Priority rules:**
+- More specific matches (e.g., "acceptance criteria") are tested before generic keywords (e.g., "design")
+- "Key Decisions" is matched before "Proposed Architecture" to prevent "Design Decisions" from being captured by an "architecture" or "design" keyword
+- The `Excludes` column prevents false positives (e.g., "Non-functional Requirements" → does NOT match Acceptance Criteria)
+- **Catch-all (priority 7):** Unmatched sections are logged and appended to Architecture Notes: `Unmatched brief section: "## {heading}" — content appended to Architecture Notes.`
+
+**Construct the parent issue:**
+
+- **Title:** Derive from the design topic. Format: `feat(v2): <topic>` or use the topic text directly if it already has a meaningful title.
+- **Description:** Build a 5-section schema description:
+
+```markdown
+## Context
+{Content mapped from brief "Problem Statement"}
+{If [OPUS INFERRED]: mark the section}
+
+## Acceptance Criteria
+{Content mapped from brief "Acceptance Criteria"}
+{Each criterion must be in checklist format: - [ ] ...}
+{If [OPUS INFERRED]: mark the section}
+
+## Architecture Notes
+{Content mapped from brief "Proposed Architecture"}
+
+{Content mapped from brief "Key Decisions and Tradeoffs"}
+{If [OPUS INFERRED]: mark the section}
+
+## Dependencies
+{Derived from brief "Risk Assessment" — extract items that are genuine blockers}
+{If no blockers: "None — no blocking dependencies."}
+{If [OPUS INFERRED]: mark the section}
+
+## Scope Boundary
+{Derived from brief "Risk Assessment" — extract items that are out-of-scope risks}
+{Add standard exclusions based on project patterns}
+{If [OPUS INFERRED]: mark the section}
+```
+
+### 5d. Map sub-task breakdown to sub-issues
+
+Parse the brief's "## Suggested Sub-task Breakdown" section. For each sub-task:
+
+1. Extract: title, description, estimated complexity (S/M/L)
+2. Generate a full 5-section schema description for each sub-issue
+
+**Sub-issue schema generation:**
+
+For each sub-task, construct:
+
+```markdown
+## Context
+{Derived from sub-task description and parent context. 2-3 sentences minimum.}
+{Reference the parent issue for broader context.}
+
+## Acceptance Criteria
+{Derive testable criteria from the sub-task description.}
+{Each in checklist format: - [ ] Concrete, observable outcome}
+{Minimum 3 criteria.}
+
+## Architecture Notes
+{Derive from parent Architecture Notes — scoped to this sub-task.}
+{Include specific file paths, function signatures where inferrable from the brief.}
+{Reference patterns from CLAUDE.md where applicable.}
+
+## Dependencies
+{If this sub-task depends on a prior sub-task, reference it by title using @@DEP:<title>@@ placeholder.}
+{IMPORTANT: The <title> inside @@DEP@@ must exactly match the sub-issue title as generated in this step. Copy-paste the title verbatim to avoid mismatches. Step 7e resolves these using case-insensitive, whitespace-normalized matching, but exact titles are preferred.}
+{If no dependencies: "None — no blocking dependencies."}
+
+## Scope Boundary
+{What this sub-issue does NOT cover — reference other sub-issues for deferred work.}
+{Minimum 2 exclusions.}
+```
+
+### 5e. Apply [OPUS INFERRED] markers
+
+After constructing all issue descriptions, scan each section for gaps. Apply the `[OPUS INFERRED]` marker when:
+
+| Condition | Section | Action |
+|-----------|---------|--------|
+| Brief has no "Problem Statement" or it's < 50 chars | `## Context` | Opus generates context from topic + project patterns, marks with `[OPUS INFERRED]` |
+| Brief has no "Acceptance Criteria" or criteria are not testable (no checklist format, no verifiable conditions) | `## Acceptance Criteria` | Opus generates testable criteria, marks with `[OPUS INFERRED]` |
+| Brief has no file paths or function signatures in "Proposed Architecture" | `## Architecture Notes` | Opus infers from codebase (reading CLAUDE.md, existing skills), marks with `[OPUS INFERRED]` |
+| Brief has no "Risk Assessment" or it's < 30 chars | `## Dependencies` and `## Scope Boundary` | Opus generates based on project patterns, marks with `[OPUS INFERRED]` |
+| Brief has no explicit scope exclusions | `## Scope Boundary` | Opus generates based on project patterns, marks with `[OPUS INFERRED]` |
+
+**Marker format:** Insert at the top of the affected section:
+
+```markdown
+> [OPUS INFERRED] This section was not covered in the Codex brief and was generated by Opus based on project context.
+```
+
+If only part of a section was inferred (e.g., Codex provided architecture but no file paths):
+
+```markdown
+> [OPUS INFERRED] File paths and function signatures below were not in the Codex brief — inferred from existing codebase patterns.
+```
+
+### 5f. Self-validate all issue descriptions
+
+Before proceeding to the approval loop, validate every generated description against the harness schema:
+
+```
+VALIDATION RULES (from schema.md):
+1. All five headings present:
+   regex: ^## (Context|Acceptance Criteria|Architecture Notes|Dependencies|Scope Boundary)
+   → check each of the five exists
+
+2. Strip placeholder lines and enforce minimum content:
+   → strip lines matching ^\[.*\]$ (square-bracket placeholders)
+   → remaining non-whitespace chars must be >= 20 per section
+
+3. [OPUS INFERRED] markers do NOT count as placeholder lines
+   (they are legitimate content markers, not empty placeholders)
+```
+
+If validation fails for any issue:
+- Regenerate the failing section by re-reading the brief and the codebase context
+- Re-validate after regeneration
+- If second attempt fails, mark the section with `[VALIDATION WARNING]` and proceed — the human reviewer will see it in the approval loop
+
+### 5g. Write translated schemas to review directory
+
+Save the complete translation output for reference:
+
+```bash
+mkdir -p .reviews/design/"$TOPIC_SLUG"
+```
+
+Write to `.reviews/design/{topic_slug}/schema-proposal.md`:
+
+```markdown
+# Schema Proposal — {topic}
+
+> Generated by harness-design-v2 (Opus translation step)
+> Date: {YYYY-MM-DD}
+> Source brief: .reviews/design/{topic_slug}/brief.md
+
+## Parent Issue
+
+**Title:** {parent issue title}
+
+{parent issue description — full 5-section schema}
+
+---
+
+## Sub-issue 1: {sub-issue title}
+
+**Complexity:** {S/M/L}
+
+{sub-issue description — full 5-section schema}
+
+---
+
+## Sub-issue 2: {sub-issue title}
+
+...
+```
+
+---
+
+## Step 6 — Approval Loop
+
+Present the proposed issue structure to the user for review. The user MUST explicitly approve before any Linear mutations occur.
+
+### 6a. Present the proposal
+
+Display a structured summary of what will be created:
+
+```
+PROPOSED LINEAR ISSUE STRUCTURE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Project: {PROJECT_NAME}
+Assignee: {USER_NAME}
+State: Backlog (all issues)
+
+Parent Issue: {parent title}
+  {Show [OPUS INFERRED] sections if any: "⚠️ [OPUS INFERRED] sections: Context, Scope Boundary"}
+  {Show [VALIDATION WARNING] sections if any: "🛑 [VALIDATION WARNING] sections: Architecture Notes — requires manual review"}
+
+Sub-issues:
+  1. {sub-issue title} ({complexity}) {[OPUS INFERRED] / [VALIDATION WARNING] markers if any}
+  2. {sub-issue title} ({complexity}) {[OPUS INFERRED] / [VALIDATION WARNING] markers if any}
+  ...
+
+Dependencies:
+  {sub-issue 2} blocked by {sub-issue 1}
+  ...
+
+Total issues to create: {N} (1 parent + {N-1} sub-issues)
+
+{If any [VALIDATION WARNING] sections exist:}
+🛑  WARNING: {count} section(s) failed schema validation and are marked [VALIDATION WARNING].
+    Review the full schema proposal carefully before approving.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Full schema proposal saved to: .reviews/design/{topic_slug}/schema-proposal.md
+Review it for complete descriptions before approving.
+```
+
+### 6b. Approval question
+
+Use `AskUserQuestion` with these options:
+
+```
+Review the proposed issue structure above. What would you like to do?
+
+A) Approve — create all issues in Linear as proposed
+B) Revise — provide feedback to adjust the proposal
+C) Reject — exit without creating any issues
+```
+
+### 6c. Handle each response
+
+**Approve:**
+- Proceed to Step 7 (Linear issue creation)
+
+**Revise:**
+- The user selects "Revise" which indicates they want changes. Check if the user provided notes in the AskUserQuestion response first.
+- **If the user provided notes** (non-empty text in the response): use those notes directly as the revision instructions. Do NOT ask a follow-up question.
+- **If the user selected "Revise" without providing notes:** Use a **follow-up AskUserQuestion** to collect specific feedback:
+
+  ```
+  What changes would you like to the proposal? Select the areas to revise:
+  A) Parent issue title or description
+  B) Sub-issue structure (add, remove, or rename sub-issues)
+  C) Dependencies between sub-issues
+  D) Other (describe in the text field below)
+  ```
+
+  After the user selects a category, interpret the response and apply changes:
+  - **A (Parent issue):** Re-read the brief and regenerate the parent issue description. If the user provided specific notes with the category selection, incorporate those notes.
+  - **B (Sub-issue structure):** Re-read the brief's Sub-task Breakdown and regenerate sub-issues. If notes say "add X" or "remove Y", apply those specific edits.
+  - **C (Dependencies):** Adjust the `@@DEP:` graph based on the user's input. If no specific input, show the current dependency list and ask which to change.
+  - **D (Other):** Apply the user's free-text instructions directly to the schema proposal.
+
+- Apply the requested changes to the schema proposal
+- Re-validate affected descriptions (Step 5f)
+- Re-write the updated schema-proposal.md to disk (so re-entry picks up revisions)
+- Re-present the updated proposal (go back to 6a)
+- Track the revision round number
+
+**Reject:**
+- Print: `Rejected — no Linear issues created. Brief preserved at .reviews/design/{topic_slug}/brief.md`
+- STOP — do not create any Linear issues
+
+### 6d. Revision round cap
+
+Maximum 3 revision rounds. Track with `REVISION_ROUND` counter (starts at 0, increments on each Revise).
+
+```
+REVISION_ROUND = 0
+
+LOOP:
+  Present proposal (6a)
+  Ask approval (6b)
+
+  IF Approve: BREAK → proceed to Step 7
+  IF Reject: STOP
+
+  REVISION_ROUND += 1
+
+  IF REVISION_ROUND > 3:
+    AskUserQuestion:
+      "You've revised the proposal 3 times. Would you like to:"
+      A) Proceed with the current structure anyway
+      B) Abort — no issues created
+
+    IF A: BREAK → proceed to Step 7
+    IF B: STOP
+  
+  Apply user feedback
+  Re-validate
+  GOTO LOOP
+```
+
+---
+
+## Step 7 — Linear Issue Creation
+
+Create the parent issue and all sub-issues in Linear. This step ONLY executes after explicit user approval in Step 6.
+
+### 7a. Determine team
+
+Resolve the team for issue creation:
+
+```
+mcp__linear-server__list_teams()
+```
+
+If the project context already provides a team (from Step 5b), use that. Otherwise, if only one team exists, use it automatically. If multiple teams exist, ask the user via `AskUserQuestion`.
+
+### 7b. Check for existing milestone
+
+If the parent issue specifies a milestone (e.g., from the brief's phase structure), check if it exists:
+
+```
+mcp__linear-server__list_milestones(project: "<PROJECT_ID>")
+```
+
+If a matching milestone exists, record its ID. If not, and the brief suggests a phase/milestone, **ask the user for confirmation before creating:**
+
+```
+AskUserQuestion:
+  "The brief suggests milestone '{name}' but it doesn't exist in project {PROJECT_NAME}."
+  A) Create the milestone
+  B) Skip milestone assignment (issues will have no milestone)
+  C) Assign to an existing milestone (list the existing ones)
+```
+
+Only create the milestone after explicit user approval:
+
+```
+mcp__linear-server__save_milestone(
+  project: "<PROJECT_ID>",
+  name: "<milestone name>",
+  description: "<1-sentence summary>"
+)
+```
+
+If no milestone is suggested by the brief, skip milestone assignment — issues will be created without a milestone.
+
+### 7c. Create parent issue
+
+**Dedup check first:**
+
+```
+mcp__linear-server__list_issues(
+  project: "<PROJECT_ID>",
+  query: "<parent issue title>"
+)
+```
+
+Compare returned issue titles against the parent title using **case-insensitive, whitespace-normalized** comparison (see 7d for details). If an exact match exists:
+
+1. Record its ID as `PARENT_ISSUE_ID`
+2. **Compare descriptions:** Read the existing issue's full description via `get_issue`. If the existing description differs from the newly generated description (beyond whitespace differences), warn the user:
+
+   ```
+   ⚠️  Existing parent issue WHI-{id} found with a different description than the current proposal.
+   ```
+
+   Use `AskUserQuestion`:
+   ```
+   A) Update the existing issue's description to match the current proposal
+   B) Keep the existing description as-is
+   ```
+
+   If the user picks A, call `save_issue(id: ..., description: "<new description>")` to update.
+
+3. Print: `Existing parent issue found: WHI-{id}. Skipping creation.`
+
+**If no match — create:**
+
+```
+mcp__linear-server__save_issue(
+  team: "<TEAM_ID>",
+  project: "<PROJECT_ID>",
+  title: "<parent issue title>",
+  description: "<validated parent issue description>",
+  state: "Backlog",
+  assignee: "me",
+  milestone: "<MILESTONE_ID>"   // if available
+)
+```
+
+Record the returned issue ID as `PARENT_ISSUE_ID`.
+
+**If creation fails:**
+- Print: `ERROR: Failed to create parent issue: <error>`
+- STOP — sub-issues cannot be created without a parent
+
+### 7d. Create sub-issues in dependency order
+
+**Topological sort:** Before creating any sub-issues, build a dependency graph from the `@@DEP:<title>@@` placeholders and perform a topological sort. Use Kahn's algorithm (BFS-based):
+
+1. Build adjacency list: for each sub-issue, record which other sub-issues it depends on
+2. Compute in-degree for each sub-issue
+3. Start with sub-issues that have in-degree 0 (no dependencies)
+4. Process queue: create issue, decrement in-degree of dependents, enqueue newly-zero dependents
+5. **Cycle detection:** If the queue empties but not all sub-issues are processed, a dependency cycle exists
+
+**If a cycle is detected:**
+- Print: `ERROR: Dependency cycle detected among sub-issues: {list of titles in the cycle}`
+- Print: `Breaking cycle by removing the dependency from the last sub-issue in the cycle.`
+- Remove one edge to break the cycle and retry the topological sort
+- Warn the user which dependency was dropped
+
+Process sub-issues in topological order:
+
+**Dedup check before each create:**
+
+```
+mcp__linear-server__list_issues(
+  project: "<PROJECT_ID>",
+  query: "<sub-issue title>"
+)
+```
+
+Compare returned issue titles using **case-insensitive, whitespace-normalized** comparison: lowercase both, collapse whitespace to single spaces, trim. If a normalized match exists:
+- Record the existing ID in the title → ID map
+- **Compare descriptions:** If the existing description differs from the newly generated one, print `NOTE: Sub-issue "{title}" already exists (WHI-{id}) with a different description. Keeping existing description.` (Sub-issue descriptions are not auto-updated to avoid disrupting in-progress work; the user can manually update via Linear if needed.)
+- Skip creation
+
+If multiple partial matches are returned but none is an exact normalized match, proceed with creation (do not skip on fuzzy matches).
+
+**For each sub-issue:**
+
+```
+mcp__linear-server__save_issue(
+  team: "<TEAM_ID>",
+  project: "<PROJECT_ID>",
+  title: "<sub-issue title>",
+  description: "<validated sub-issue description>",
+  state: "Backlog",
+  assignee: "me",
+  parentId: "<PARENT_ISSUE_ID>",
+  milestone: "<MILESTONE_ID>"   // if available — sub-issues do NOT inherit parent milestone
+)
+```
+
+Record each returned issue ID. Map: sub-issue title → Linear issue ID.
+
+**If a sub-issue creation fails:**
+- Print: `WARNING: Failed to create sub-issue "<title>": <error>`
+- Continue creating remaining sub-issues — do NOT abort
+- Record failed sub-issues for the summary
+
+### 7e. Resolve dependency placeholders (second pass)
+
+After ALL issues are created, rewrite descriptions to replace `@@DEP:<title>@@` placeholders with actual `WHI-<N>` references.
+
+**Scope:** This pass covers ALL issues in the title → ID map — both newly created and pre-existing (found via dedup check). Pre-existing issues from prior failed runs may still have stale `@@DEP:` tags that need resolution.
+
+1. For every issue in the title → ID map whose description contains `@@DEP:...@@` tags:
+   - Read the current description from Linear (not from the in-memory version) to catch any manual edits: `mcp__linear-server__get_issue(id: "<issue-id>")`
+   - Build the final Dependencies section: replace each `@@DEP:<title>@@` with the resolved `WHI-<N>` from the title → ID map. Use **case-insensitive, whitespace-normalized** matching for the title lookup.
+   - **Two-step update (description first, then relation):**
+     1. Call `mcp__linear-server__save_issue(id: "<issue-id>", description: "<rewritten description>")` to update the description text
+     2. Call `mcp__linear-server__save_issue(id: "<issue-id>", blockedBy: ["<blocking-issue-id>"])` to set the blocking relation
+   - **If the description update fails:** Print `WARNING: Failed to update description for "<title>": <error>`. The `@@DEP:` tags remain in the live description — on re-entry, this issue will be retried (tags still present → eligible for resolution).
+   - **If the `blockedBy` relation fails:** Print `WARNING: Description updated for "<title>" but blocking relation to WHI-{N} was NOT set. You must add this relation manually in Linear.` This ensures the user knows the relation is missing even though the description text looks correct.
+2. If a referenced title was not created (failed or skipped), replace the tag with `(dependency "<title>" — not created; see schema-proposal.md)` and print `WARNING: Unresolvable dependency "<title>" in issue "<issue title>".`
+3. **Final validation:** After the pass, re-read all issue descriptions from Linear (not in-memory) and check for any remaining `@@DEP:...@@` tags. If any remain, print a final warning listing the issue IDs and the unresolved tags. Also verify that every resolved `blockedBy` relation is actually set by checking `get_issue(includeRelations: true)` for each issue that should have a blocking relation.
+
+### 7f. All issues in Backlog state
+
+All issues are created in `Backlog` state. Do NOT transition to any other state — that is `/harness-dev`'s job when implementation begins.
+
+---
+
+## Step 8 — Summary Output
+
+After all creation is complete, print the structured summary:
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅  harness-design-v2 complete for {topic}
+
+Project:              {PROJECT_NAME}
+Parent issue:         WHI-{parent_id}: {parent_title}
+Sub-issues created:   {N}
+Sub-issues failed:    {F}  ← (0 if all succeeded)
+[OPUS INFERRED]:      {count of sections marked}
+Revision rounds:      {REVISION_ROUND}
+
+Issue hierarchy:
+  WHI-{parent}: {parent title} (parent)
+    WHI-{a}: {sub-issue title} [no blockers]
+    WHI-{b}: {sub-issue title} [blocked by WHI-{a}]
+    ...
+
+Failed issues (if any):
+  ❌ {title} — {error}
+
+Artifacts:
+  Brief:    .reviews/design/{topic_slug}/brief.md
+  Schema:   .reviews/design/{topic_slug}/schema-proposal.md
+
+Next step:  /harness-dev WHI-{first-unblocked-sub-issue-id}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
 ---
@@ -546,23 +1119,71 @@ Note: Claude Code disagrees on X because Y.
 | Codex CLI not found | ERROR with install instructions, STOP |
 | Codex authentication failed | ERROR with `codex login` instructions, STOP |
 | Codex invocation timeout (10 min) | ERROR with retry suggestion, STOP |
-| Linear API unavailable | Warn, continue with reduced context |
+| Linear API unavailable (context gathering) | Warn, continue with reduced context |
 | CLAUDE.md not found | Warn, continue with reduced context |
 | No git history | Continue with empty git log section |
 | Topic slug collision (dir exists) | Overwrite — design briefs are iterative artifacts |
+| Brief has < 3/6 sections (Step 4a) | Warn, offer retry/write-as-is/abort |
+| Schema validation fails (Step 5f) | Regenerate; if 2nd attempt fails, mark [VALIDATION WARNING] |
+| User rejects proposal (Step 6) | STOP cleanly, preserve brief |
+| Revision cap reached (Step 6d) | Ask: proceed anyway or abort |
+| Parent issue creation fails (Step 7c) | STOP — sub-issues need a parent |
+| Sub-issue creation fails (Step 7d) | Warn, continue with remaining sub-issues |
+| Dependency placeholder unresolvable (Step 7e) | Replace with descriptive fallback text |
+
+---
+
+## Re-entry Detection
+
+Before running Step 1, check whether a prior run already produced artifacts:
+
+```bash
+TOPIC_SLUG="<slug>"
+
+# Check for existing brief
+BRIEF_EXISTS=$([ -f ".reviews/design/$TOPIC_SLUG/brief.md" ] && echo "yes" || echo "no")
+
+# Check for existing schema proposal
+SCHEMA_EXISTS=$([ -f ".reviews/design/$TOPIC_SLUG/schema-proposal.md" ] && echo "yes" || echo "no")
+
+echo "Brief: $BRIEF_EXISTS"
+echo "Schema proposal: $SCHEMA_EXISTS"
+```
+
+**Decision table:**
+
+| Brief exists? | Schema exists? | Entry point |
+|---|---|---|
+| No | No | Full run — Steps 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 |
+| Yes | No | Skip Codex invocation — jump to Step 5 (reuse existing brief) |
+| Yes | Yes | Skip to Step 5f (re-validate existing schema), then proceed to Step 6 |
+
+**Important:** On re-entry with existing schema-proposal.md, always re-run Step 5f (schema validation) before entering the approval loop. The on-disk schema may be stale, corrupted, or from a partially failed prior run. Never skip validation.
+
+When skipping steps, print:
+
+```
+⏩  Re-entry detected: {brief/schema} found at {path}.
+    Re-validating schema (Step 5f) before proceeding to approval...
+    Resuming from Step {N}.
+```
 
 ---
 
 ## Scope Boundary
 
-This skill ONLY handles:
+This skill handles the **full v2 design pipeline**:
 - Input parsing (free text or Linear URL)
 - Context gathering (CLAUDE.md, git log, active Linear issues)
-- Codex consult invocation
-- Brief output to `.reviews/design/{topic_slug}/brief.md`
+- Codex consult invocation and brief generation
+- Brief-to-schema translation with [OPUS INFERRED] markers
+- Human approval loop (approve / revise / reject)
+- Linear issue creation (parent + sub-issues in Backlog)
 
 This skill does NOT:
-- Translate the brief to Linear issue schema (that is the next sub-issue, WHI-225)
-- Create any Linear issues
-- Modify any existing code or issues
+- Modify any v1 skills (harness-design, harness-dev, etc.)
+- Auto-approve without human confirmation
+- Create milestone/phase structure beyond what the brief suggests
 - Run multi-turn Codex design sessions beyond the initial consult
+- Transition issues to `In Progress` — that is `/harness-dev`'s job
+- Run adversarial review, implement features, or manage worktrees
