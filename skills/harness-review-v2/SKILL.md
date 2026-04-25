@@ -943,7 +943,7 @@ Initialize loop state before entering the convergence loop:
 ```bash
 ROUND_N=1
 MAX_ROUNDS=3
-PREV_ACTIVE_IDS=""
+PREV_ACTIVE_IDS=""  # Updated inside Step 7b after each convergence evaluation
 LOOP_STATUS="CONTINUE"
 ```
 
@@ -989,7 +989,7 @@ Round 1:
   Step 3 → Parse output
   Step 4 → Normalize findings (round 1, no merge)
   Step 5 → Opus fix loop
-  Step 6b → Convergence check
+  Step 6b → Convergence check (updates PREV_ACTIVE_IDS)
     → CONTINUE? → Step 6c (Round 2)
     → PASS/PASS_WITH_NOTES/ESCALATED? → Step 8
 
@@ -998,7 +998,7 @@ Round 2:
   Step 3 → Parse output
   Step 4 → Normalize + merge with round 1 findings (re-raise detection)
   Step 5 → Opus fix loop
-  Step 6b → Convergence check
+  Step 6b → Convergence check (updates PREV_ACTIVE_IDS)
     → CONTINUE? → Step 6c (Round 3)
     → PASS/PASS_WITH_NOTES/ESCALATED? → Step 8
 
@@ -1007,7 +1007,7 @@ Round 3:
   Step 3 → Parse output
   Step 4 → Normalize + merge with round 2 findings
   Step 5 → Opus fix loop
-  Step 6b → Convergence check (MAX_ROUNDS forces ESCALATED if not PASS)
+  Step 6b → Convergence check (at MAX_ROUNDS: exits ESCALATED unless PASS or PASS_WITH_NOTES)
     → Step 8
 ```
 
@@ -1054,6 +1054,7 @@ elif [ "$ACTIVE_COUNT" -eq 0 ] && [ "$LOW_ONLY_COUNT" -gt 0 ]; then
   echo "Convergence: PASS_WITH_NOTES — 0 medium+ active, $LOW_ONLY_COUNT low-severity remain"
 
 elif [ "$ROUND_N" -ge 2 ] && [ "$ACTIVE_IDS" = "$PREV_ACTIVE_IDS" ]; then
+  # Note: this branch is only reached when ACTIVE_COUNT > 0 (the PASS checks above fire first when ACTIVE_COUNT == 0)
   LOOP_STATUS="ESCALATED"
   echo "Convergence: ESCALATED (stale) — active finding IDs identical to previous round"
   echo "Active IDs: $ACTIVE_IDS"
@@ -1069,8 +1070,11 @@ else
 fi
 
 # Store current active IDs for next round's stale detection
+# (This updates the outer loop variable from Step 6a — required for cross-round stale comparison)
 PREV_ACTIVE_IDS="$ACTIVE_IDS"
 ```
+
+**Note:** The `PREV_ACTIVE_IDS` assignment above mutates the outer loop variable declared in Step 6a. This is intentional — the stale check in the next round needs the current round's active IDs as its baseline. When the loop exits (`PASS`, `PASS_WITH_NOTES`, or `ESCALATED`), the final assignment is harmless since the variable is no longer read.
 
 ### 7c. Convergence Rules Reference
 
@@ -1078,15 +1082,17 @@ PREV_ACTIVE_IDS="$ACTIVE_IDS"
 |-----------|--------|-------------|
 | 0 active (medium+) AND 0 low-only | `PASS` | All findings resolved, rebutted, deferred, or confirmed fixed |
 | 0 active (medium+) AND >0 low-only | `PASS_WITH_NOTES` | Only low-severity findings remain open |
-| Round >= 2 AND active IDs == previous round's active IDs | `ESCALATED` (stale) | Loop is not making progress — same findings persist |
-| Round >= 3 (MAX_ROUNDS) | `ESCALATED` (max rounds) | Hard cap reached |
+| Round >= 2 AND active IDs == previous round's active IDs | `ESCALATED` | Stale: loop is not making progress — same findings persist |
+| Round >= 3 (MAX_ROUNDS) | `ESCALATED` | Max rounds: hard cap reached |
 | None of the above | `CONTINUE` | More rounds needed |
+
+**Note:** Both stale detection and max-rounds produce `LOOP_STATUS="ESCALATED"` — there is no separate `STALE` or `MAX_ROUNDS` enum value. The distinction is logged in the console message for debugging but does not affect the loop's control flow.
 
 **Stale detection detail:**
 - Compare `sorted(active_finding_ids_this_round)` vs `sorted(active_finding_ids_prev_round)`
 - If identical, the loop is not making progress — Opus is unable to resolve or Codex keeps re-raising the same issues
 - Only evaluated when `ROUND_N >= 2` (round 1 can never be stale — there's no previous round)
-- Active findings = those with `status in ("open", "disputed")` AND `severity in ("CRITICAL", "HIGH", "MEDIUM")`
+- Active findings = those with `status in ("open", "disputed")` AND `severity in ("CRITICAL", "HIGH", "MEDIUM")` (severity values are uppercase in the findings JSON as normalized in Step 4b)
 
 ---
 
@@ -1111,6 +1117,9 @@ REBUTTED_COUNT=$(jq '[.findings[] | select(.status == "rebutted")] | length' "$F
 DEFERRED_COUNT=$(jq '[.findings[] | select(.status == "deferred")] | length' "$FINAL_FINDINGS")
 DISPUTED_COUNT=$(jq '[.findings[] | select(.status == "disputed")] | length' "$FINAL_FINDINGS")
 OPEN_COUNT=$(jq '[.findings[] | select(.status == "open")] | length' "$FINAL_FINDINGS")
+LOW_ONLY_COUNT=$(jq '[.findings[] | select(
+  (.status == "open" or .status == "disputed") and .severity == "LOW"
+)] | length' "$FINAL_FINDINGS")
 UNRESOLVED_COUNT=$((DISPUTED_COUNT + OPEN_COUNT))
 ```
 
@@ -1146,23 +1155,33 @@ Status: {LOOP_STATUS}
 For each finding in the final findings JSON, append a row to the table:
 
 ```bash
-jq -r '.findings[] | "| \(.id) | \(.severity) | \(.claim_title // .claim | .[0:60]) | \(.status) | \(.resolution // "—" | .[0:40]) | \(.round_opened) | \(.round_closed // "—") |"' "$FINAL_FINDINGS"
+jq -r '.findings[] | "| \(.id) | \(.severity) | \(if (.claim_title // "") == "" then .claim else .claim_title end | .[0:60]) | \(.status) | \(.resolution // "—" | .[0:40]) | \(.round_opened) | \(.round_closed // "—") |"' "$FINAL_FINDINGS"
 ```
 
 **Truncation:** Truncate `claim` to 60 characters and `resolution` to 40 characters in the table for readability. The full details are available in the findings JSON files.
 
 ### 8c. Unresolved Section (ESCALATED only)
 
-If `LOOP_STATUS == "ESCALATED"`, append the Unresolved Issues section to the report:
+If `LOOP_STATUS == "ESCALATED"`, append the Unresolved Issues section to the report.
+
+First, write the section header:
 
 ```markdown
 ## Unresolved Issues
 
 The following findings remain unresolved after {ROUND_N} rounds:
-
 ```
 
-For each finding with `status in ("open", "disputed")` and `severity in ("CRITICAL", "HIGH", "MEDIUM")`, write a detailed entry:
+Then, enumerate the unresolved findings:
+
+```bash
+UNRESOLVED=$(jq '[.findings[] | select(
+  (.status == "open" or .status == "disputed") and
+  (.severity == "CRITICAL" or .severity == "HIGH" or .severity == "MEDIUM")
+)]' "$FINAL_FINDINGS")
+```
+
+For each finding in the `UNRESOLVED` array, write a detailed entry:
 
 ```markdown
 ### {finding.id} [{finding.severity}] — {finding.claim_title}
@@ -1305,7 +1324,7 @@ This skill file covers:
 - Quick exit path (approve + 0 medium+ → PASS)
 - Opus fix loop: literal Opus prompt, RESOLVE/REBUT/DEFER handling, findings JSON update, git commit/push, error recovery
 - Convergence loop: outer loop orchestration driving Codex re-review → Opus fix → convergence check (max 3 rounds)
-- Convergence check: PASS, PASS_WITH_NOTES, STALE detection, MAX_ROUNDS → ESCALATED
+- Convergence check: PASS, PASS_WITH_NOTES, stale detection → ESCALATED, MAX_ROUNDS → ESCALATED
 - Final report generation: review-report.md with status, summary counts, findings detail table, unresolved section
 
 This skill file does NOT cover (deferred to v3):
