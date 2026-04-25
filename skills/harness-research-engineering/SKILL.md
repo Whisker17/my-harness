@@ -634,6 +634,22 @@ Phase 1 fetches the announcement source, extracts structured claims, and saves a
 
 **Agent role:** `source_ingestion_agent` (see [Agent Roles](#1-source_ingestion_agent-phase-1))
 
+### Step 1.0 — Session Directory Bootstrap
+
+Before any artifact writes, create a concrete session directory for this analysis run:
+
+```bash
+CHAIN_SLUG=$(echo "<chain>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
+UPGRADE_SLUG=$(echo "<upgrade>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//')
+SESSION_DIR="$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$SESSION_DIR"
+echo "Session directory: $SESSION_DIR"
+```
+
+Store `SESSION_DIR` as the canonical path for all Phase 1 artifacts. All subsequent steps in Phase 1 write to this directory — `{session_dir}` in the instructions below refers to the value of `$SESSION_DIR` created here.
+
+**On failure** (mkdir fails due to permissions, disk full, etc.): print `"ERROR: Cannot create session directory at $SESSION_DIR"` and abort Phase 1.
+
 ### Step 1.1 — Source Fetching (Fallback Chain — D10)
 
 Fetch the announcement content using a 3-tier fallback chain. Each tier is tried in order; proceed to the next only on failure.
@@ -711,7 +727,7 @@ content_length: <character count of raw content>
 <raw content as fetched — no modifications>
 ```
 
-Write this file using the Write tool. The snapshot preserves the exact content used for extraction, ensuring reproducibility regardless of future changes to the source URL.
+Write this file using the Write tool. The snapshot preserves the content as returned by the fetching tool — **note that this is tool-processed content** (WebFetch applies markdown conversion, WebSearch returns summaries, user paste is as-provided), not the raw HTML/PDF source. The `fetch_method` field in the frontmatter records which tool produced the content, enabling downstream consumers to assess fidelity. For Tier 2 (WebSearch), if multiple sources were combined, record all fetched URLs in a `source_urls` list in the frontmatter alongside the primary `url`.
 
 ### Step 1.3 — Claims Extraction
 
@@ -746,16 +762,27 @@ Output as a valid JSON array of claim objects. No prose, no commentary — just 
 
 ### Step 1.4 — Chunked Extraction (D1)
 
-If the initial extraction produces more than 15 claims, re-extract using chunked processing to improve quality:
+Chunking is triggered by **either** of these conditions (first match wins):
+
+1. **Source size trigger:** If the source content has 4 or more distinct sections (level-2 or level-3 headings) OR exceeds 5,000 characters, skip the single-pass extraction in Step 1.3 entirely and go directly to chunked extraction below. This prevents the initial pass from silently omitting claims on long/dense announcements.
+
+2. **Output count trigger:** If a single-pass extraction (Step 1.3) was performed and produced more than 15 claims, re-extract using chunked processing to improve quality.
+
+**Chunked extraction process:**
 
 1. **Split the source content** into logical sections (by heading or natural breaks)
 2. **Process each chunk** independently with the same extraction prompt, targeting 5-8 claims per chunk
-3. **Merge results:** Combine all chunks, then deduplicate:
+3. **Reconciliation pass:** After merging all chunks, compare section coverage against the source snapshot. If any section with a heading in the source has zero extracted claims, flag it:
+   ```
+   WARNING: Section "<heading>" has 0 extracted claims. Review for potential omissions.
+   ```
+   Present flagged sections to the user in the Step 1.7 checkpoint for manual review.
+4. **Deduplicate:** Combine all chunks, then:
    - For each pair of claims, if the `text` fields share >80% of key terms (nouns, verbs, technical terms), treat them as duplicates
    - Keep the claim with higher confidence; if tied, keep the one from the earlier chunk
    - Re-number IDs sequentially after deduplication (claim-001, claim-002, ...)
 
-If initial extraction produces ≤15 claims, skip chunking — use the initial results directly.
+If the source has fewer than 4 sections AND fewer than 5,000 characters AND the initial extraction produces ≤15 claims, skip chunking — use the initial results directly.
 
 ### Step 1.5 — Build claims.json
 
