@@ -203,6 +203,54 @@ Update a Linear issue description (with user approval) when any of these are tru
 
 Always read the full current issue description before updating. Preserve the five required sections (`## Context`, `## Acceptance Criteria`, `## Architecture Notes`, `## Dependencies`, `## Scope Boundary`). When updating, add new information alongside existing content. Outdated content that has been superseded by the current change should be replaced with the corrected version — mark what changed and why in the update.
 
+## V2 Pipeline (Multi-Model, optional)
+
+The v2 pipeline introduces cross-model review using Codex (GPT-5.4) alongside Opus. It runs as a parallel alternative to the v1 pipeline — all v1 skills remain unchanged.
+
+### V2 Skills
+
+| Skill | Command | Purpose |
+|-------|---------|---------|
+| **harness-design-v2** | `/harness-design-v2` | Codex designs the architecture, Opus translates to Linear issues |
+| **harness-dev** | `/harness-dev WHI-N` | Unchanged — same dev loop for both v1 and v2 |
+| **harness-review-v2** | `/harness-review-v2` | Codex reviews code, Opus fixes, loop until consensus (max 3 rounds) |
+
+### V2 Flow
+
+```
+Idea  ──►  /harness-design-v2  ──►  Codex brief → Opus schema → Linear issues
+Issue ──►  /harness-dev WHI-N  ──►  (same as v1)
+PR    ──►  /harness-review-v2  ──►  Codex↔Opus convergence review
+```
+
+### V2 Prerequisites
+
+The v2 pipeline requires additional tools beyond the v1 prerequisites:
+
+- **Codex CLI**: `npm install -g @openai/codex`
+- **Codex Plugin**: `npm install -g codex-plugin-cc`
+- **Codex Authentication**: `codex login`
+- **gstack**: Must be installed (provides `/codex` skill used by v2 skills)
+
+Run `./setup.sh` to check all prerequisites — it detects v2 dependencies automatically.
+
+### When to use v1 vs v2
+
+Use **v2** when:
+- PR touches authentication, authorization, or security-sensitive code
+- PR introduces new data models or modifies existing schemas
+- PR adds new external integrations or API endpoints
+- PR is a significant new feature (not a minor enhancement)
+
+Use **v1** when:
+- Documentation changes, README updates
+- Configuration changes, environment variable additions
+- Small bug fixes with clear scope
+- Refactors that don't change behavior
+- Style/formatting changes
+
+**Note:** v2 is explicit invocation only — there is no auto-routing between v1 and v2. You choose which pipeline to use for each task.
+
 ## Schema Reference
 
 The shared issue schema is at `~/.claude/skills/harness-dev/schema.md`.

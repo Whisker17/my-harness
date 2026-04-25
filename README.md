@@ -21,6 +21,9 @@ PR    ──►  /harness-review WHI-N  ──►  Approve + merge (or reject)
 | **harness-bootstrap** | `/harness-bootstrap <project>` | One-shot project setup: generates CLAUDE.md, AGENTS.md, initializes git branches, optionally creates a GitHub repo |
 | **harness-dev** | `/harness-dev WHI-123` | Implements a single Linear issue through the full dev loop: quality gate, worktree, implementation, PR creation, adversarial review |
 | **harness-review** | `/harness-review WHI-123` | Opus-level final review: validates acceptance criteria against the diff, merges on approval or posts feedback |
+| **harness-design-v2** | `/harness-design-v2` | Codex-powered design: Codex designs architecture, Opus translates to Linear issues |
+| **harness-review-v2** | `/harness-review-v2` | Codex↔Opus convergence review: cross-model review with up to 3 rounds |
+| **harness-triage** | `/harness-triage` | Reactive course correction: formalizes mid-development findings as Linear issues |
 
 ## Quick Start
 
@@ -96,6 +99,50 @@ cd my-project
 /harness-dev WHI-42
 ```
 
+## V2 Pipeline (Multi-Model, optional)
+
+The v2 pipeline adds cross-model review using Codex (GPT-5.4) alongside Claude Opus. It runs as a parallel alternative to v1 — all v1 skills remain unchanged.
+
+### V2 Prerequisites
+
+In addition to the v1 prerequisites, the v2 pipeline requires:
+
+1. **Codex CLI**: `npm install -g @openai/codex`
+2. **Codex Plugin**: `npm install -g codex-plugin-cc`
+3. **Authentication**: `codex login`
+4. **gstack**: Must be installed (provides `/codex` skill)
+
+Run `./setup.sh` to check all prerequisites automatically — it detects v2 dependencies in Step 5.
+
+### V2 Usage
+
+```bash
+# Design with Codex — Codex does landscape research, Opus creates Linear issues
+/harness-design-v2
+
+# Dev loop is the same as v1
+/harness-dev WHI-42
+
+# Review with Codex↔Opus convergence (max 3 rounds)
+/harness-review-v2
+```
+
+### When to use v1 vs v2
+
+| Scenario | Pipeline | Why |
+|----------|----------|-----|
+| PR touches auth, authorization, or security | **v2** | Cross-model review catches blind spots a single model family misses |
+| New data models or schema changes | **v2** | Different models have different strengths in schema design review |
+| New external integrations or API endpoints | **v2** | Integration boundary code benefits from diverse review perspectives |
+| Significant new features | **v2** | Higher stakes warrant the extra review rigor |
+| Documentation or README updates | **v1** | Low risk, cross-model overhead is unnecessary |
+| Config changes, env var additions | **v1** | Straightforward changes with clear scope |
+| Small bug fixes | **v1** | Clear scope, fast turnaround |
+| Refactors that don't change behavior | **v1** | Lower risk, v1 adversarial review is sufficient |
+| Style/formatting changes | **v1** | Minimal review needed |
+
+**Note:** v2 is explicit invocation only — there is no auto-routing between pipelines. Choose the pipeline that fits the risk level of your change.
+
 ## Architecture
 
 ### Workflow
@@ -129,6 +176,27 @@ cd my-project
           │  3. Approve → merge PR + cleanup + Done             │
           │     OR reject → post feedback + keep In Review      │
           └───────────────────────────────────────────────────┘
+
+V2 Alternative (multi-model):
+
+          ┌─────────────────────────────────────────────────┐
+          │            /harness-design-v2                     │
+          │  Codex brief → Opus schema → Linear issues       │
+          └──────────────────┬──────────────────────────────┘
+                             │
+          ┌──────────────────▼──────────────────────────────┐
+          │                /harness-dev                       │
+          │  (same as v1 — unchanged)                        │
+          └──────────────────┬──────────────────────────────┘
+                             │
+          ┌──────────────────▼──────────────────────────────┐
+          │              /harness-review-v2                   │
+          │  1. Codex reviews PR (adversarial)               │
+          │  2. Normalize findings to findings.json          │
+          │  3. Opus resolves/rebuts/defers each finding     │
+          │  4. Re-run Codex → converge or escalate          │
+          │  5. Max 3 rounds, then final report              │
+          └───────────────────────────────────────────────┘
 ```
 
 ### Issue Schema
@@ -185,6 +253,17 @@ These are only needed if you use `/harness-design` to create new projects from s
 | `gstack-slug` binary | harness-design | Project slug generation |
 | `~/.gstack/` directory | harness-design, harness-bootstrap | Design doc storage and project config |
 
+### Optional (v2 pipeline only)
+
+These are only needed if you use the v2 multi-model pipeline (`/harness-design-v2` + `/harness-review-v2`). The v1 pipeline works without them.
+
+| Dependency | Used By | Purpose |
+|------------|---------|---------|
+| [Codex CLI](https://openai.com/codex) (`codex`) | harness-review-v2, harness-design-v2 | Cross-model code review and design |
+| `codex-plugin-cc` | harness-review-v2 | Adversarial review plugin for Codex |
+| `codex login` (authentication) | harness-review-v2, harness-design-v2 | Codex API access |
+| [gstack](https://github.com/anthropics/gstack) | harness-design-v2 | Provides `/codex` skill for Codex invocation |
+
 ## Repository Structure
 
 ```
@@ -194,13 +273,19 @@ my-harness/
 ├── setup.sh                               # Interactive setup script
 ├── skills/
 │   ├── harness-dev/
-│   │   └── SKILL.md                       # Dev loop skill (449 lines)
+│   │   └── SKILL.md                       # Dev loop skill
 │   ├── harness-review/
-│   │   └── SKILL.md                       # Final review skill (481 lines)
+│   │   └── SKILL.md                       # Final review skill (v1)
 │   ├── harness-design/
-│   │   └── SKILL.md                       # Design pipeline skill (644 lines)
-│   └── harness-bootstrap/
-│       └── SKILL.md                       # Project bootstrap skill (839 lines)
+│   │   └── SKILL.md                       # Design pipeline skill (v1)
+│   ├── harness-bootstrap/
+│   │   └── SKILL.md                       # Project bootstrap skill
+│   ├── harness-review-v2/
+│   │   └── SKILL.md                       # Codex↔Opus convergence review (v2)
+│   ├── harness-design-v2/
+│   │   └── SKILL.md                       # Codex-powered design (v2)
+│   └── harness-triage/
+│       └── SKILL.md                       # Course correction skill
 └── references/
     └── *.md                               # Design docs from /harness-design
 ```
