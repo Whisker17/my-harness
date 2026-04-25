@@ -24,7 +24,7 @@ allowed-tools:
 
 You are running a cross-model convergence review for a Linear issue. The user invoked this skill as `/harness-review-v2 WHI-<N>` (or similar). Extract the issue ID from the invocation arguments.
 
-This skill orchestrates Codex (adversarial reviewer) and Opus (acceptance reviewer) in a convergence loop. This file implements Steps 1-4: pre-flight checks, initial Codex invocation, findings normalization with `schema_version: 1`, re-raise detection, and round merge logic. Later sub-issues will add the Opus fix loop (WHI-221), convergence loop, and final report (WHI-222).
+This skill orchestrates Codex (adversarial reviewer) and Opus (acceptance reviewer) in a convergence loop. This file implements Steps 1-5: pre-flight checks, initial Codex invocation, findings normalization with `schema_version: 1`, re-raise detection, round merge logic, and the Opus fix loop (resolve/rebut/defer handling with git commit/push). The convergence loop and final report generation (WHI-222) will be added in a later sub-issue.
 
 ---
 
@@ -693,19 +693,258 @@ For round 1, skip the "Confirmed fixed", "Disputed", "New this round", and "Re-r
 
 ---
 
+## Step 5 — Opus Fix Loop
+
+This step presents the normalized findings from Step 4 to Opus, which resolves each finding by choosing RESOLVE, REBUT, or DEFER. After Opus acts on all findings, the skill verifies the changes, updates the findings JSON, and commits/pushes.
+
+### 5a. Load Open Findings
+
+Load the findings file from Step 4 and filter to open findings with severity CRITICAL, HIGH, or MEDIUM:
+
+```bash
+FINDINGS_FILE=".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json"
+
+# Extract open findings that need Opus attention
+OPEN_FINDINGS=$(jq '[.findings[] | select(.status == "open" and (.severity == "CRITICAL" or .severity == "HIGH" or .severity == "MEDIUM"))]' "$FINDINGS_FILE")
+OPEN_COUNT=$(echo "$OPEN_FINDINGS" | jq 'length')
+
+echo "Open findings requiring Opus attention: $OPEN_COUNT"
+```
+
+**If `OPEN_COUNT == 0`:** No findings need fixing. Print:
+
+```
+No open CRITICAL/HIGH/MEDIUM findings — skipping Opus fix loop.
+```
+
+Skip to Step 6 (or the convergence loop when WHI-222 is implemented).
+
+### 5b. Present Findings to Opus
+
+Present the following **exact prompt text** to Opus. This is the literal prompt — do NOT paraphrase, summarize, or restructure it:
+
+```
+The following findings were identified by Codex adversarial review (Round {N}).
+For each finding, you must take ONE action:
+
+- RESOLVE: Fix the code. After fixing, the skill will verify the file was
+  actually modified (git diff --name-only must include the file).
+- REBUT: Explain with specific evidence why this finding is invalid.
+  You must provide:
+  - evidence_type: one of "code_reference", "test_reference", "doc_reference"
+  - evidence_detail: the specific code snippet, test name, or doc section
+    that proves the finding is wrong.
+  "This is fine" is NOT a valid rebuttal.
+- DEFER: Acknowledge the issue but explain why it's out of scope for this PR.
+  Provide a justification. Deferred findings are recorded as notes for human
+  review — no Linear issues are auto-created.
+
+Findings:
+[list each finding with id, severity, claim, file, lines, suggested_fix]
+```
+
+Replace `{N}` with the current round number. Replace the `[list each finding...]` placeholder with the actual findings formatted as:
+
+```
+- F-001 [CRITICAL] claim: "..." | file: path/to/file.ts:42-50 | suggested_fix: "..."
+- F-002 [HIGH] claim: "..." | file: null | suggested_fix: "..."
+```
+
+For findings where `file` is null, display `file: null` (no line numbers). For findings where `file` is present but lines are null, display `file: path/to/file.ts` (no line range).
+
+### 5c. Process Opus Responses
+
+Opus will respond with an action for each finding. For each finding, extract the action and validate it:
+
+#### RESOLVE action
+
+1. Opus edits the code to fix the finding.
+2. **Verify the fix:** Run `git diff --name-only` and confirm that at least one of the files associated with the finding appears in the diff. If the finding has `file: null` (architectural finding), accept any file change as valid.
+
+```bash
+MODIFIED_FILES=$(git diff --name-only)
+```
+
+3. **If verification passes:** Update the finding in the JSON:
+   - `status`: `"resolved"`
+   - `resolution`: A brief description of the fix applied (from Opus's response)
+   - `round_closed`: current round number `N`
+
+4. **If verification fails** (no file was actually modified): Log a warning and keep the finding as `open`:
+
+```
+WARNING: RESOLVE claimed for F-001 but git diff --name-only does not include the expected file(s).
+Finding F-001 remains open.
+```
+
+#### REBUT action
+
+1. Opus provides a rebuttal with:
+   - `evidence_type`: Must be one of `"code_reference"`, `"test_reference"`, `"doc_reference"`
+   - `evidence_detail`: A specific quote, path, test name, or doc section — NOT a generic dismissal
+
+2. **Validate the rebuttal:**
+   - `evidence_type` must be one of the three allowed values
+   - `evidence_detail` must be a non-empty string with at least 10 characters (prevents "this is fine" rebuttals)
+
+3. **If validation passes:** Update the finding in the JSON:
+   - `status`: `"rebutted"`
+   - `resolution`: `"REBUT ({evidence_type}): {evidence_detail}"`
+   - `round_closed`: current round number `N`
+
+4. **If validation fails** (invalid evidence_type or insufficient evidence_detail): Log a warning and keep the finding as `open`:
+
+```
+WARNING: REBUT for F-002 has invalid evidence. evidence_type must be one of: code_reference, test_reference, doc_reference. evidence_detail must be >= 10 characters.
+Finding F-002 remains open.
+```
+
+#### DEFER action
+
+1. Opus provides a justification for why this finding is out of scope.
+2. **Validate:** The justification must be a non-empty string with at least 20 characters (prevents empty deferrals).
+
+3. **If validation passes:** Update the finding in the JSON:
+   - `status`: `"deferred"`
+   - `resolution`: `"DEFER: {justification}"`
+   - `round_closed`: current round number `N`
+
+4. **If validation fails:** Log a warning and keep the finding as `open`:
+
+```
+WARNING: DEFER for F-003 has insufficient justification (< 20 characters).
+Finding F-003 remains open.
+```
+
+**Important:** Deferred findings are recorded as notes only. Do NOT auto-create Linear issues for deferred findings (per design decision D9).
+
+### 5d. Update Findings JSON
+
+After processing all Opus responses, write the updated findings back to the same file:
+
+```bash
+FINDINGS_FILE=".reviews/${BRANCH_SAFE}/findings-round-${ROUND_N}.json"
+```
+
+Use jq to update each finding in-place based on the Opus responses. The structure of the findings file remains the same — only `status`, `resolution`, and `round_closed` fields are modified for findings that Opus acted on.
+
+Example update for a single finding:
+
+```bash
+jq --arg fid "F-001" --arg status "resolved" --arg resolution "Fixed null check in validator" --argjson round_closed "$ROUND_N" '
+  .findings = [.findings[] |
+    if .id == $fid then
+      .status = $status | .resolution = $resolution | .round_closed = $round_closed
+    else . end
+  ]
+' "$FINDINGS_FILE" > "${FINDINGS_FILE}.tmp" && mv "${FINDINGS_FILE}.tmp" "$FINDINGS_FILE"
+```
+
+For batch updates (multiple findings in one pass), construct a jq filter that handles all findings at once:
+
+```bash
+# Build an update map: {"F-001": {"status": "resolved", "resolution": "...", "round_closed": N}, ...}
+# Then apply it in a single jq pass:
+jq --argjson updates "$UPDATES_JSON" '
+  .findings = [.findings[] |
+    . as $f |
+    if $updates[$f.id] then
+      .status = $updates[$f.id].status |
+      .resolution = $updates[$f.id].resolution |
+      .round_closed = $updates[$f.id].round_closed
+    else . end
+  ]
+' "$FINDINGS_FILE" > "${FINDINGS_FILE}.tmp" && mv "${FINDINGS_FILE}.tmp" "$FINDINGS_FILE"
+```
+
+### 5e. Git Commit and Push
+
+After updating the findings JSON and code fixes are in place, stage and commit all changes:
+
+```bash
+# Stage all modified files (Opus may have touched files beyond those in findings)
+git add -A
+
+# Build commit message with resolved finding IDs
+# RESOLVED_IDS is a comma-separated list of finding IDs that were resolved in this round
+# Example: "F-001, F-003"
+git commit -m "fix(WHI-${ISSUE_N}): address codex review round ${ROUND_N} — ${RESOLVED_IDS}"
+```
+
+The commit message format is: `fix(WHI-N): address codex review round {N} — F-001, F-003`
+
+- `WHI-N` is extracted from the branch name
+- `{N}` is the current round number
+- The finding IDs listed are ONLY those with action RESOLVE (not REBUT or DEFER)
+- If no findings were resolved (all rebutted/deferred), use: `chore(WHI-N): update findings round {N} — rebuttals and deferrals only`
+
+**Push to the feature branch:**
+
+```bash
+BRANCH_NAME=$(git branch --show-current)
+git push origin "$BRANCH_NAME"
+```
+
+### 5f. Error Recovery — Git Commit Failure
+
+If the git commit fails (merge conflict, pre-commit hook failure, empty commit, etc.):
+
+1. **Capture the error:**
+
+```bash
+COMMIT_OUTPUT=$(git commit -m "..." 2>&1)
+COMMIT_EXIT=$?
+
+if [ "$COMMIT_EXIT" -ne 0 ]; then
+  echo "ERROR: Git commit failed (exit code $COMMIT_EXIT)"
+  echo "$COMMIT_OUTPUT"
+fi
+```
+
+2. **Do NOT clean up the findings JSON.** The user needs the updated findings for manual retry.
+
+3. **Print the failure message:**
+
+```
+Git commit failed: {stderr}.
+Findings are preserved at .reviews/{branch_safe}/findings-round-{N}.json
+```
+
+4. **STOP.** Do not push. Do not proceed to the next round. The user must manually resolve the commit failure and re-invoke the skill.
+
+### 5g. Round Summary
+
+After a successful commit and push, display:
+
+```
+Opus Fix Loop Complete (Round {N})
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Resolved:  {resolved_count} findings (code fixed)
+Rebutted:  {rebutted_count} findings (with evidence)
+Deferred:  {deferred_count} findings (out of scope)
+Still open: {still_open_count} findings (validation failed)
+
+Committed: fix(WHI-{N}): address codex review round {ROUND_N} — {RESOLVED_IDS}
+Pushed to: {branch_name}
+
+Findings: .reviews/{branch_safe}/findings-round-{ROUND_N}.json
+```
+
+---
+
 ## Output Contract
 
-After completing Steps 1-4, the skill has produced:
+After completing Steps 1-5, the skill has produced:
 
 | Artifact | Path | Description |
 |----------|------|-------------|
 | Codex findings JSON | `.reviews/{branch_safe}/codex-findings-round-{N}.json` | Raw structured Codex findings |
-| Normalized findings | `.reviews/{branch_safe}/findings-round-{N}.json` | Harness-format findings with `schema_version: 1` |
+| Normalized findings | `.reviews/{branch_safe}/findings-round-{N}.json` | Harness-format findings with `schema_version: 1`, updated with Opus resolutions |
 | Raw output (on parse failure) | `.reviews/{branch_safe}/codex-raw-round-{N}.txt` | Unprocessed Codex output |
 | Local diff (if no PR) | `.reviews/{branch_safe}/local-diff.patch` | Git diff against dev |
 | Invocation log | `.reviews/{branch_safe}/codex-invocation.log` | Timeout/retry tracking |
 
-The normalized findings file (`findings-round-{N}.json`) is the primary artifact consumed by the convergence loop (WHI-222) and the Opus fix loop (WHI-221).
+The normalized findings file (`findings-round-{N}.json`) is the primary artifact consumed by the convergence loop (WHI-222). After Step 5, each finding's `status` reflects Opus's action (resolved, rebutted, deferred, or still open).
 
 **Findings JSON schema (`schema_version: 1`):**
 
@@ -726,7 +965,7 @@ The normalized findings file (`findings-round-{N}.json`) is the primary artifact
       "line_start": 42 | null,
       "line_end": 50 | null,
       "suggested_fix": "Recommendation text",
-      "status": "open" | "resolved" | "confirmed_fixed" | "rebutted" | "disputed",
+      "status": "open" | "resolved" | "confirmed_fixed" | "rebutted" | "disputed" | "deferred",
       "resolution": "Description of how it was fixed" | null,
       "round_opened": 1,
       "round_closed": null | 2
@@ -750,6 +989,11 @@ The normalized findings file (`findings-round-{N}.json`) is the primary artifact
 | JSON parse failure | "Could not parse Codex output" | Inspect raw output, retry |
 | Normalization validation failure | "findings has invalid schema_version" | Re-run normalization step |
 | Merge conflict (round N+1) | "Failed to merge findings" | Inspect previous round file, re-run |
+| RESOLVE verification failed | "git diff --name-only does not include file" | Finding stays open, Opus can retry next round |
+| REBUT validation failed | "invalid evidence_type or insufficient evidence_detail" | Finding stays open, Opus can retry next round |
+| DEFER validation failed | "insufficient justification" | Finding stays open, Opus can retry next round |
+| Git commit failed (Step 5) | "Git commit failed: {stderr}" | Findings JSON preserved, fix manually and re-invoke |
+| Git push failed (Step 5) | "Git push failed: {stderr}" | Commit exists locally, push manually or re-invoke |
 
 **Never proceed past a STOP error.** Each error is terminal for this invocation. Fix the issue and re-invoke the skill.
 
@@ -765,8 +1009,8 @@ This skill file covers:
 - Re-raise detection (exact title match OR same file + overlapping lines ±15)
 - Round merge logic (confirmed_fixed, reopened, disputed states)
 - Quick exit path (approve + 0 medium+ → PASS)
+- Opus fix loop: literal Opus prompt, RESOLVE/REBUT/DEFER handling, findings JSON update, git commit/push, error recovery
 
 This skill file does NOT cover (handled by later sub-issues):
 - Convergence loop and final report generation (WHI-222)
-- Opus fix loop — resolve, rebut, defer handling (WHI-221)
-- Fix loop orchestration
+- Fix loop orchestration (iteration logic between Codex re-review and Opus fix rounds)
