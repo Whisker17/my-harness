@@ -202,16 +202,22 @@ else
   echo "         Auth:    codex login"
 fi
 
-# codex-plugin-cc
+# codex-plugin-cc (Claude Code plugin, NOT an npm package)
 CODEX_PLUGIN_FOUND=false
-if npm list -g codex-plugin-cc &>/dev/null 2>&1; then
+CODEX_PLUGIN_VERSION=""
+CODEX_PLUGIN_CACHE="$HOME/.claude/plugins/cache/openai-codex"
+if [ -d "$CODEX_PLUGIN_CACHE" ]; then
   CODEX_PLUGIN_FOUND=true
+  # Extract version from the cache directory structure (e.g., openai-codex/codex/1.0.2/)
+  CODEX_PLUGIN_VERSION=$(ls -1 "$CODEX_PLUGIN_CACHE/codex/" 2>/dev/null | sort -V | tail -1)
 fi
 if $CODEX_PLUGIN_FOUND; then
-  check_pass "codex-plugin-cc installed"
+  check_pass "codex-plugin-cc installed (v${CODEX_PLUGIN_VERSION:-unknown})"
 else
   check_warn "codex-plugin-cc not found (optional, required for v2 pipeline)"
-  echo "         Install: npm install -g codex-plugin-cc"
+  echo "         This is a Claude Code plugin, NOT an npm package."
+  echo "         Install: In Claude Code, run /install-plugin codex-plugin-cc"
+  echo "         Or see:  https://github.com/openai/codex-plugin-cc"
 fi
 
 # gstack (also used by v1 design, but required for v2 codex invocation)
@@ -245,23 +251,24 @@ fi
 
 header "Step 7: Checking for v2 dependency updates"
 
-# codex-plugin-cc — check installed vs latest version
-if command -v npm &>/dev/null; then
-  INSTALLED_CC=$(npm list -g codex-plugin-cc --depth=0 2>/dev/null | grep codex-plugin-cc | sed 's/.*@//')
+# codex-plugin-cc — check installed version from plugin cache
+CODEX_PLUGIN_CACHE="$HOME/.claude/plugins/cache/openai-codex"
+if [ -d "$CODEX_PLUGIN_CACHE" ]; then
+  INSTALLED_CC=$(ls -1 "$CODEX_PLUGIN_CACHE/codex/" 2>/dev/null | sort -V | tail -1)
   if [ -n "$INSTALLED_CC" ]; then
-    LATEST_CC=$(npm view codex-plugin-cc version 2>/dev/null || echo "")
-    if [ -n "$LATEST_CC" ] && [ "$INSTALLED_CC" != "$LATEST_CC" ]; then
-      check_warn "codex-plugin-cc outdated: $INSTALLED_CC → $LATEST_CC"
-      echo "         Update: npm update -g codex-plugin-cc"
-    else
-      check_pass "codex-plugin-cc up to date ($INSTALLED_CC)"
-    fi
+    check_pass "codex-plugin-cc v$INSTALLED_CC (Claude Code plugin)"
+    echo "         To update: In Claude Code, the plugin auto-updates or reinstall via /install-plugin codex-plugin-cc"
   else
-    check_warn "codex-plugin-cc not installed"
-    echo "         Install: npm install -g codex-plugin-cc"
+    check_warn "codex-plugin-cc cache found but version unknown"
   fi
+else
+  check_warn "codex-plugin-cc not installed"
+  echo "         This is a Claude Code plugin, NOT an npm package."
+  echo "         Install: In Claude Code, run /install-plugin codex-plugin-cc"
+fi
 
-  # @openai/codex CLI — check installed vs latest version
+# @openai/codex CLI — check installed vs latest version
+if command -v npm &>/dev/null; then
   INSTALLED_CODEX=$(npm list -g @openai/codex --depth=0 2>/dev/null | grep @openai/codex | sed 's/.*@openai\/codex@//')
   if [ -n "$INSTALLED_CODEX" ]; then
     LATEST_CODEX=$(npm view @openai/codex version 2>/dev/null || echo "")

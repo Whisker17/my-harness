@@ -108,7 +108,7 @@ The v2 pipeline adds cross-model review using Codex (GPT-5.4) alongside Claude O
 In addition to the v1 prerequisites, the v2 pipeline requires:
 
 1. **Codex CLI**: `npm install -g @openai/codex`
-2. **Codex Plugin**: `npm install -g codex-plugin-cc`
+2. **Codex Plugin**: Install `codex-plugin-cc` via Claude Code's plugin system (NOT an npm package). In Claude Code, run `/install-plugin codex-plugin-cc` or see [github.com/openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc)
 3. **Authentication**: `codex login`
 4. **gstack**: Must be installed (provides `/codex` skill)
 
@@ -260,7 +260,7 @@ These are only needed if you use the v2 multi-model pipeline (`/harness-design-v
 | Dependency | Used By | Purpose |
 |------------|---------|---------|
 | [Codex CLI](https://openai.com/codex) (`codex`) | harness-review-v2, harness-design-v2 | Cross-model code review and design |
-| `codex-plugin-cc` | harness-review-v2 | Adversarial review plugin for Codex |
+| [codex-plugin-cc](https://github.com/openai/codex-plugin-cc) (Claude Code plugin) | harness-review-v2 | Adversarial review plugin for Codex (install via `/install-plugin`, NOT npm) |
 | `codex login` (authentication) | harness-review-v2, harness-design-v2 | Codex API access |
 | [gstack](https://github.com/anthropics/gstack) | harness-design-v2 | Provides `/codex` skill for Codex invocation |
 
