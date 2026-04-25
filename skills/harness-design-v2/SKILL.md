@@ -37,6 +37,12 @@ echo "Branch:     $CURRENT_BRANCH"
 echo "Repo root:  $REPO_ROOT"
 echo "CLAUDE.md:  $CLAUDE_MD_EXISTS"
 
+# STOP if not in a git repo — required for context gathering and Codex invocation
+if [ -z "$REPO_ROOT" ]; then
+  echo "ERROR: Not in a git repository. harness-design-v2 requires a git repo."
+  exit 1
+fi
+
 # Verify Codex CLI is installed
 if ! command -v codex &>/dev/null; then
   echo "CODEX: not-found"
@@ -44,7 +50,27 @@ else
   CODEX_VERSION=$(codex --version 2>&1 || echo "unknown")
   echo "CODEX: $CODEX_VERSION"
 fi
+
+# Verify Codex authentication (mirrors harness-review-v2 Step 1a-2)
+if command -v codex &>/dev/null; then
+  codex auth status 2>&1 || codex whoami 2>&1 || echo "CODEX_AUTH: failed"
+fi
+
+# Check .reviews/ is gitignored
+if [ -f "$REPO_ROOT/.gitignore" ]; then
+  grep -q '\.reviews/' "$REPO_ROOT/.gitignore" 2>/dev/null || echo "WARNING: .reviews/ may not be gitignored — design briefs may be committed."
+fi
 ```
+
+**If not in a git repo:**
+
+```
+ERROR: Not in a git repository.
+
+harness-design-v2 requires a git repository for context gathering and Codex invocation.
+```
+
+STOP — do not proceed.
 
 **If Codex CLI is not found:**
 
@@ -61,6 +87,18 @@ Then authenticate:
 ```
 
 STOP — do not proceed.
+
+**If Codex authentication fails** (output contains "failed", "unauthorized", or "not logged in"):
+
+```
+ERROR: Codex CLI is not authenticated.
+
+Fix: Run `codex login` to authenticate with your Codex account.
+```
+
+STOP — do not proceed.
+
+**Note:** If neither `codex auth status` nor `codex whoami` is a valid subcommand, skip this check — authentication errors will surface during the Codex invocation in Step 3, where the error handler should also emit the `"Run codex login to authenticate"` message.
 
 **If CLAUDE.md is missing:** Print a warning but continue — design can operate with reduced context:
 
@@ -146,11 +184,16 @@ echo "GIT_LOG: $(echo "$GIT_LOG" | wc -l | tr -d ' ') commits"
 
 ### 2c. Fetch active Linear issues
 
-Use `mcp__linear-server__list_issues` to fetch issues in active states for the current project:
+**Detect the project name** using this precedence:
+1. If a Linear issue was fetched in Step 1b, use `issue.project` from the response
+2. Else, read `.linear-project` at repo root (if it exists) for the project name
+3. Else, default to `"My Harness"` with a visible warning: `"WARNING: Using default project name 'My Harness' — create .linear-project to configure."`
 
-1. Query with `project: "My Harness"` (or the detected project name), `state: "In Progress"`
-2. Query with `project: "My Harness"`, `state: "Todo"`
-3. Query with `project: "My Harness"`, `state: "Backlog"`, `limit: 20`
+Use `mcp__linear-server__list_issues` to fetch issues in active states for the detected project:
+
+1. Query with `project: "<detected project name>"`, `state: "In Progress"`
+2. Query with `project: "<detected project name>"`, `state: "Todo"`
+3. Query with `project: "<detected project name>"`, `state: "Backlog"`, `limit: 20`
 
 Compile a concise list of active issues:
 
@@ -186,7 +229,11 @@ If the user chooses to continue, use the `resume` invocation pattern.
 
 ### 3b. Build the prompt
 
-Assemble the full prompt with all gathered context:
+Assemble the full prompt with all gathered context.
+
+**Size guard:** Before embedding, check the size of CLAUDE.md content. If it exceeds 8 KB (~8192 chars), truncate to the first 8 KB with a note: `[TRUNCATED — full CLAUDE.md is {N} bytes, showing first 8192]`. Similarly, if the Linear issue description exceeds 4 KB, truncate with a note. This prevents `E2BIG` errors and model context exhaustion.
+
+The assembled prompt structure:
 
 ```
 IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
@@ -194,7 +241,7 @@ IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claud
 You are a senior systems architect designing a feature for the following project.
 
 PROJECT CONTEXT (from CLAUDE.md):
-{CLAUDE_MD content}
+{CLAUDE_MD content — truncated if >8KB}
 
 RECENT ACTIVITY (last 20 commits):
 {GIT_LOG output}
@@ -206,7 +253,7 @@ ACTIVE LINEAR ISSUES:
 LINEAR ISSUE CONTEXT:
 Title: {issue title}
 Description:
-{issue description}
+{issue description — truncated if >4KB}
 
 DESIGN TOPIC: {topic text}
 
@@ -233,24 +280,43 @@ What could go wrong? What are the unknowns? What needs validation?
 Ordered list of implementation sub-tasks. Each should be independently shippable. Include estimated complexity (S/M/L) for each.
 ```
 
+**Prompt safety:** Write the assembled prompt to a temp file rather than interpolating it as a shell argument. This prevents shell injection from CLAUDE.md content, git log messages, or Linear issue descriptions that may contain backticks, `$()`, double quotes, or other shell metacharacters.
+
 ### 3c. Invoke Codex
 
-Create temp files and run Codex in consult mode:
+**Architecture note:** This skill invokes `codex exec` directly (not via the gstack `/codex` Skill tool) because: (1) the prompt is pre-assembled with embedded context that the `/codex` skill's plan-detection logic would interfere with, (2) the skill needs direct control over the `--json` streaming parser to capture the session ID, and (3) the `/codex` skill's interactive mode (AskUserQuestion for review/challenge/consult) is not appropriate here. However, we mirror the `/codex` skill's timeout and hang-detection patterns for consistency.
+
+Write the assembled prompt to a temp file and invoke Codex:
 
 ```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel)
+TMPPROMPT=$(mktemp /tmp/codex-prompt-XXXXXX.txt)
 TMPRESP=$(mktemp /tmp/codex-resp-XXXXXX.txt)
 TMPERR=$(mktemp /tmp/codex-err-XXXXXX.txt)
-_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+
+# Write the assembled prompt to a temp file to avoid shell injection
+cat > "$TMPPROMPT" << 'PROMPT_EOF'
+<assembled prompt content — Claude writes the full prompt here>
+PROMPT_EOF
 ```
 
 **For a new session:**
 
 ```bash
-_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-TMPRESP=$(mktemp /tmp/codex-resp-XXXXXX.txt)
-TMPERR=$(mktemp /tmp/codex-err-XXXXXX.txt)
+# Use timeout wrapper (10 min) matching the codex skill pattern
+# If _gstack_codex_timeout_wrapper is available, use it; otherwise fall back to timeout/gtimeout
+if type _gstack_codex_timeout_wrapper &>/dev/null; then
+  TIMEOUT_CMD="_gstack_codex_timeout_wrapper 600"
+elif command -v gtimeout &>/dev/null; then
+  TIMEOUT_CMD="gtimeout 600"
+elif command -v timeout &>/dev/null; then
+  TIMEOUT_CMD="timeout 600"
+else
+  TIMEOUT_CMD=""
+  echo "WARNING: No timeout command available. Codex may hang indefinitely."
+fi
 
-codex exec "<assembled prompt>" \
+$TIMEOUT_CMD codex exec "$(cat "$TMPPROMPT")" \
   -C "$_REPO_ROOT" \
   -s read-only \
   -c 'model_reasoning_effort="medium"' \
@@ -290,22 +356,78 @@ if [ "$_CODEX_EXIT" = "124" ]; then
   echo "ERROR: Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue."
   echo "Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
 fi
+
+# Clean up prompt temp file
+rm -f "$TMPPROMPT"
 ```
 
-**For a resumed session** (user chose "Continue"):
+**For a resumed session** (user chose "Continue" in Step 3a):
+
+Read the session ID from the file, then invoke with `resume`:
 
 ```bash
-codex exec resume <session-id> "<assembled prompt>" \
+EXISTING_SESSION_ID=$(cat .context/codex-session-id)
+
+# Use the same timeout wrapper as the new-session path
+if type _gstack_codex_timeout_wrapper &>/dev/null; then
+  TIMEOUT_CMD="_gstack_codex_timeout_wrapper 600"
+elif command -v gtimeout &>/dev/null; then
+  TIMEOUT_CMD="gtimeout 600"
+elif command -v timeout &>/dev/null; then
+  TIMEOUT_CMD="timeout 600"
+else
+  TIMEOUT_CMD=""
+  echo "WARNING: No timeout command available. Codex may hang indefinitely."
+fi
+
+$TIMEOUT_CMD codex exec resume "$EXISTING_SESSION_ID" "$(cat "$TMPPROMPT")" \
   -C "$_REPO_ROOT" \
   -s read-only \
   -c 'model_reasoning_effort="medium"' \
   --enable web_search_cached \
-  --json < /dev/null 2>"$TMPERR" | <same python streaming parser> | tee "$TMPRESP"
+  --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'thread.started':
+            tid = obj.get('thread_id','')
+            if tid: print(f'SESSION_ID:{tid}', flush=True)
+        elif t == 'item.completed' and 'item' in obj:
+            item = obj['item']
+            itype = item.get('type','')
+            text = item.get('text','')
+            if itype == 'reasoning' and text:
+                print(f'[codex thinking] {text}', flush=True)
+                print(flush=True)
+            elif itype == 'agent_message' and text:
+                print(text, flush=True)
+            elif itype == 'command_execution':
+                cmd = item.get('command','')
+                if cmd: print(f'[codex ran] {cmd}', flush=True)
+        elif t == 'turn.completed':
+            usage = obj.get('usage',{})
+            tokens = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+            if tokens: print(f'\ntokens used: {tokens}', flush=True)
+    except: pass
+" | tee "$TMPRESP"
+
+_CODEX_EXIT=${PIPESTATUS[0]}
+if [ "$_CODEX_EXIT" = "124" ]; then
+  echo "ERROR: Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue."
+  echo "Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
+fi
+
+# Clean up prompt temp file
+rm -f "$TMPPROMPT"
 ```
 
-**Timeout:** 10-minute Bash timeout. If Codex stalls, print the error and STOP.
+**Timeout:** 10-minute timeout via `_gstack_codex_timeout_wrapper`, `gtimeout`, or `timeout` (in that precedence). If Codex stalls, print the error and STOP.
 
-**Authentication failure:** If Codex output contains "unauthorized", "not logged in", or "invalid token":
+**Authentication failure:** If Codex output (in `$TMPERR` or `$TMPRESP`) contains "unauthorized", "not logged in", or "invalid token":
 
 ```
 ERROR: Codex authentication failed.
@@ -317,10 +439,13 @@ STOP — do not proceed.
 
 ### 3d. Save session ID
 
-Extract the session ID from the streamed output (line starting with `SESSION_ID:`):
+Extract the session ID from the streamed output. The Python parser emits `SESSION_ID:<id>` from the `thread.started` event. Use a specific pattern to avoid matching reasoning traces:
 
 ```bash
-SESSION_ID=$(grep "^SESSION_ID:" "$TMPRESP" | head -1 | cut -d: -f2-)
+# Wait for tee to finish flushing before reading
+sync 2>/dev/null || true
+
+SESSION_ID=$(grep -m1 "^SESSION_ID:[A-Za-z0-9_-]" "$TMPRESP" | head -1 | cut -d: -f2-)
 if [ -n "$SESSION_ID" ]; then
   mkdir -p .context
   echo "$SESSION_ID" > .context/codex-session-id
@@ -336,9 +461,39 @@ fi
 
 ### 4a. Extract the brief content
 
-Parse the Codex response to extract the design brief. The brief is the substantive content from Codex's response — the sections starting with `## Problem Statement` through `## Suggested Sub-task Breakdown`.
+Parse the Codex response to extract the design brief. Strip metadata lines from the output to produce clean brief content:
 
-Strip the `SESSION_ID:` line, `[codex thinking]` traces, `[codex ran]` traces, and `tokens used:` lines from the output to produce clean brief content.
+```bash
+# Strip metadata lines from Codex output
+grep -v '^SESSION_ID:' "$TMPRESP" | \
+grep -v '^\[codex thinking\]' | \
+grep -v '^\[codex ran\]' | \
+grep -v '^tokens used:' | \
+grep -v '^$' > /tmp/codex-brief-clean.txt
+```
+
+**Output validation:** Check that the brief contains at least 3 of the 6 required section headings:
+
+```bash
+SECTION_COUNT=$(grep -cE '^## (Problem Statement|Proposed Architecture|Key Decisions|Acceptance Criteria|Risk Assessment|Suggested Sub-task)' /tmp/codex-brief-clean.txt)
+echo "Sections found: $SECTION_COUNT / 6"
+```
+
+If fewer than 3 sections are found, warn the user:
+
+```
+WARNING: Codex response contains only {N}/6 expected sections.
+The brief may be incomplete or malformed.
+```
+
+Use AskUserQuestion:
+```
+A) Write the brief as-is (review and supplement manually)
+B) Retry the Codex invocation
+C) Abort
+```
+
+If the user chooses B, re-run Step 3c. If C, STOP.
 
 ### 4b. Write to file
 
