@@ -373,7 +373,8 @@ If validation fails at any phase boundary:
       "category": "core",
       "lines_changed": 142,
       "lines_added": 98,
-      "lines_deleted": 44
+      "lines_deleted": 44,
+      "num_hunks": 8
     },
     {
       "path": "pkg/governance/module.go",
@@ -381,7 +382,8 @@ If validation fails at any phase boundary:
       "category": "new_module",
       "lines_changed": 350,
       "lines_added": 350,
-      "lines_deleted": 0
+      "lines_deleted": 0,
+      "num_hunks": 1
     }
   ],
   "summary": {
@@ -389,6 +391,7 @@ If validation fails at any phase boundary:
     "added": 12,
     "modified": 30,
     "deleted": 5,
+    "renamed": 0,
     "total_lines_changed": 4200
   }
 }
@@ -413,18 +416,20 @@ If validation fails at any phase boundary:
 | `files[].lines_changed` | number | ✅ | Total lines changed (added + deleted) |
 | `files[].lines_added` | number | ✅ | Lines added |
 | `files[].lines_deleted` | number | ✅ | Lines deleted |
+| `files[].num_hunks` | number | ✅ | Number of contiguous change regions (hunks) in the file |
 | `summary` | object | ✅ | Aggregate statistics |
 | `summary.total_files` | number | ✅ | Total files in the diff |
 | `summary.added` | number | ✅ | Files added |
 | `summary.modified` | number | ✅ | Files modified |
 | `summary.deleted` | number | ✅ | Files deleted |
+| `summary.renamed` | number | ✅ | Files renamed |
 | `summary.total_lines_changed` | number | ✅ | Total lines changed across all files |
 
 **Phase boundary validation (before Phase 3):**
 - `schema_version` must equal `1`
 - `repo`, `base_sha`, `head_sha` must be non-empty strings
 - `files` array must be non-empty
-- Each file must have non-null `path`, `status`, `category`, `lines_changed`
+- Each file must have non-null `path`, `status`, `category`, `lines_changed`, `num_hunks`
 - `status` must be one of the allowed values
 - `category` must be one of the allowed values
 - `summary` must be present with all required sub-fields
@@ -892,6 +897,12 @@ Before cloning, validate that the required inputs are available:
 | `head_ref` | User-provided OR auto-detected via fuzzy tag matching | ❌ (auto-detect) |
 | `session_dir` | Created in Phase 1, Step 1.0 | ✅ |
 
+**Recovering `session_dir`:** Phase 2 runs in the same session as Phase 1. The `SESSION_DIR` variable set in Step 1.0 should still be available. If not (e.g., re-invocation), find the most recent matching session directory:
+```bash
+SESSION_DIR=$(ls -dt "$HOME/.gstack/research/sessions/${CHAIN_SLUG}-${UPGRADE_SLUG}-"* 2>/dev/null | head -1)
+```
+If no session directory is found, abort: "No session directory found. Run Phase 1 first."
+
 If `repo` is missing, use AskUserQuestion:
 
 ```
@@ -903,11 +914,16 @@ Use AskUserQuestion:
     - "Abort pipeline"
 ```
 
-If user provides a local path → skip to Step 2.2 (set `CLONE_DIR` to the local path, `clone_method = "local"`).
+If user provides a local path → set `CLONE_DIR` to the local path, `REPO_URL` to the absolute local path (for the `repo` field in diff-map.json), `clone_method = "local"`, and skip to Step 2.2.
 
 ### Step 2.1 — Repository Clone (D6: Treeless Clone)
 
 Clone the target repository using a treeless clone to avoid downloading full blob history.
+
+**Assign `REPO_URL`** from the resolved `repo` input:
+```bash
+REPO_URL="<repo>"  # The resolved repo URL from Input Resolution
+```
 
 **Clone directory:**
 ```bash
@@ -916,12 +932,21 @@ UPGRADE_SLUG=$(echo "<upgrade>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '
 CLONE_DIR="$HOME/.gstack/tmp/research-${CHAIN_SLUG}-${UPGRADE_SLUG}"
 ```
 
-If `CLONE_DIR` already exists from a previous run, reuse it:
+If `CLONE_DIR` already exists from a previous run, verify it's the correct repo and reuse it:
 ```bash
 if [ -d "$CLONE_DIR/.git" ]; then
-  echo "Reusing existing clone at $CLONE_DIR"
-  git -C "$CLONE_DIR" fetch --tags --force
-  clone_method="reused"
+  EXISTING_URL=$(git -C "$CLONE_DIR" remote get-url origin 2>/dev/null)
+  if [ "$EXISTING_URL" = "$REPO_URL" ]; then
+    echo "Reusing existing clone at $CLONE_DIR"
+    if ! git -C "$CLONE_DIR" fetch --tags --force 2>/dev/null; then
+      echo "⚠️  Warning: Could not fetch latest tags (offline?). Using cached tags from previous clone."
+    fi
+    clone_method="reused"
+  else
+    echo "Existing clone is for a different repo ($EXISTING_URL). Removing and re-cloning."
+    rm -rf "$CLONE_DIR"
+    # Fall through to fresh clone below
+  fi
 else
   # Fresh clone below
 fi
@@ -937,7 +962,7 @@ The 300-second (5 minute) timeout prevents hanging on very large repositories. I
 
 ```bash
 cd "$CLONE_DIR"
-git sparse-checkout set --no-cone '/*'
+git checkout HEAD
 clone_method="treeless"
 ```
 
@@ -994,11 +1019,11 @@ Otherwise, auto-detect the relevant tags using fuzzy matching.
 ```bash
 cd "$CLONE_DIR"
 ALL_TAGS=$(git tag -l | sort -V)
-TAG_COUNT=$(echo "$ALL_TAGS" | wc -l | tr -d ' ')
+TAG_COUNT=$(echo "$ALL_TAGS" | grep -c . || echo "0")
 echo "Found $TAG_COUNT tags"
 ```
 
-If `TAG_COUNT` is 0:
+If `TAG_COUNT` is 0 or `ALL_TAGS` is empty:
 ```
 Use AskUserQuestion:
   question: "No tags found in the repository. Please provide the base and head git refs manually (branch names, commit SHAs, or any valid git ref)."
@@ -1046,9 +1071,14 @@ The fuzzy matching is implemented as inline logic within the SKILL.md instructio
 USER_TOKENS=$(echo "<upgrade_name>" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '\n' | sort -u)
 FILTERED_TAGS=""
 for token in $USER_TOKENS; do
-  FILTERED_TAGS="$FILTERED_TAGS$(echo "$ALL_TAGS" | grep -i "$token")"$'\n'
+  if [ -n "$token" ] && [ ${#token} -ge 3 ]; then
+    MATCHES=$(echo "$ALL_TAGS" | grep -i "$token" || true)
+    if [ -n "$MATCHES" ]; then
+      FILTERED_TAGS="${FILTERED_TAGS}${FILTERED_TAGS:+$'\n'}${MATCHES}"
+    fi
+  fi
 done
-FILTERED_TAGS=$(echo "$FILTERED_TAGS" | sort -V | uniq)
+FILTERED_TAGS=$(echo "$FILTERED_TAGS" | sort -V | uniq | grep -v '^$')
 ```
 
 If `FILTERED_TAGS` is empty, fall through to scoring ALL tags.
@@ -1060,7 +1090,7 @@ Rank all tags by similarity score. Apply these thresholds:
 | Confidence | Score Range | Action |
 |-----------|-------------|--------|
 | **Auto-select** | ≥ 0.8 | Use the highest-scoring tag automatically. Print: `Auto-selected tag: <tag> (confidence: <score>)` |
-| **Candidate list** | 0.5 – 0.8 | Present top 5 candidates to user for confirmation |
+| **Candidate list** | ≥ 0.5 and < 0.8 | Present top 5 candidates to user for confirmation |
 | **Full list** | < 0.5 (all tags) | Present all tags for manual selection |
 
 **For the candidate list (0.5-0.8):**
@@ -1103,7 +1133,13 @@ HEAD_SHA=$(git rev-parse "$HEAD_REF" 2>/dev/null)
 ```
 
 **Validation:**
-- If `git rev-parse` fails for either ref → error:
+- If `git rev-parse` fails for either ref → attempt to deepen:
+  ```bash
+  # For shallow/depth-limited clones, the tag's commit may be outside the boundary
+  git fetch origin "$BASE_REF" --depth=500 2>/dev/null || true
+  BASE_SHA=$(git rev-parse "$BASE_REF" 2>/dev/null)
+  ```
+  If still fails after deepening → error:
   ```
   ❌ Cannot resolve ref: <ref>
      Available tags: <list first 10 tags>
@@ -1136,9 +1172,9 @@ Generate the file-level diff between `BASE_SHA` and `HEAD_SHA`.
 
 ```bash
 cd "$CLONE_DIR"
-git diff --stat "$BASE_SHA..$HEAD_SHA" > /tmp/diff-stat.txt
-git diff --numstat "$BASE_SHA..$HEAD_SHA" > /tmp/diff-numstat.txt
-git diff --name-status "$BASE_SHA..$HEAD_SHA" > /tmp/diff-name-status.txt
+git diff --stat "$BASE_SHA..$HEAD_SHA" > "$SESSION_DIR/diff-stat.txt"
+git diff --numstat "$BASE_SHA..$HEAD_SHA" > "$SESSION_DIR/diff-numstat.txt"
+git diff --name-status "$BASE_SHA..$HEAD_SHA" > "$SESSION_DIR/diff-name-status.txt"
 ```
 
 **Step 2.4b — Parse diff data**
@@ -1149,17 +1185,25 @@ For each changed file, extract:
 - `lines_added`: from `--numstat` (column 1)
 - `lines_deleted`: from `--numstat` (column 2)
 - `lines_changed`: `lines_added + lines_deleted`
+- `num_hunks`: count of hunk headers (`@@` lines) per file:
+  ```bash
+  git diff -U0 "$BASE_SHA..$HEAD_SHA" -- "$FILE_PATH" | grep -c "^@@" || echo "0"
+  ```
+  For added files (entire file is one hunk), set `num_hunks = 1`. For deleted files, set `num_hunks = 1`. For large diffs (>500 files), batch the hunk counting:
+  ```bash
+  git diff -U0 "$BASE_SHA..$HEAD_SHA" | grep -E "^diff --git|^@@" | awk '/^diff/{file=$0; count=0} /^@@/{count++} /^diff/{if(NR>1)print prev_file, prev_count; prev_file=file; prev_count=count} END{print prev_file, prev_count}'
+  ```
 
 **Step 2.4c — Categorize files**
 
-Assign a category to each file based on its path patterns:
+Assign a category to each file based on its path patterns. **Evaluate in priority order** (first match wins):
 
 | Category | Path patterns |
 |----------|---------------|
 | `test` | `*_test.*`, `*_test/*`, `*/test/*`, `*/tests/*`, `*_spec.*`, `*/spec/*`, `*/__tests__/*` |
 | `docs` | `*.md`, `*.rst`, `*.txt` (in docs/ or root), `*/docs/*`, `*/documentation/*` |
-| `config` | `*.json`, `*.yaml`, `*.yml`, `*.toml`, `*.ini`, `*.cfg`, `Makefile`, `Dockerfile`, `*.Dockerfile`, `docker-compose*`, `.github/*`, `.circleci/*` |
 | `dependency` | `go.mod`, `go.sum`, `package.json`, `package-lock.json`, `yarn.lock`, `Cargo.toml`, `Cargo.lock`, `requirements.txt`, `Pipfile*` |
+| `config` | `*.yaml`, `*.yml`, `*.toml`, `*.ini`, `*.cfg`, `Makefile`, `Dockerfile`, `*.Dockerfile`, `docker-compose*`, `.github/*`, `.circleci/*` (excludes `*.json` files already matched by `dependency`) |
 | `new_module` | File has status `added` AND the parent directory is also new (no files with status `modified` in the same directory) |
 | `core` | Everything else (production source code) |
 
@@ -1190,7 +1234,8 @@ Assemble the `diff-map.json` artifact following the schema from [Artifact Schema
       "category": "core",
       "lines_changed": 42,
       "lines_added": 30,
-      "lines_deleted": 12
+      "lines_deleted": 12,
+      "num_hunks": 3
     }
   ],
   "summary": {
@@ -1198,6 +1243,7 @@ Assemble the `diff-map.json` artifact following the schema from [Artifact Schema
     "added": 12,
     "modified": 30,
     "deleted": 5,
+    "renamed": 0,
     "total_lines_changed": 4200
   }
 }
@@ -1218,12 +1264,12 @@ Validation checks:
 5. `generated_at` is a valid ISO 8601 timestamp
 6. `clone_path` is a non-empty string
 7. `files` array is non-empty
-8. Each file has non-null `path`, `status`, `category`, `lines_changed`, `lines_added`, `lines_deleted`
+8. Each file has non-null `path`, `status`, `category`, `lines_changed`, `lines_added`, `lines_deleted`, `num_hunks`
 9. Each `status` is one of: `added`, `modified`, `deleted`, `renamed`
 10. Each `category` is one of: `core`, `new_module`, `config`, `test`, `docs`, `dependency`, `other`
 11. `summary` is present with all required sub-fields (`total_files`, `added`, `modified`, `deleted`, `total_lines_changed`)
 12. `summary.total_files` equals `len(files)`
-13. `summary.added + summary.modified + summary.deleted` equals `summary.total_files` (renamed files count as modified for this check)
+13. `summary.added + summary.modified + summary.deleted + summary.renamed` equals `summary.total_files`
 
 **On validation failure:**
 
@@ -1271,6 +1317,7 @@ Category breakdown:
   config:      <N> files (<N> lines)
   docs:        <N> files (<N> lines)
   dependency:  <N> files (<N> lines)
+  other:       <N> files (<N> lines)
 
 Artifacts saved:
   • {session_dir}/diff-map.json
@@ -1348,9 +1395,10 @@ If the skill is interrupted, errors out, or the user aborts mid-pipeline:
 
 ```bash
 # Cleanup trap pattern (used within pipeline phases)
+# CLONE_DIR must be set by Phase 2 using the same slugification as Step 2.1
+# e.g., CLONE_DIR="$HOME/.gstack/tmp/research-${CHAIN_SLUG}-${UPGRADE_SLUG}"
 cleanup() {
-  local CLONE_DIR="$HOME/.gstack/tmp/research-${CHAIN}-${UPGRADE}"
-  if [ -d "$CLONE_DIR" ]; then
+  if [ -n "$CLONE_DIR" ] && [ -d "$CLONE_DIR" ]; then
     rm -rf "$CLONE_DIR"
     echo "Cleaned up temp clone: $CLONE_DIR"
   fi
