@@ -69,7 +69,7 @@ check_file_exists() {
 check_json_valid() {
   local file="$1"
   local label="$2"
-  if python3 -c "import json; json.load(open('$file'))" 2>/dev/null; then
+  if FILE="$file" python3 -c "import json, os; json.load(open(os.environ['FILE']))" 2>/dev/null; then
     pass "$label is valid JSON"
     return 0
   else
@@ -83,10 +83,10 @@ check_json_field() {
   local field="$2"
   local label="$3"
   local value
-  value=$(python3 -c "
-import json, sys
-data = json.load(open('$file'))
-keys = '$field'.split('.')
+  value=$(FILE="$file" FIELD="$field" python3 -c "
+import json, sys, os
+data = json.load(open(os.environ['FILE']))
+keys = os.environ['FIELD'].split('.')
 obj = data
 for k in keys:
     if isinstance(obj, dict) and k in obj:
@@ -117,17 +117,20 @@ check_json_array_nonempty() {
   local field="$2"
   local label="$3"
   local count
-  count=$(python3 -c "
-import json
-data = json.load(open('$file'))
-keys = '$field'.split('.')
+  count=$(FILE="$file" FIELD="$field" python3 -c "
+import json, os
+data = json.load(open(os.environ['FILE']))
+keys = os.environ['FIELD'].split('.')
 obj = data
 for k in keys:
     obj = obj[k]
 print(len(obj) if isinstance(obj, list) else -1)
-" 2>/dev/null)
+" 2>/dev/null || echo "__ERROR__")
 
-  if [ "$count" = "-1" ]; then
+  if [ "$count" = "__ERROR__" ] || [ -z "$count" ]; then
+    fail "$label: error reading '$field' (Python exception or missing key)"
+    return 1
+  elif [ "$count" = "-1" ]; then
     fail "$label: '$field' is not an array"
     return 1
   elif [ "$count" = "0" ]; then
@@ -145,15 +148,15 @@ check_json_enum() {
   local allowed="$3"  # comma-separated
   local label="$4"
   local result
-  result=$(python3 -c "
-import json
-data = json.load(open('$file'))
-keys = '$field'.split('.')
+  result=$(FILE="$file" FIELD="$field" ALLOWED="$allowed" python3 -c "
+import json, os
+data = json.load(open(os.environ['FILE']))
+keys = os.environ['FIELD'].split('.')
 obj = data
 for k in keys:
     obj = obj[k]
-allowed = set('$allowed'.split(','))
-if str(obj) in allowed:
+allowed = set(os.environ['ALLOWED'].split(','))
+if str(obj) in allowed:  # intentional: accepts int or str schema_version
     print('OK')
 else:
     print(f'INVALID: {obj} not in {allowed}')
@@ -260,13 +263,13 @@ if check_file_exists "$CLAIMS" "claims.json"; then
     check_json_array_nonempty "$CLAIMS" "claims" "claims.json"
 
     # Validate individual claims
-    CLAIM_COUNT=$(python3 -c "import json; print(len(json.load(open('$CLAIMS'))['claims']))" 2>/dev/null)
+    CLAIM_COUNT=$(FILE="$CLAIMS" python3 -c "import json, os; print(len(json.load(open(os.environ['FILE']))['claims']))" 2>/dev/null)
     echo "  📊 Total claims: $CLAIM_COUNT"
 
     # Check each claim has required fields
-    CLAIM_ERRORS=$(python3 -c "
-import json
-data = json.load(open('$CLAIMS'))
+    CLAIM_ERRORS=$(FILE="$CLAIMS" python3 -c "
+import json, os
+data = json.load(open(os.environ['FILE']))
 errors = []
 valid_categories = {'architecture','performance','security','governance','tooling','deprecation','other'}
 valid_confidence = {'high','medium','low'}
@@ -287,18 +290,18 @@ if not errors:
     if [ "$CLAIM_ERRORS" = "__ALL_OK__" ]; then
       pass "All $CLAIM_COUNT claims have valid required fields"
     else
-      echo "$CLAIM_ERRORS" | while read -r err; do
+      while IFS= read -r err; do
         fail "claims.json: $err"
-      done
+      done < <(echo "$CLAIM_ERRORS")
     fi
 
     # Category distribution
     echo ""
     echo "  📊 Category distribution:"
-    python3 -c "
-import json
+    FILE="$CLAIMS" python3 -c "
+import json, os
 from collections import Counter
-data = json.load(open('$CLAIMS'))
+data = json.load(open(os.environ['FILE']))
 cats = Counter(c.get('category','unknown') for c in data['claims'])
 for cat, count in sorted(cats.items(), key=lambda x: -x[1]):
     print(f'     {cat}: {count}')
@@ -306,10 +309,10 @@ for cat, count in sorted(cats.items(), key=lambda x: -x[1]):
 
     # Confidence distribution
     echo "  📊 Confidence distribution:"
-    python3 -c "
-import json
+    FILE="$CLAIMS" python3 -c "
+import json, os
 from collections import Counter
-data = json.load(open('$CLAIMS'))
+data = json.load(open(os.environ['FILE']))
 confs = Counter(c.get('confidence','unknown') for c in data['claims'])
 for conf, count in sorted(confs.items(), key=lambda x: -x[1]):
     print(f'     {conf}: {count}')
@@ -350,12 +353,12 @@ if check_file_exists "$DIFFMAP" "diff-map.json"; then
     check_json_field "$DIFFMAP" "summary.total_lines_changed" "diff-map.json"
 
     # Validate individual files
-    FILE_COUNT=$(python3 -c "import json; print(len(json.load(open('$DIFFMAP'))['files']))" 2>/dev/null)
+    FILE_COUNT=$(FILE="$DIFFMAP" python3 -c "import json, os; print(len(json.load(open(os.environ['FILE']))['files']))" 2>/dev/null)
     echo "  📊 Total files in diff: $FILE_COUNT"
 
-    FILE_ERRORS=$(python3 -c "
-import json
-data = json.load(open('$DIFFMAP'))
+    FILE_ERRORS=$(FILE="$DIFFMAP" python3 -c "
+import json, os
+data = json.load(open(os.environ['FILE']))
 errors = []
 valid_status = {'added','modified','deleted','renamed'}
 valid_category = {'core','new_module','config','test','docs','dependency','other'}
@@ -378,17 +381,17 @@ if not errors:
     if [ "$FILE_ERRORS" = "__ALL_OK__" ]; then
       pass "All $FILE_COUNT files have valid required fields"
     else
-      echo "$FILE_ERRORS" | while read -r err; do
+      while IFS= read -r err; do
         fail "diff-map.json: $err"
-      done
+      done < <(echo "$FILE_ERRORS")
     fi
 
     # Summary stats
     echo ""
     echo "  📊 Diff summary:"
-    python3 -c "
-import json
-data = json.load(open('$DIFFMAP'))
+    FILE="$DIFFMAP" python3 -c "
+import json, os
+data = json.load(open(os.environ['FILE']))
 s = data.get('summary', {})
 print(f'     Total files: {s.get(\"total_files\", \"?\")}')
 print(f'     Added: {s.get(\"added\", \"?\")}')
@@ -398,9 +401,9 @@ print(f'     Total lines changed: {s.get(\"total_lines_changed\", \"?\")}')
 " 2>/dev/null
 
     # Verify SHA format (should be 40-char hex)
-    SHA_CHECK=$(python3 -c "
-import json, re
-data = json.load(open('$DIFFMAP'))
+    SHA_CHECK=$(FILE="$DIFFMAP" python3 -c "
+import json, re, os
+data = json.load(open(os.environ['FILE']))
 base = data.get('base_sha','')
 head = data.get('head_sha','')
 if re.match(r'^[0-9a-f]{40}$', base):
@@ -413,13 +416,13 @@ else:
     print(f'head_sha INVALID: {head}')
 " 2>/dev/null)
     echo "  📊 SHA verification:"
-    echo "$SHA_CHECK" | while read -r line; do
+    while IFS= read -r line; do
       if echo "$line" | grep -q "OK"; then
         pass "diff-map.json: $line"
       else
         fail "diff-map.json: $line"
       fi
-    done
+    done < <(echo "$SHA_CHECK")
   fi
 fi
 
@@ -458,9 +461,9 @@ if [ -n "$ANALYSIS" ]; then
     check_json_field "$ANALYSIS" "summary.unverified" "analysis"
 
     # Validate claims
-    ANALYSIS_RESULT=$(python3 -c "
-import json
-data = json.load(open('$ANALYSIS'))
+    ANALYSIS_RESULT=$(FILE="$ANALYSIS" python3 -c "
+import json, os
+data = json.load(open(os.environ['FILE']))
 claims = data.get('claims_analyzed', [])
 unreported = data.get('unreported_changes', [])
 summary = data.get('summary', {})
@@ -601,10 +604,11 @@ if check_file_exists "$REPORT" "internal-report.md"; then
 
   # Check that sections are non-empty
   for sect in "${REQUIRED_SECTIONS[@]}"; do
-    SECT_CONTENT=$(python3 -c "
-import re
-content = open('$REPORT').read()
-pattern = r'#+\s*$sect\s*\n(.*?)(?=\n#+\s|\Z)'
+    SECT_CONTENT=$(FILE="$REPORT" SECTION="$sect" python3 -c "
+import re, os
+content = open(os.environ['FILE']).read()
+sect = os.environ['SECTION']
+pattern = r'#+\s*' + re.escape(sect) + r'\s*\n(.*?)(?=\n#+\s|\Z)'
 match = re.search(pattern, content, re.DOTALL | re.IGNORECASE)
 if match:
     text = match.group(1).strip()

@@ -153,19 +153,27 @@ print('Timing started at', data['start_iso'])
 timing_phase() {
   local phase="$1"
   local status="$2"
-  python3 -c "
-import json, time
-data = json.load(open('$TIMING_FILE'))
+  PHASE_NUM="$phase" PHASE_STATUS="$status" python3 -c "
+import json, time, os
+path = '$TIMING_FILE'
+data = json.load(open(path))
 now = time.time()
+phase_num = os.environ['PHASE_NUM']
+phase_status = os.environ['PHASE_STATUS']
+# Compute duration from the most recent phase end, or from pipeline start
+prev_end = data['start_time']
+for k, v in data.get('phases', {}).items():
+    if 'end_time' in v and v['end_time'] > prev_end:
+        prev_end = v['end_time']
 phase_data = {
     'end_time': now,
     'end_iso': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
-    'duration_seconds': round(now - (data['phases'].get('phase_${phase}_start', {}).get('start_time', data['start_time'])), 1),
-    'status': '$status'
+    'duration_seconds': round(now - prev_end, 1),
+    'status': phase_status
 }
-data['phases']['phase_$phase'] = phase_data
-json.dump(data, open('$TIMING_FILE', 'w'), indent=2)
-print(f'Phase $phase: {phase_data[\"duration_seconds\"]}s ($status)')
+data['phases']['phase_' + phase_num] = phase_data
+json.dump(data, open(path, 'w'), indent=2)
+print(f'Phase {phase_num}: {phase_data[\"duration_seconds\"]}s ({phase_status})')
 "
 }
 
@@ -201,9 +209,9 @@ generate_report() {
   # Collect timing data if available
   local timing_info=""
   if [ -f "$TIMING_FILE" ]; then
-    timing_info=$(python3 -c "
-import json
-data = json.load(open('$TIMING_FILE'))
+    timing_info=$(FILE="$TIMING_FILE" python3 -c "
+import json, os
+data = json.load(open(os.environ['FILE']))
 print(f'Total: {data.get(\"total_duration_minutes\", \"?\"):.1f} minutes')
 for phase, info in sorted(data.get('phases', {}).items()):
     print(f'  {phase}: {info.get(\"duration_seconds\", \"?\")}s ({info.get(\"status\", \"?\")})')
@@ -222,11 +230,11 @@ for phase, info in sorted(data.get('phases', {}).items()):
 
   # Collect artifact stats
   local claims_count files_count confirmed_rate unreported_count report_lines
-  claims_count=$(python3 -c "import json; print(len(json.load(open('$session_dir/claims.json'))['claims']))" 2>/dev/null || echo "?")
-  files_count=$(python3 -c "import json; print(len(json.load(open('$session_dir/diff-map.json'))['files']))" 2>/dev/null || echo "?")
-  confirmed_rate=$(python3 -c "
-import json
-data = json.load(open('$session_dir/analysis.json'))
+  claims_count=$(DIR="$session_dir" python3 -c "import json, os; print(len(json.load(open(os.path.join(os.environ['DIR'],'claims.json')))['claims']))" 2>/dev/null || echo "?")
+  files_count=$(DIR="$session_dir" python3 -c "import json, os; print(len(json.load(open(os.path.join(os.environ['DIR'],'diff-map.json')))['files']))" 2>/dev/null || echo "?")
+  confirmed_rate=$(DIR="$session_dir" python3 -c "
+import json, os
+data = json.load(open(os.path.join(os.environ['DIR'],'analysis.json')))
 claims = data.get('claims_analyzed', data.get('evidence_map', []))
 if isinstance(claims, list):
     total = len(claims)
@@ -235,7 +243,7 @@ if isinstance(claims, list):
 else:
     print('?')
 " 2>/dev/null || echo "?")
-  unreported_count=$(python3 -c "import json; print(len(json.load(open('$session_dir/analysis.json')).get('unreported_changes',[])))" 2>/dev/null || echo "?")
+  unreported_count=$(DIR="$session_dir" python3 -c "import json, os; print(len(json.load(open(os.path.join(os.environ['DIR'],'analysis.json'))).get('unreported_changes',[])))" 2>/dev/null || echo "?")
   report_lines=$(wc -l < "$session_dir/internal-report.md" 2>/dev/null | tr -d ' ' || echo "?")
 
   cat > "$report_file" << REPORT_EOF
@@ -333,7 +341,7 @@ REPORT_EOF
 # ═══════════════════════════════════════════
 case "${1:-help}" in
   preflight)
-    preflight
+    preflight || true
     ;;
   timing-start)
     timing_start
